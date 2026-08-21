@@ -279,6 +279,104 @@ function Backup-OfflineHiveFile {
     return $backup
 }
 
+function Test-OfflineHiveFile {
+    <#
+    .SYNOPSIS
+        Reports whether a registry hive file is structurally loadable by Windows.
+
+    .DESCRIPTION
+        A size and 'regf' signature check only proves the file looks like a hive. The
+        authoritative test is to have Windows parse it, which is what RegLoadAppKey does
+        without attaching the hive to the live registry. The file is copied to a scratch
+        path first, because RegLoadAppKey needs write access and will replay the
+        transaction logs into whatever file it is given.
+
+    .OUTPUTS
+        PSCustomObject with Path, Exists, Size, IsValid and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $result = [PSCustomObject]@{
+        Path    = $Path
+        Exists  = $false
+        Size    = 0
+        IsValid = $false
+        Reason  = $null
+    }
+
+    $handle = [IntPtr]::Zero
+    $scratch = $null
+    try {
+        if (-not (Test-OfflinePath $Path)) { throw 'File does not exist.' }
+
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer) { throw 'Path is a directory, not a hive file.' }
+
+        $result.Exists = $true
+        $result.Size = $item.Length
+        if ($item.Length -eq 0) { throw 'File is 0 bytes.' }
+        if ($item.Length -lt 4096) { throw "File is $($item.Length) bytes, smaller than the 4096 byte minimum hive structure." }
+
+        $header = [byte[]]::new(4)
+        $stream = [System.IO.File]::Open($item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try { [void]$stream.Read($header, 0, 4) } finally { $stream.Dispose() }
+        if ([System.Text.Encoding]::ASCII.GetString($header) -ne 'regf') { throw "Hive header signature 'regf' is missing." }
+
+        if (-not ('RslOffline.NativeHive' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace RslOffline {
+    public static class NativeHive {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int RegLoadAppKey(string lpFile, out IntPtr phkResult, int samDesired, int dwOptions, int reserved);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern int RegCloseKey(IntPtr hKey);
+    }
+}
+'@ -ErrorAction Stop
+        }
+
+        $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("rsl-hive-{0}.hiv" -f [guid]::NewGuid().ToString('N'))
+        Copy-Item -LiteralPath $Path -Destination $scratch -Force -ErrorAction Stop
+
+        # The transaction logs are copied too, because a hive that is only dirty rather than
+        # damaged is repaired by log replay and must not be reported as corrupt.
+        foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
+            if (Test-OfflinePath "$Path$suffix") {
+                Copy-Item -LiteralPath "$Path$suffix" -Destination "$scratch$suffix" -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        $status = [RslOffline.NativeHive]::RegLoadAppKey($scratch, [ref]$handle, 0x20019, 1, 0)
+        if ($status -ne 0) {
+            $message = (New-Object System.ComponentModel.Win32Exception($status)).Message
+            throw "Windows could not load the hive: $message (error $status)."
+        }
+
+        $result.IsValid = $true
+    }
+    catch {
+        $result.Reason = $_.Exception.Message
+    }
+    finally {
+        if ($handle -ne [IntPtr]::Zero -and ('RslOffline.NativeHive' -as [type])) {
+            [void][RslOffline.NativeHive]::RegCloseKey($handle)
+        }
+        if ($scratch) {
+            foreach ($suffix in @('', '.LOG', '.LOG1', '.LOG2')) {
+                if (Test-Path -LiteralPath "$scratch$suffix") {
+                    Remove-Item -LiteralPath "$scratch$suffix" -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    return $result
+}
+
 function Resolve-OfflineImagePath {
     <#
     .SYNOPSIS
