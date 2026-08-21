@@ -22,12 +22,18 @@
 .NOTES
     Name:   Get-OfflineBcdStore.ps1
     Requires: common/setup/init.ps1 to be dot-sourced first (for the Log-* functions).
+    These functions return values, so they buffer their messages with Add-OfflineRepairLog
+    instead of calling Log-* directly. Call Write-OfflineRepairLog at script level to flush.
     Every function targets an offline store explicitly. None of them ever modifies the
     rescue VM's own BCD.
 
 .VERSION
     v1.0: Initial version.
 #>
+
+if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+    . .\src\windows\common\helpers\OfflineRepairLog.ps1
+}
 
 function Get-BcdStorePath {
     <#
@@ -307,7 +313,7 @@ function Get-BcdBootLoaderId {
     )
 
     if (-not (Test-BcdStorePath -StorePath $StorePath)) {
-        Log-Warning "BCD store not found at $StorePath."
+        Add-OfflineRepairLog -Level Warning -Message "BCD store not found at $StorePath."
         return $null
     }
 
@@ -336,7 +342,7 @@ function Get-BcdBootLoaderId {
 
         if (-not [string]::IsNullOrWhiteSpace($fallbackIdentifier)) { return $fallbackIdentifier }
 
-        Log-Warning "Could not determine the boot loader identifier in $StorePath."
+        Add-OfflineRepairLog -Level Warning -Message "Could not determine the boot loader identifier in $StorePath."
         return $null
     }
 
@@ -359,7 +365,7 @@ function Backup-BcdStore {
 
     $backup = "$StorePath.bak-$(Get-Date -Format yyyyMMddHHmmss)"
     Copy-Item -LiteralPath $StorePath -Destination $backup -Force
-    Log-Info "Backed up the BCD store to $backup"
+    Add-OfflineRepairLog -Level Info -Message "Backed up the BCD store to $backup"
     return $backup
 }
 
@@ -384,17 +390,17 @@ function Invoke-BcdEdit {
     )
 
     $fullCmd = "bcdedit.exe /store `"$StorePath`" $Command"
-    Log-Info "Running: $fullCmd"
+    Add-OfflineRepairLog -Level Info -Message "Running: $fullCmd"
 
     $output = & cmd.exe /c $fullCmd 2>&1 | Out-String
     $exitCode = $LASTEXITCODE
     $trimmed = $output.Trim()
 
     if ($exitCode -ne 0) {
-        Log-Warning "bcdedit returned exit code ${exitCode}: $trimmed"
+        Add-OfflineRepairLog -Level Warning -Message "bcdedit returned exit code ${exitCode}: $trimmed"
     }
     elseif ($trimmed) {
-        Log-Info $trimmed
+        Add-OfflineRepairLog -Level Info -Message $trimmed
     }
 
     return [PSCustomObject]@{

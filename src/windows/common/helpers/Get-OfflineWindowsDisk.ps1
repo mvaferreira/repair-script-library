@@ -26,11 +26,17 @@
 .NOTES
     Name:   Get-OfflineWindowsDisk.ps1
     Requires: common/setup/init.ps1 to be dot-sourced first (for the Log-* functions).
+    These functions return values, so they buffer their messages with Add-OfflineRepairLog
+    instead of calling Log-* directly. Call Write-OfflineRepairLog at script level to flush.
     The rescue VM's own system disk is always excluded from the search.
 
 .VERSION
     v1.0: Initial version.
 #>
+
+if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+    . .\src\windows\common\helpers\OfflineRepairLog.ps1
+}
 
 function Test-DriveLetterInUse {
     <#
@@ -90,12 +96,12 @@ function Stop-NestedRepairVm {
         $running = @(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' })
     }
     catch {
-        Log-Info "Hyper-V is present but VMs could not be enumerated: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Info -Message "Hyper-V is present but VMs could not be enumerated: $($_.Exception.Message)"
         return $stopped
     }
 
     foreach ($vm in $running) {
-        Log-Info "Stopping nested Hyper-V VM '$($vm.Name)' so its disk can be mounted offline."
+        Add-OfflineRepairLog -Level Info -Message "Stopping nested Hyper-V VM '$($vm.Name)' so its disk can be mounted offline."
         Stop-VM -Name $vm.Name -TurnOff -Force -ErrorAction SilentlyContinue
         $stopped += $vm.Name
     }
@@ -135,10 +141,10 @@ online disk noerr
     }
 
     if ($processed.Count -gt 0) {
-        Log-Info "Brought attached virtual disk(s) online: $($processed -join ', ')"
+        Add-OfflineRepairLog -Level Info -Message "Brought attached virtual disk(s) online: $($processed -join ', ')"
     }
     else {
-        Log-Warning 'No attached virtual data disk was found on the rescue VM.'
+        Add-OfflineRepairLog -Level Warning -Message 'No attached virtual data disk was found on the rescue VM.'
     }
 
     # Give the volume stack a moment to surface the new volumes.
@@ -181,7 +187,7 @@ exit
     Start-Sleep -Milliseconds 500
 
     if (Test-Path -LiteralPath "${DriveLetter}:\") {
-        Log-Info "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber."
+        Add-OfflineRepairLog -Level Info -Message "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber."
         return $DriveLetter
     }
 
@@ -189,15 +195,15 @@ exit
     try {
         Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -AccessPath "${DriveLetter}:" -ErrorAction Stop
         if (Test-Path -LiteralPath "${DriveLetter}:\") {
-            Log-Info "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber (access path)."
+            Add-OfflineRepairLog -Level Info -Message "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber (access path)."
             return $DriveLetter
         }
     }
     catch {
-        Log-Info "Could not add an access path for disk $DiskNumber partition ${PartitionNumber}: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Info -Message "Could not add an access path for disk $DiskNumber partition ${PartitionNumber}: $($_.Exception.Message)"
     }
 
-    Log-Warning "Could not assign a drive letter to disk $DiskNumber partition $PartitionNumber."
+    Add-OfflineRepairLog -Level Warning -Message "Could not assign a drive letter to disk $DiskNumber partition $PartitionNumber."
     return $null
 }
 
@@ -339,7 +345,7 @@ function Get-OfflineWindowsDisk {
         $systemDiskNumber = (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':')) -ErrorAction Stop).DiskNumber
     }
     catch {
-        Log-Warning "Could not determine the rescue VM system disk number: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Warning -Message "Could not determine the rescue VM system disk number: $($_.Exception.Message)"
     }
 
     $null = Stop-NestedRepairVm
@@ -415,7 +421,7 @@ function Get-OfflineWindowsDisk {
     foreach ($candidate in $sorted) { $candidate.Selected = ($candidate.Drive -eq $selected.Drive) }
 
     if ($sorted.Count -gt 1) {
-        Log-Warning "$($sorted.Count) Windows installations found on the attached disk(s). Selected $($selected.Drive) (score $($selected.Score))."
+        Add-OfflineRepairLog -Level Warning -Message "$($sorted.Count) Windows installations found on the attached disk(s). Selected $($selected.Drive) (score $($selected.Score))."
     }
 
     $selectedDisk = Get-Disk -Number $selected.DiskNumber -ErrorAction SilentlyContinue
@@ -449,14 +455,14 @@ function Get-OfflineWindowsDisk {
             if ($root) {
                 $bootDrive = $root.TrimEnd('\')
                 $bcdStorePath = if ($generation -eq 2) { Join-Path $bootDrive 'EFI\Microsoft\Boot\BCD' } else { Join-Path $bootDrive 'Boot\BCD' }
-                Log-Warning "No BCD store was found at $bcdStorePath, but the boot partition is present at $bootDrive."
+                Add-OfflineRepairLog -Level Warning -Message "No BCD store was found at $bcdStorePath, but the boot partition is present at $bootDrive."
                 break
             }
         }
     }
 
     if (-not $bootDrive) {
-        Log-Warning 'No boot partition was found on the attached disk. Boot configuration repairs will not be available.'
+        Add-OfflineRepairLog -Level Warning -Message 'No boot partition was found on the attached disk. Boot configuration repairs will not be available.'
     }
 
     $script:OfflineWindowsDrive = $selected.Drive
@@ -478,9 +484,9 @@ function Get-OfflineWindowsDisk {
         Candidates        = $sorted
     }
 
-    Log-Info "Offline Windows: $($result.WindowsPath) (disk $($result.DiskNumber), Gen$($result.Generation), $($result.ProductName) build $($result.BuildNumber))"
-    if ($result.GuestComputerName) { Log-Info "Guest computer name: $($result.GuestComputerName)" }
-    if ($result.BootDrive) { Log-Info "Boot partition: $($result.BootDrive) (BCD: $($result.BcdStorePath))" }
+    Add-OfflineRepairLog -Level Info -Message "Offline Windows: $($result.WindowsPath) (disk $($result.DiskNumber), Gen$($result.Generation), $($result.ProductName) build $($result.BuildNumber))"
+    if ($result.GuestComputerName) { Add-OfflineRepairLog -Level Info -Message "Guest computer name: $($result.GuestComputerName)" }
+    if ($result.BootDrive) { Add-OfflineRepairLog -Level Info -Message "Boot partition: $($result.BootDrive) (BCD: $($result.BcdStorePath))" }
 
     return $result
 }

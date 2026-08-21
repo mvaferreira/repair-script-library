@@ -23,10 +23,16 @@
 .NOTES
     Name:   Use-OfflineRegistryHive.ps1
     Requires: common/setup/init.ps1 to be dot-sourced first (for the Log-* functions).
+    These functions return values, so they buffer their messages with Add-OfflineRepairLog
+    instead of calling Log-* directly. Call Write-OfflineRepairLog at script level to flush.
 
 .VERSION
     v1.0: Initial version.
 #>
+
+if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+    . .\src\windows\common\helpers\OfflineRepairLog.ps1
+}
 
 # Drive letter of the offline Windows installation, normally set by Get-OfflineWindowsDisk.ps1.
 if (-not (Get-Variable -Name OfflineWindowsDrive -Scope Script -ErrorAction SilentlyContinue)) {
@@ -67,11 +73,11 @@ function Mount-OfflineHive {
 
     # A previous failed unload can leave the key mounted. Reuse it rather than failing.
     if (Test-Path "HKLM:\BROKEN$Hive") {
-        Log-Info "HKLM\BROKEN$Hive is already loaded - reusing the existing mount."
+        Add-OfflineRepairLog -Level Info -Message "HKLM\BROKEN$Hive is already loaded - reusing the existing mount."
         return
     }
 
-    Log-Info "Loading offline hive: reg load HKLM\BROKEN$Hive `"$offHive`""
+    Add-OfflineRepairLog -Level Info -Message "Loading offline hive: reg load HKLM\BROKEN$Hive `"$offHive`""
     $out = reg.exe load "HKLM\BROKEN$Hive" "$offHive" 2>&1 | Out-String
 
     if ($LASTEXITCODE -ne 0) {
@@ -112,7 +118,7 @@ function Dismount-OfflineHive {
     # Query with reg.exe (separate process) so we do not open new .NET handles here.
     $null = reg.exe query $hiveKey /ve 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Log-Info "$hiveKey is not currently loaded - nothing to unload."
+        Add-OfflineRepairLog -Level Info -Message "$hiveKey is not currently loaded - nothing to unload."
         return $true
     }
 
@@ -124,7 +130,7 @@ function Dismount-OfflineHive {
     [GC]::Collect()
     Start-Sleep -Milliseconds 500
 
-    Log-Info "Unloading offline hive: reg unload $hiveKey"
+    Add-OfflineRepairLog -Level Info -Message "Unloading offline hive: reg unload $hiveKey"
     $maxAttempts = 6
     for ($i = 1; $i -le $maxAttempts; $i++) {
         $out = reg.exe unload $hiveKey 2>&1 | Out-String
@@ -139,7 +145,7 @@ function Dismount-OfflineHive {
         }
     }
 
-    Log-Warning "Failed to unload $hiveKey after $maxAttempts attempts: $($out.Trim()). The hive may still be loaded."
+    Add-OfflineRepairLog -Level Warning -Message "Failed to unload $hiveKey after $maxAttempts attempts: $($out.Trim()). The hive may still be loaded."
     return $false
 }
 
@@ -269,7 +275,7 @@ function Backup-OfflineHiveFile {
 
     $backup = "$source.bak-$(Get-Date -Format yyyyMMddHHmmss)"
     Copy-Item -LiteralPath $source -Destination $backup -Force
-    Log-Info "Backed up the $Hive hive to $backup"
+    Add-OfflineRepairLog -Level Info -Message "Backed up the $Hive hive to $backup"
     return $backup
 }
 
