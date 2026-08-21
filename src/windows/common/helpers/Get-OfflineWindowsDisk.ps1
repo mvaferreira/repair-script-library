@@ -38,6 +38,48 @@ if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
     . .\src\windows\common\helpers\OfflineRepairCommon.ps1
 }
 
+# QueryDosDevice reads the NT object namespace, which is the only place a drive letter
+# that diskpart assigned to a hidden EFI System or Recovery partition can be observed.
+# mountvol and Get-Partition both report the mount manager database instead, and neither
+# lists those letters, so without this the helper cannot tell that a partition already
+# has one and hands out a new letter on every run until the alphabet is exhausted.
+if (-not ('RslOffline.NativeDosDevice' -as [type])) {
+    try {
+        Add-Type -Namespace RslOffline -Name NativeDosDevice -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern uint QueryDosDeviceW(string lpDeviceName, System.Text.StringBuilder lpTargetPath, int ucchMax);
+'@ -ErrorAction Stop
+    }
+    catch {
+        # Falls back to the mountvol lookup, which is weaker but needs no compiler.
+        Add-OfflineRepairLog -Level Info -Message "QueryDosDevice is unavailable, so drive letter reuse falls back to mountvol: $($_.Exception.Message)"
+    }
+}
+
+function Get-DosDeviceTarget {
+    <#
+    .SYNOPSIS
+        Returns the device a DOS device name points at, or an empty string.
+
+    .PARAMETER Name
+        A DOS device name without the \\?\ prefix, such as 'K:' or 'Volume{guid}'.
+
+    .OUTPUTS
+        A device name such as \Device\HarddiskVolume5, or '' when the name is undefined.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not ('RslOffline.NativeDosDevice' -as [type])) { return '' }
+
+    $buffer = New-Object System.Text.StringBuilder 1024
+    $length = [RslOffline.NativeDosDevice]::QueryDosDeviceW($Name, $buffer, $buffer.Capacity)
+    if ($length -eq 0) { return '' }
+
+    return $buffer.ToString()
+}
+
 function Test-DriveLetterInUse {
     <#
     .SYNOPSIS
@@ -45,13 +87,16 @@ function Test-DriveLetterInUse {
 
     .DESCRIPTION
         Get-Volume and Get-Partition do not report drive letters that were assigned to
-        hidden System or Recovery partitions, so the root path is probed directly as well.
+        hidden System or Recovery partitions, so the object namespace is consulted and
+        the root path is probed directly as well. A letter that is defined but not
+        reachable still counts as taken, because assigning over it would fail.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$DriveLetter
     )
 
     $letter = $DriveLetter.TrimEnd(':', '\')
+    if (-not [string]::IsNullOrWhiteSpace((Get-DosDeviceTarget -Name "${letter}:"))) { return $true }
     if (Test-OfflinePath "${letter}:\") { return $true }
     if (Get-PSDrive -Name $letter -PSProvider FileSystem -ErrorAction SilentlyContinue) { return $true }
     if (Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue) { return $true }
@@ -84,13 +129,9 @@ function Get-VolumeDriveLetterMap {
         Maps each volume GUID path to the drive letters currently mounted on it.
 
     .DESCRIPTION
-        Get-Partition never reports a drive letter for hidden EFI System and Recovery
-        partitions, even after one has been assigned, but those partitions do report
-        their \\?\Volume{...}\ path. mountvol is the one source that still lists the
-        letters mounted on such a volume, so its output is parsed to recover them.
-
-        Without this, every run would believe those partitions have no letter and
-        assign another one, exhausting the alphabet after a handful of runs.
+        Fallback used only when QueryDosDevice is unavailable. mountvol reports the
+        mount manager database, which does not contain letters that diskpart created
+        directly in the object namespace, so this is the weaker of the two sources.
 
     .OUTPUTS
         Hashtable keyed by volume GUID path (no trailing backslash) whose values are
@@ -115,6 +156,26 @@ function Get-VolumeDriveLetterMap {
     return $map
 }
 
+function Get-DriveLetterDeviceMap {
+    <#
+    .SYNOPSIS
+        Maps every defined drive letter to the device it points at.
+
+    .OUTPUTS
+        Hashtable keyed by drive letter in the form 'K:' whose values are device
+        names such as \Device\HarddiskVolume5.
+    #>
+    $map = @{}
+
+    foreach ($letter in ([char[]](67..90))) {
+        $target = Get-DosDeviceTarget -Name "${letter}:"
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
+        $map["${letter}:"] = $target
+    }
+
+    return $map
+}
+
 function Get-PartitionExistingRoot {
     <#
     .SYNOPSIS
@@ -122,13 +183,17 @@ function Get-PartitionExistingRoot {
 
     .DESCRIPTION
         Reported access paths are confirmed before they are trusted, because a
-        partition can advertise a letter whose drive is no longer mounted. When the
-        partition reports no letter at all, its volume GUID path is looked up in the
-        mountvol map so an already-assigned letter on a hidden partition is reused
-        instead of a new one being handed out.
+        partition can advertise a letter whose drive is no longer mounted.
+
+        Hidden EFI System and Recovery partitions never report a drive letter at all,
+        so the partition's volume device is resolved instead and matched against the
+        device every defined drive letter points at. That recovers a letter assigned
+        by an earlier run, which is what stops each run from leaking two more letters
+        until the alphabet is exhausted.
     #>
     param(
         [Parameter(Mandatory = $true)]$Partition,
+        [Parameter(Mandatory = $false)][hashtable]$LetterDeviceMap = @{},
         [Parameter(Mandatory = $false)][hashtable]$VolumeMap = @{}
     )
 
@@ -139,7 +204,22 @@ function Get-PartitionExistingRoot {
 
     if ($existing.Count -gt 0) { return @($existing | Select-Object -Unique) }
 
-    foreach ($volumePath in @($Partition.AccessPaths | Where-Object { $_ -and $_ -match '^\\\\\?\\Volume\{' })) {
+    $volumePaths = @($Partition.AccessPaths | Where-Object { $_ -and $_ -match '^\\\\\?\\Volume\{' })
+
+    # Preferred source: the object namespace, which holds letters mountvol cannot see.
+    foreach ($volumePath in $volumePaths) {
+        $device = Get-DosDeviceTarget -Name (($volumePath.TrimEnd('\')) -replace '^\\\\\?\\', '')
+        if ([string]::IsNullOrWhiteSpace($device)) { continue }
+
+        # Sorted so repeated runs settle on the same letter for the same partition.
+        foreach ($letter in @($LetterDeviceMap.Keys | Sort-Object)) {
+            if ($LetterDeviceMap[$letter] -ne $device) { continue }
+            if (-not (Test-OfflinePath "$letter\")) { continue }
+            return @($letter)
+        }
+    }
+
+    foreach ($volumePath in $volumePaths) {
         $key = $volumePath.TrimEnd('\')
         if (-not $VolumeMap.ContainsKey($key)) { continue }
 
@@ -440,11 +520,12 @@ function Get-OfflineWindowsDisk {
     # so the letters are tracked here and used for all later path building.
     $partitionRoots = @{}
     $volumeMap = Get-VolumeDriveLetterMap
+    $letterDeviceMap = Get-DriveLetterDeviceMap
     foreach ($disk in $disks) {
         foreach ($part in (Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
             $key = "$($disk.Number)-$($part.PartitionNumber)"
 
-            $existing = @(Get-PartitionExistingRoot -Partition $part -VolumeMap $volumeMap)
+            $existing = @(Get-PartitionExistingRoot -Partition $part -LetterDeviceMap $letterDeviceMap -VolumeMap $volumeMap)
             if ($existing.Count -gt 0) {
                 $partitionRoots[$key] = @($existing)
                 continue
@@ -455,7 +536,14 @@ function Get-OfflineWindowsDisk {
             if ($part.Size -lt 1MB) { continue }
 
             $letter = Add-PartitionDriveLetter -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber
-            if ($letter) { $partitionRoots[$key] = @("${letter}:") }
+            if ($letter) {
+                $partitionRoots[$key] = @("${letter}:")
+
+                # Keep the map current so a partition that shares this volume is not
+                # handed a second letter later in the same pass.
+                $newDevice = Get-DosDeviceTarget -Name "${letter}:"
+                if (-not [string]::IsNullOrWhiteSpace($newDevice)) { $letterDeviceMap["${letter}:"] = $newDevice }
+            }
         }
     }
 
