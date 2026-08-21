@@ -151,12 +151,23 @@ function Invoke-ChkReg {
         Runs chkreg.exe against a hive file and reports what it found.
 
     .DESCRIPTION
-        Always runs on a scratch copy, never on the file on the offline disk. In repair mode the
-        repaired file is left in scratch space for the caller to validate before it is used;
-        chkreg writes the compacted result to <file>.BAK when /C succeeds.
+        Always runs on a scratch copy, never on the file on the offline disk. In repair mode
+        chkreg writes its fixes back into the file it was given, so the repaired hive is the
+        scratch copy itself and the caller validates that copy before it goes near the disk.
+
+        The result is taken from the exit code, not from the message text. Measured on
+        Windows Server 2022 with the copy of chkreg.exe shipped in this repository:
+
+            healthy    exit 0    "Hive validated successfully, no errors found."
+            damaged    exit 1009 "Errors detected during hive validation (Error = 1009)."
+            repaired   exit 0    "Error found and fixed during hive validation."
+                                 "Fixes written back successfully."
+
+        Matching on wording is unreliable: none of those strings contain the word "corrupt",
+        and a check that looks for it silently reports every damaged hive as healthy.
 
     .OUTPUTS
-        PSCustomObject with Ran, FoundProblem, RepairedPath and Output.
+        PSCustomObject with Ran, FoundProblem, RepairedPath, ExitCode and Output.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ChkRegPath,
@@ -169,6 +180,7 @@ function Invoke-ChkReg {
         Ran          = $false
         FoundProblem = $false
         RepairedPath = ''
+        ExitCode     = $null
         Output       = ''
     }
 
@@ -183,19 +195,24 @@ function Invoke-ChkReg {
     # chkreg writes progress to stderr, so both streams are coerced to plain strings to keep
     # PowerShell from turning ordinary output into NativeCommandError records.
     if ($Repair) {
-        $raw = & $ChkRegPath /F "$working" /R /C 2>&1 | ForEach-Object { "$_" }
+        $raw = & $ChkRegPath /F "$working" /R 2>&1 | ForEach-Object { "$_" }
     }
     else {
         $raw = & $ChkRegPath /F "$working" 2>&1 | ForEach-Object { "$_" }
     }
+    $exitCode = $LASTEXITCODE
 
     $result.Ran = $true
-    $result.Output = (@($raw) -join "`n").Trim()
-    $result.FoundProblem = ($result.Output -match '\.\.\.\s*fixed' -or $result.Output -match 'corrupt')
+    $result.ExitCode = $exitCode
+    $result.Output = (@($raw) -join ' | ').Trim()
 
     if ($Repair) {
-        # /C writes the compacted hive alongside the repaired one; prefer it when present.
-        $result.RepairedPath = if (Test-OfflinePath "$working.BAK") { "$working.BAK" } else { $working }
+        # chkreg /R rewrites the file it was handed, so the repaired hive is the scratch copy.
+        $result.FoundProblem = ($exitCode -ne 0)
+        $result.RepairedPath = if ($exitCode -eq 0) { $working } else { '' }
+    }
+    else {
+        $result.FoundProblem = ($exitCode -ne 0)
     }
 
     return $result
@@ -215,6 +232,8 @@ function Get-RegBackPlan {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $false)][string]$ChkRegPath = '',
+        [Parameter(Mandatory = $false)][string]$ScratchDir = '',
         [Parameter(Mandatory = $false)][timespan]$MaximumSkew = ([timespan]::FromHours(24))
     )
 
@@ -237,6 +256,16 @@ function Get-RegBackPlan {
         if (-not $validation.IsValid) {
             $excluded += [PSCustomObject]@{ Name = $spec.Name; Reason = $validation.Reason }
             continue
+        }
+
+        # Loading is not enough on its own: reg.exe loads a hive with damaged bins without
+        # complaining, so a backup has to pass chkreg before it is treated as a usable source.
+        if ($ChkRegPath -and $ScratchDir) {
+            $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $source -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback') -Repair $false
+            if ($check.FoundProblem) {
+                $excluded += [PSCustomObject]@{ Name = $spec.Name; Reason = "The backup copy fails chkreg validation (exit $($check.ExitCode))." }
+                continue
+            }
         }
 
         $usable += [PSCustomObject]@{
@@ -366,14 +395,22 @@ function Repair-HiveInPlace {
 
     $repair = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $path -ScratchDir $ScratchDir -Repair $true
     if (-not $repair.RepairedPath -or -not (Test-OfflinePath $repair.RepairedPath)) {
-        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): chkreg produced no output file."
+        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): chkreg could not repair the hive (exit $($repair.ExitCode)). $($repair.Output)"
         return $false
     }
 
-    # The repaired file must prove itself before it is allowed to replace a file on the disk.
+    # The repaired file must prove itself twice before it is allowed to replace a file on the
+    # disk: it has to load, and it has to pass a fresh chkreg check. Loading alone is too weak,
+    # because reg.exe loads a hive whose bins are damaged without complaining.
     $validation = Test-OfflineHiveFile -Path $repair.RepairedPath
     if (-not $validation.IsValid) {
         Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): the chkreg output still does not load ($($validation.Reason)), so the file on disk was left alone."
+        return $false
+    }
+
+    $recheck = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $repair.RepairedPath -ScratchDir (Join-Path $ScratchDir 'verify') -Repair $false
+    if ($recheck.FoundProblem) {
+        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): the chkreg output still fails validation (exit $($recheck.ExitCode)), so the file on disk was left alone."
         return $false
     }
 
@@ -538,7 +575,7 @@ try {
             Log-Warning "$($needRegBack.Count) hive(s) could not be repaired in place and allowRegBack is false, so no restore was attempted: $($needRegBack -join ', ')" | Tee-Object -FilePath $logFile -Append
         }
         else {
-            $plan = Get-RegBackPlan -ConfigPath $configPath
+            $plan = Get-RegBackPlan -ConfigPath $configPath -ChkRegPath $chkRegPath -ScratchDir $scratchDir
             Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
             foreach ($item in @($plan.Excluded)) {
