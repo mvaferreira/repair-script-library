@@ -77,7 +77,7 @@
 	{
 		"id" : "win-fix-registry-corruption",
 		"path" : "src/windows/win-fix-registry-corruption.ps1",
-		"description" : "Repairs corrupted, empty or unloadable registry hives behind stop error 0xC0000218 STATUS_CANNOT_LOAD_REGISTRY_FILE and stop error 0x74 BAD_SYSTEM_CONFIG_INFO. Validates every hive with RegLoadAppKey, repairs structural damage in place with chkreg.exe, and falls back to a validated RegBack restore only when a hive cannot be repaired. Backs up every file it replaces. NOTE: use option --run-on-repair."
+		"description" : "Repairs corrupted, empty or unloadable registry hives behind stop error 0xC0000218 STATUS_CANNOT_LOAD_REGISTRY_FILE and stop error 0x74 BAD_SYSTEM_CONFIG_INFO. Validates every hive by loading a scratch copy, repairs structural damage in place with chkreg.exe, and falls back to a validated RegBack restore only when a hive cannot be repaired. Backs up every file it replaces. NOTE: use option --run-on-repair."
 	},
 	{
 		"id" : "win-toggle-safe-mode",

@@ -286,10 +286,15 @@ function Test-OfflineHiveFile {
 
     .DESCRIPTION
         A size and 'regf' signature check only proves the file looks like a hive. The
-        authoritative test is to have Windows parse it, which is what RegLoadAppKey does
-        without attaching the hive to the live registry. The file is copied to a scratch
-        path first, because RegLoadAppKey needs write access and will replay the
-        transaction logs into whatever file it is given.
+        authoritative test is to have Windows parse it, which is done by loading a scratch
+        copy with reg.exe. The copy means the file on the offline disk is never modified by
+        the check, while log replay still happens exactly as it would at boot, so a hive
+        that is merely dirty is correctly reported as healthy rather than corrupt.
+
+        RegLoadAppKey is deliberately not used. It rejects primary OS hives with
+        ERROR_BADDB (1009): measured on a healthy Windows Server 2022 disk, SAM and
+        COMPONENTS load through it but SYSTEM and SOFTWARE always fail, while reg.exe
+        loads the same SYSTEM file without error.
 
     .OUTPUTS
         PSCustomObject with Path, Exists, Size, IsValid and Reason.
@@ -306,8 +311,9 @@ function Test-OfflineHiveFile {
         Reason  = $null
     }
 
-    $handle = [IntPtr]::Zero
     $scratch = $null
+    $mountKey = "RSLVALIDATE$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $mounted = $false
     try {
         if (-not (Test-OfflinePath $Path)) { throw 'File does not exist.' }
 
@@ -324,37 +330,20 @@ function Test-OfflineHiveFile {
         try { [void]$stream.Read($header, 0, 4) } finally { $stream.Dispose() }
         if ([System.Text.Encoding]::ASCII.GetString($header) -ne 'regf') { throw "Hive header signature 'regf' is missing." }
 
-        if (-not ('RslOffline.NativeHive' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-namespace RslOffline {
-    public static class NativeHive {
-        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        public static extern int RegLoadAppKey(string lpFile, out IntPtr phkResult, int samDesired, int dwOptions, int reserved);
-        [DllImport("advapi32.dll", SetLastError = true)]
-        public static extern int RegCloseKey(IntPtr hKey);
-    }
-}
-'@ -ErrorAction Stop
-        }
-
-        $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("rsl-hive-{0}.hiv" -f [guid]::NewGuid().ToString('N'))
+        $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("rsl-hive-{0}" -f [guid]::NewGuid().ToString('N'))
         Copy-Item -LiteralPath $Path -Destination $scratch -Force -ErrorAction Stop
 
-        # The transaction logs are copied too, because a hive that is only dirty rather than
-        # damaged is repaired by log replay and must not be reported as corrupt.
+        # The transaction logs travel with the hive so that a dirty hive is recovered the
+        # way Windows would recover it, instead of being reported as damaged.
         foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
             if (Test-OfflinePath "$Path$suffix") {
                 Copy-Item -LiteralPath "$Path$suffix" -Destination "$scratch$suffix" -Force -ErrorAction SilentlyContinue
             }
         }
 
-        $status = [RslOffline.NativeHive]::RegLoadAppKey($scratch, [ref]$handle, 0x20019, 1, 0)
-        if ($status -ne 0) {
-            $message = (New-Object System.ComponentModel.Win32Exception($status)).Message
-            throw "Windows could not load the hive: $message (error $status)."
-        }
+        $loadOutput = & reg.exe load "HKLM\$mountKey" $scratch 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -ne 0) { throw "Windows could not load the hive: $((@($loadOutput) -join ' ').Trim())" }
+        $mounted = $true
 
         $result.IsValid = $true
     }
@@ -362,8 +351,10 @@ namespace RslOffline {
         $result.Reason = $_.Exception.Message
     }
     finally {
-        if ($handle -ne [IntPtr]::Zero -and ('RslOffline.NativeHive' -as [type])) {
-            [void][RslOffline.NativeHive]::RegCloseKey($handle)
+        if ($mounted) {
+            [gc]::Collect()
+            [gc]::WaitForPendingFinalizers()
+            & reg.exe unload "HKLM\$mountKey" 2>&1 | Out-Null
         }
         if ($scratch) {
             foreach ($suffix in @('', '.LOG', '.LOG1', '.LOG2')) {

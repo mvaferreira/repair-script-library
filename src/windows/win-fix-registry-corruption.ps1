@@ -12,14 +12,15 @@
 #     1. The hive file is missing.
 #     2. The hive file is 0 bytes.
 #     3. The hive file does not start with the 'regf' signature.
-#     4. Windows itself cannot parse the hive. This is the authoritative check: the file is copied
-#        to scratch space with its transaction logs and handed to RegLoadAppKey, so a hive that is
-#        merely dirty is repaired by log replay and is correctly reported as healthy.
+#     4. Windows itself cannot parse the hive. This is the authoritative check: a scratch copy of
+#        the hive and its transaction logs is loaded with reg.exe, so a hive that is merely dirty
+#        is recovered by log replay and correctly reported as healthy, and the file on the offline
+#        disk is never modified by the check.
 #     5. chkreg.exe reports repairable structural damage in a hive that still loads.
 #
 #   Repair escalates only as far as it needs to, per hive:
-#     a. chkreg.exe /R /C on a scratch copy. The result must load through RegLoadAppKey before it
-#        is allowed anywhere near the disk, so a failed repair can never replace a working hive.
+#     a. chkreg.exe /R /C on a scratch copy. The result must load through reg.exe before it is
+#        allowed anywhere near the disk, so a failed repair can never replace a working hive.
 #     b. Restore from Windows\System32\Config\RegBack when the hive cannot be repaired in place.
 #        The RegBack set is validated first: every candidate must load, SYSTEM and SOFTWARE must
 #        both be present, SAM and SECURITY are restored only as a pair, and any hive whose
