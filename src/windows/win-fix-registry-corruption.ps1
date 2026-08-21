@@ -194,6 +194,7 @@ function Invoke-ChkReg {
     }
 
     $working = Join-Path $ScratchDir (Split-Path -Path $HivePath -Leaf)
+    if (-not (Test-OfflinePath $ScratchDir)) { New-Item -Path $ScratchDir -ItemType Directory -Force | Out-Null }
     Copy-Item -LiteralPath $HivePath -Destination $working -Force -ErrorAction Stop
     foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
         if (Test-OfflinePath "$HivePath$suffix") {
@@ -579,7 +580,16 @@ try {
 
     foreach ($finding in $findings) {
         if ($chkRegPath -and $finding.Cause -ne 'HiveMissing') {
-            if (Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir) {
+            # A failure repairing one hive must not abandon the others: it falls through to the
+            # RegBack path for this hive and the run carries on.
+            $inPlace = $false
+            try {
+                $inPlace = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir
+            }
+            catch {
+                Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): in place repair could not run ($($_.Exception.Message))."
+            }
+            if ($inPlace) {
                 $finding.Repaired = $true
                 [void]$repairedInPlace.Add($finding.Item)
                 Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
