@@ -71,6 +71,15 @@
 #   Winlogon or Session Manager key belongs to win-fix-logon-subsystem, and boot storage driver
 #   settings belong to win-fix-inaccessible-boot-device.
 #
+#   Only hives that are actually damaged are repaired or restored. A RegBack copy is always
+#   older than the file it replaces, so restoring a healthy hive would silently revert working
+#   configuration. SAM and SECURITY are the one exception and only between themselves: they are
+#   sealed with the SysKey held in SYSTEM and cross-reference each other, so if one has to be
+#   restored its partner is restored from the same backup. When that happens, local account
+#   passwords revert to their state at backup time, and on a domain joined VM the machine
+#   account password reverts with them, so the domain trust may need repairing after boot.
+#   Every file the script replaces is copied to <name>.bak-<timestamp> first.
+#
 #   After recovery, consider re-enabling the periodic RegBack backup on the repaired VM with
 #   HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Configuration Manager
 #   EnablePeriodicBackup = 1, so a future incident has a recent restore point.
@@ -452,11 +461,23 @@ function Restore-HiveFromRegBack {
     $targets = @($Plan.Hives | Where-Object { $_.Name -in $Wanted })
     if ($targets.Count -eq 0) { return @() }
 
-    # SYSTEM and SOFTWARE come from the same point in time, so restoring one without the other
-    # produces a pair that disagree about installed software and services.
-    $core = @($Plan.Hives | Where-Object { $_.Required })
-    foreach ($item in $core) {
-        if ($item.Name -notin @($targets.Name)) { $targets += $item }
+    # Only damaged hives are restored. Every RegBack copy is older than the file it replaces,
+    # so restoring a healthy hive is a silent regression: a month old SYSTEM reverts driver and
+    # service configuration, and a month old SOFTWARE reverts installed software state. A VM
+    # whose only real problem was one small hive must not lose either.
+    #
+    # SAM and SECURITY are the exception, and only between themselves. Both are sealed with the
+    # SysKey held in SYSTEM and they cross-reference each other, so a current SAM beside a
+    # restored SECURITY is an inconsistent account database. When one of them has to be
+    # restored, its partner comes from the same backup or neither is touched.
+    $identity = @('SAM', 'SECURITY')
+    if (@($targets | Where-Object { $_.Name -in $identity }).Count -gt 0) {
+        $partner = @($Plan.Hives | Where-Object { $_.Name -in $identity -and $_.Name -notin @($targets.Name) })
+        if ($partner.Count -gt 0) {
+            $targets += $partner
+            Add-OfflineRepairLog -Level Warning -Message "Restoring $(@($partner.Name) -join ' and ') from RegBack as well, because the account and security hives are sealed together and only work as a matched pair."
+        }
+        Add-OfflineRepairLog -Level Warning -Message 'The account hives are being replaced with older copies. Local account passwords revert to their state at backup time, and on a domain joined VM the machine account password reverts too, so the domain trust may need to be repaired after the VM boots.'
     }
 
     $stamp = Get-Date -Format yyyyMMddHHmmss
