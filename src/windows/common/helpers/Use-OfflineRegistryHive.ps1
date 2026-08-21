@@ -288,8 +288,16 @@ function Test-OfflineHiveFile {
         A size and 'regf' signature check only proves the file looks like a hive. The
         authoritative test is to have Windows parse it, which is done by loading a scratch
         copy with reg.exe. The copy means the file on the offline disk is never modified by
-        the check, while log replay still happens exactly as it would at boot, so a hive
-        that is merely dirty is correctly reported as healthy rather than corrupt.
+        the check, while log replay still happens exactly as it would at boot, so a dirty
+        hive whose logs are present and applicable is correctly reported as healthy.
+
+        This is a test of whether Windows will load the file as it stands, not a verdict on
+        whether the data is recoverable. A hive left unreconciled with no usable logs, which
+        is the normal state of a RegBack copy, is reported invalid here even though chkreg
+        can recover it. Callers that have a recovery path must try it before giving up.
+
+        It is also not a corruption check. reg.exe loads a hive with wrecked bins without
+        complaining, so structural damage needs chkreg on top of this.
 
         RegLoadAppKey is deliberately not used. It rejects primary OS hives with
         ERROR_BADDB (1009): measured on a healthy Windows Server 2022 disk, SAM and

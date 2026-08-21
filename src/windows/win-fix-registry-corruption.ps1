@@ -228,6 +228,89 @@ function Invoke-ChkReg {
     return $result
 }
 
+function Resolve-RegBackSource {
+    <#
+    .SYNOPSIS
+        Decides whether one RegBack file can be used, recovering it first when it needs it.
+
+    .DESCRIPTION
+        A RegBack copy is frequently left unreconciled: the backup is taken while the hive is
+        being flushed, so the base block carries a primary sequence one ahead of the secondary
+        one. Windows normally settles that by replaying the transaction logs, but RegBack keeps
+        no logs, so reg.exe rejects the file with ERROR_BADDB and it looks corrupt.
+
+        Measured on this repository's copy of chkreg.exe against a Windows Server 2022 RegBack
+        set, both SECURITY (sequence 197/196) and DEFAULT (43/42) had valid base block checksums
+        and intact bodies, and were rejected only for being unreconciled. Discarding them would
+        disable the fallback precisely when it is needed.
+
+        So a candidate that fails validation gets exactly one recovery attempt with chkreg /R,
+        which rolls the sequence back to the last write Windows confirmed as durable and
+        discards the unconfirmed one. That is the conservative direction: nothing is assumed to
+        have completed. The recovered copy is then only accepted if it both loads and passes a
+        fresh structural check, and it is that copy, not the untouched RegBack file, that the
+        caller restores. Restoring the raw file would hand the same unreconciled hive to the
+        boot loader with its logs already moved aside.
+
+    .OUTPUTS
+        PSCustomObject with IsUsable, Path, Reconciled and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $false)][string]$ChkRegPath = '',
+        [Parameter(Mandatory = $false)][string]$ScratchDir = ''
+    )
+
+    $result = [PSCustomObject]@{ IsUsable = $false; Path = $SourcePath; Reconciled = $false; Reason = '' }
+    $canUseChkReg = ($ChkRegPath -and $ScratchDir)
+
+    $validation = Test-OfflineHiveFile -Path $SourcePath
+    if ($validation.IsValid) {
+        if (-not $canUseChkReg) {
+            $result.IsUsable = $true
+            return $result
+        }
+
+        # Loading is not enough on its own: reg.exe loads a hive with damaged bins without
+        # complaining, so a backup has to pass chkreg before it is treated as a usable source.
+        $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-check') -Repair $false
+        if (-not $check.FoundProblem) {
+            $result.IsUsable = $true
+            return $result
+        }
+        $result.Reason = "The backup fails chkreg validation (exit $($check.ExitCode))."
+    }
+    else {
+        $result.Reason = "The backup does not load: $($validation.Reason)"
+    }
+
+    if (-not $canUseChkReg) { return $result }
+
+    $fix = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-fix') -Repair $true
+    if (-not $fix.RepairedPath) {
+        $result.Reason = "$($result.Reason) chkreg could not recover it (exit $($fix.ExitCode))."
+        return $result
+    }
+
+    $recheck = Test-OfflineHiveFile -Path $fix.RepairedPath
+    if (-not $recheck.IsValid) {
+        $result.Reason = "$($result.Reason) The recovered copy still does not load ($($recheck.Reason))"
+        return $result
+    }
+
+    $verify = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $fix.RepairedPath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-verify') -Repair $false
+    if ($verify.FoundProblem) {
+        $result.Reason = "$($result.Reason) The recovered copy still fails chkreg (exit $($verify.ExitCode))."
+        return $result
+    }
+
+    $result.IsUsable = $true
+    $result.Path = $fix.RepairedPath
+    $result.Reconciled = $true
+    $result.Reason = "$($result.Reason) chkreg recovered it and the recovered copy loads and validates cleanly."
+    return $result
+}
+
 function Get-RegBackPlan {
     <#
     .SYNOPSIS
@@ -262,27 +345,23 @@ function Get-RegBackPlan {
             continue
         }
 
-        $validation = Test-OfflineHiveFile -Path $source
-        if (-not $validation.IsValid) {
-            $excluded += [PSCustomObject]@{ Name = $spec.Name; Reason = $validation.Reason }
+        $prepared = Resolve-RegBackSource -SourcePath $source -ChkRegPath $ChkRegPath -ScratchDir $ScratchDir
+        if (-not $prepared.IsUsable) {
+            $excluded += [PSCustomObject]@{ Name = $spec.Name; Reason = $prepared.Reason }
             continue
         }
-
-        # Loading is not enough on its own: reg.exe loads a hive with damaged bins without
-        # complaining, so a backup has to pass chkreg before it is treated as a usable source.
-        if ($ChkRegPath -and $ScratchDir) {
-            $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $source -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback') -Repair $false
-            if ($check.FoundProblem) {
-                $excluded += [PSCustomObject]@{ Name = $spec.Name; Reason = "The backup copy fails chkreg validation (exit $($check.ExitCode))." }
-                continue
-            }
+        if ($prepared.Reconciled) {
+            Add-OfflineRepairLog -Message "RegBack $($spec.Name): $($prepared.Reason)"
         }
 
         $usable += [PSCustomObject]@{
             Name       = $spec.Name
             Required   = $spec.Required
-            SourcePath = $source
+            SourcePath = $prepared.Path
             LivePath   = (Join-OfflinePath -Root $ConfigPath -ChildPath $spec.Name)
+            # The timestamp always comes from the RegBack file itself. A recovered copy is
+            # written now, and using its timestamp would defeat the skew check that keeps
+            # hives from different restore points from being mixed.
             WrittenUtc = (Get-Item -LiteralPath $source -Force).LastWriteTimeUtc
         }
     }
