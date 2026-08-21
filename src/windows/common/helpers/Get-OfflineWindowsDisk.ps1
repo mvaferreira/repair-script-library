@@ -32,22 +32,41 @@
     v1.0: Initial version.
 #>
 
+function Test-DriveLetterInUse {
+    <#
+    .SYNOPSIS
+        Returns $true when a drive letter is already taken.
+
+    .DESCRIPTION
+        Get-Volume and Get-Partition do not report drive letters that were assigned to
+        hidden System or Recovery partitions, so the root path is probed directly as well.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$DriveLetter
+    )
+
+    $letter = $DriveLetter.TrimEnd(':', '\')
+    if (Test-Path -LiteralPath "${letter}:\") { return $true }
+    if (Get-PSDrive -Name $letter -PSProvider FileSystem -ErrorAction SilentlyContinue) { return $true }
+    if (Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue) { return $true }
+    return $false
+}
+
 function Get-FreeDriveLetter {
     <#
     .SYNOPSIS
-        Returns the next unused drive letter, searching from Z: downwards by default.
+        Returns the next unused drive letter, searching from Z: downwards.
     #>
     param(
         [Parameter(Mandatory = $false)][string[]]$Exclude = @()
     )
 
-    $used = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter)" })
-    $used += @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-    $used += $Exclude | ForEach-Object { $_.TrimEnd(':', '\') }
+    $excluded = @($Exclude | ForEach-Object { $_.TrimEnd(':', '\').ToUpperInvariant() })
 
-    foreach ($letter in ([char[]](90..68))) {
-        # Z down to E - A-D are reserved for floppies and the rescue VM system/temp disks.
-        if ($used -notcontains "$letter") { return "$letter" }
+    # Z down to E. A-D are reserved for the rescue VM's own system and temporary disks.
+    foreach ($letter in ([char[]](90..69))) {
+        if ($excluded -contains "$letter") { continue }
+        if (-not (Test-DriveLetterInUse -DriveLetter "$letter")) { return "$letter" }
     }
 
     throw 'No free drive letter is available on the rescue VM.'
@@ -134,7 +153,14 @@ function Add-PartitionDriveLetter {
 
     .DESCRIPTION
         Set-Partition -NewDriveLetter fails on EFI System and Recovery partitions, so
-        diskpart is used instead. Returns the assigned drive letter, or $null on failure.
+        diskpart is used, with Add-PartitionAccessPath as a fallback.
+
+        Success is verified by probing the drive root rather than by re-reading
+        Get-Partition, because the partition object never reports a drive letter for
+        hidden System and Recovery partitions even after one has been assigned.
+
+    .OUTPUTS
+        The assigned drive letter (without a colon), or $null on failure.
     #>
     param(
         [Parameter(Mandatory = $true)][int]$DiskNumber,
@@ -143,23 +169,35 @@ function Add-PartitionDriveLetter {
     )
 
     if ([string]::IsNullOrWhiteSpace($DriveLetter)) { $DriveLetter = Get-FreeDriveLetter }
-    $DriveLetter = $DriveLetter.TrimEnd(':', '\')
+    $DriveLetter = $DriveLetter.TrimEnd(':', '\').ToUpperInvariant()
 
-    $script = @"
+    $diskpartScript = @"
 select disk $DiskNumber
 select partition $PartitionNumber
-assign letter=$DriveLetter noerr
+assign letter=$DriveLetter
+exit
 "@
-    $null = $script | diskpart.exe 2>&1
+    $null = $diskpartScript | diskpart.exe 2>&1
     Start-Sleep -Milliseconds 500
 
-    $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
-    if ($partition -and $partition.DriveLetter) {
-        Log-Info "Assigned drive letter $($partition.DriveLetter): to disk $DiskNumber partition $PartitionNumber ($($partition.Type))."
-        return "$($partition.DriveLetter)"
+    if (Test-Path -LiteralPath "${DriveLetter}:\") {
+        Log-Info "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber."
+        return $DriveLetter
     }
 
-    Log-Warning "Could not assign a drive letter to disk $DiskNumber partition $PartitionNumber ($(if ($partition) { $partition.Type } else { 'unknown' }))."
+    # Fallback for partitions diskpart refuses to address, such as the MSR partition.
+    try {
+        Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -AccessPath "${DriveLetter}:" -ErrorAction Stop
+        if (Test-Path -LiteralPath "${DriveLetter}:\") {
+            Log-Info "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber (access path)."
+            return $DriveLetter
+        }
+    }
+    catch {
+        Log-Info "Could not add an access path for disk $DiskNumber partition ${PartitionNumber}: $($_.Exception.Message)"
+    }
+
+    Log-Warning "Could not assign a drive letter to disk $DiskNumber partition $PartitionNumber."
     return $null
 }
 
@@ -318,11 +356,25 @@ function Get-OfflineWindowsDisk {
 
     # Give every partition a drive letter. EFI System and Recovery partitions have none
     # by default, and offline boot repairs cannot reach them without one.
+    # Get-Partition never reports a letter for those partitions even after assignment,
+    # so the letters are tracked here and used for all later path building.
+    $partitionRoots = @{}
     foreach ($disk in $disks) {
         foreach ($part in (Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
-            if ($part.DriveLetter) { continue }
+            $key = "$($disk.Number)-$($part.PartitionNumber)"
+
+            $existing = @($part.AccessPaths | Where-Object { $_ -and $_ -match '^[A-Za-z]:' })
+            if ($existing.Count -gt 0) {
+                $partitionRoots[$key] = @($existing | ForEach-Object { $_.TrimEnd('\') })
+                continue
+            }
+
+            # The Microsoft Reserved partition holds no file system and cannot be mounted.
+            if ("$($part.Type)" -eq 'Reserved') { continue }
             if ($part.Size -lt 1MB) { continue }
-            $null = Add-PartitionDriveLetter -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber
+
+            $letter = Add-PartitionDriveLetter -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber
+            if ($letter) { $partitionRoots[$key] = @("${letter}:") }
         }
     }
 
@@ -331,8 +383,8 @@ function Get-OfflineWindowsDisk {
         $generation = if ($disk.PartitionStyle -eq 'GPT') { 2 } elseif ($disk.PartitionStyle -eq 'MBR') { 1 } else { 0 }
 
         foreach ($part in (Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
-            $accessPaths = @($part.AccessPaths | Where-Object { $_ -and $_ -match '^[A-Za-z]:' })
-            foreach ($accessPath in $accessPaths) {
+            foreach ($accessPath in @($partitionRoots["$($disk.Number)-$($part.PartitionNumber)"])) {
+                if (-not $accessPath) { continue }
                 if (-not (Test-Path -LiteralPath (Join-Path $accessPath 'Windows\System32\ntdll.dll'))) { continue }
 
                 $normalized = if ($accessPath -match '\\$') { $accessPath } else { "$accessPath\" }
@@ -373,11 +425,12 @@ function Get-OfflineWindowsDisk {
     $bootDrive = $null
     $bcdStorePath = $null
     foreach ($part in (Get-Partition -DiskNumber $selected.DiskNumber -ErrorAction SilentlyContinue)) {
-        foreach ($accessPath in @($part.AccessPaths | Where-Object { $_ -and $_ -match '^[A-Za-z]:' })) {
+        foreach ($accessPath in @($partitionRoots["$($selected.DiskNumber)-$($part.PartitionNumber)"])) {
+            if (-not $accessPath) { continue }
             $efiBcd = Join-Path $accessPath 'EFI\Microsoft\Boot\BCD'
             $biosBcd = Join-Path $accessPath 'Boot\BCD'
 
-            if ($generation -eq 2 -and "$($part.Type)" -eq 'System' -and (Test-Path -LiteralPath $efiBcd)) {
+            if ($generation -eq 2 -and (Test-Path -LiteralPath $efiBcd)) {
                 $bootDrive = $accessPath.TrimEnd('\'); $bcdStorePath = $efiBcd; break
             }
             if ($generation -ne 2 -and (Test-Path -LiteralPath $biosBcd)) {
@@ -388,7 +441,22 @@ function Get-OfflineWindowsDisk {
     }
 
     if (-not $bootDrive) {
-        Log-Warning 'No BCD store was found on the attached disk. Boot configuration repairs will not be available.'
+        # The BCD file may be missing while the system partition itself is intact.
+        foreach ($part in (Get-Partition -DiskNumber $selected.DiskNumber -ErrorAction SilentlyContinue)) {
+            $isBootPartition = ("$($part.Type)" -eq 'System') -or ($generation -ne 2 -and $part.IsActive)
+            if (-not $isBootPartition) { continue }
+            $root = @($partitionRoots["$($selected.DiskNumber)-$($part.PartitionNumber)"]) | Select-Object -First 1
+            if ($root) {
+                $bootDrive = $root.TrimEnd('\')
+                $bcdStorePath = if ($generation -eq 2) { Join-Path $bootDrive 'EFI\Microsoft\Boot\BCD' } else { Join-Path $bootDrive 'Boot\BCD' }
+                Log-Warning "No BCD store was found at $bcdStorePath, but the boot partition is present at $bootDrive."
+                break
+            }
+        }
+    }
+
+    if (-not $bootDrive) {
+        Log-Warning 'No boot partition was found on the attached disk. Boot configuration repairs will not be available.'
     }
 
     $script:OfflineWindowsDrive = $selected.Drive
@@ -406,6 +474,7 @@ function Get-OfflineWindowsDisk {
         BuildNumber       = $selected.CurrentBuildNumber
         GuestComputerName = $selected.GuestComputerName
         SetupInProgress   = $selected.SetupInProgress
+        PartitionRoots    = $partitionRoots
         Candidates        = $sorted
     }
 
