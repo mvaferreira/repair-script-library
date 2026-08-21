@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Shared primitives for the offline repair helpers: buffered logging and drive-safe paths.
+    Shared primitives for the offline repair helpers: buffered logging, drive-safe paths
+    and offline binary trust checks.
 
 .DESCRIPTION
     Buffered logging
@@ -148,4 +149,78 @@ function Test-OfflinePath {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     try { return [bool](Test-Path -LiteralPath $Path -ErrorAction Stop) }
     catch { return $false }
+}
+
+function Test-OfflineFileSignature {
+    <#
+    .SYNOPSIS
+        Reports whether a binary on the offline disk is a trustworthy Microsoft file.
+
+    .DESCRIPTION
+        Authenticode alone is not enough offline. Most Windows inbox binaries are catalog
+        signed, and the catalog store of the broken installation is not available to the
+        rescue VM, so Get-AuthenticodeSignature reports NotSigned for perfectly good files.
+        Boot manager payloads are compressed stubs that are not parseable at all. The
+        version resource is therefore used as a fallback before a file is called untrusted.
+
+    .PARAMETER FilePath
+        Full path to the file on the offline disk.
+
+    .OUTPUTS
+        PSCustomObject with Path, IsSigned, IsMicrosoft, Status and Subject.
+
+    .EXAMPLE
+        (Test-OfflineFileSignature -FilePath 'D:\Windows\System32\drivers\storvsc.sys').IsMicrosoft
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath
+    )
+
+    $result = [PSCustomObject]@{
+        Path        = $FilePath
+        IsSigned    = $false
+        IsMicrosoft = $false
+        Status      = 'FileNotFound'
+        Subject     = ''
+    }
+
+    if (-not (Test-OfflinePath $FilePath)) { return $result }
+
+    $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+    if (-not $item -or $item.Length -eq 0) {
+        $result.Status = 'ZeroByte'
+        return $result
+    }
+
+    try { $signature = Get-AuthenticodeSignature -LiteralPath $FilePath -ErrorAction Stop }
+    catch {
+        $result.Status = 'Error'
+        return $result
+    }
+
+    $result.Status = [string]$signature.Status
+    $result.Subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
+
+    if ($signature.Status -eq 'Valid') {
+        $result.IsSigned = $true
+        if ($result.Subject -match 'O=Microsoft Corporation') { $result.IsMicrosoft = $true }
+        return $result
+    }
+
+    $versionInfo = $item.VersionInfo
+    if ($versionInfo -and $versionInfo.CompanyName -match 'Microsoft') {
+        $result.IsSigned = $true
+        $result.IsMicrosoft = $true
+        $result.Status = 'CatalogSigned'
+        $result.Subject = $versionInfo.CompanyName
+    }
+    elseif ($signature.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
+        # Not parseable by Authenticode and carrying no version resource, for example a
+        # compressed boot stub. Inconclusive rather than untrusted.
+        $result.Status = 'NotVerifiable'
+        $result.IsSigned = $true
+        $result.IsMicrosoft = $true
+    }
+
+    return $result
 }
