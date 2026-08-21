@@ -75,7 +75,81 @@ function Get-FreeDriveLetter {
         if (-not (Test-DriveLetterInUse -DriveLetter "$letter")) { return "$letter" }
     }
 
-    throw 'No free drive letter is available on the rescue VM.'
+    throw 'No free drive letter is available on the rescue VM. Remove unused mount points with "mountvol <letter>: /d" and run the script again.'
+}
+
+function Get-VolumeDriveLetterMap {
+    <#
+    .SYNOPSIS
+        Maps each volume GUID path to the drive letters currently mounted on it.
+
+    .DESCRIPTION
+        Get-Partition never reports a drive letter for hidden EFI System and Recovery
+        partitions, even after one has been assigned, but those partitions do report
+        their \\?\Volume{...}\ path. mountvol is the one source that still lists the
+        letters mounted on such a volume, so its output is parsed to recover them.
+
+        Without this, every run would believe those partitions have no letter and
+        assign another one, exhausting the alphabet after a handful of runs.
+
+    .OUTPUTS
+        Hashtable keyed by volume GUID path (no trailing backslash) whose values are
+        drive letter arrays in the form 'K:'.
+    #>
+    $map = @{}
+    $currentVolume = $null
+
+    foreach ($line in @(mountvol.exe 2>$null)) {
+        $text = "$line".Trim()
+
+        if ($text -match '^\\\\\?\\Volume\{[0-9a-fA-F-]+\}\\?$') {
+            $currentVolume = $text.TrimEnd('\')
+            if (-not $map.ContainsKey($currentVolume)) { $map[$currentVolume] = @() }
+            continue
+        }
+
+        if (-not $currentVolume) { continue }
+        if ($text -match '^([A-Za-z]):\\?$') { $map[$currentVolume] += "$($Matches[1].ToUpperInvariant()):" }
+    }
+
+    return $map
+}
+
+function Get-PartitionExistingRoot {
+    <#
+    .SYNOPSIS
+        Returns the drive letters already usable for a partition, or an empty array.
+
+    .DESCRIPTION
+        Reported access paths are confirmed before they are trusted, because a
+        partition can advertise a letter whose drive is no longer mounted. When the
+        partition reports no letter at all, its volume GUID path is looked up in the
+        mountvol map so an already-assigned letter on a hidden partition is reused
+        instead of a new one being handed out.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Partition,
+        [Parameter(Mandatory = $false)][hashtable]$VolumeMap = @{}
+    )
+
+    $existing = @($Partition.AccessPaths |
+        Where-Object { $_ -and $_ -match '^[A-Za-z]:' } |
+        ForEach-Object { $_.TrimEnd('\').ToUpperInvariant() } |
+        Where-Object { Test-OfflinePath "$_\" })
+
+    if ($existing.Count -gt 0) { return @($existing | Select-Object -Unique) }
+
+    foreach ($volumePath in @($Partition.AccessPaths | Where-Object { $_ -and $_ -match '^\\\\\?\\Volume\{' })) {
+        $key = $volumePath.TrimEnd('\')
+        if (-not $VolumeMap.ContainsKey($key)) { continue }
+
+        # All letters on one volume address the same file system, so the first
+        # usable one is enough and keeps later path building deterministic.
+        $recovered = @($VolumeMap[$key] | Where-Object { Test-OfflinePath "$_\" } | Select-Object -First 1)
+        if ($recovered.Count -gt 0) { return @($recovered) }
+    }
+
+    return @()
 }
 
 function Stop-NestedRepairVm {
@@ -365,17 +439,12 @@ function Get-OfflineWindowsDisk {
     # Get-Partition never reports a letter for those partitions even after assignment,
     # so the letters are tracked here and used for all later path building.
     $partitionRoots = @{}
+    $volumeMap = Get-VolumeDriveLetterMap
     foreach ($disk in $disks) {
         foreach ($part in (Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
             $key = "$($disk.Number)-$($part.PartitionNumber)"
 
-            # A partition can advertise an access path whose drive is no longer mounted,
-            # so each reported letter is confirmed before it is trusted.
-            $existing = @($part.AccessPaths |
-                Where-Object { $_ -and $_ -match '^[A-Za-z]:' } |
-                ForEach-Object { $_.TrimEnd('\') } |
-                Where-Object { Test-OfflinePath "$_\" })
-
+            $existing = @(Get-PartitionExistingRoot -Partition $part -VolumeMap $volumeMap)
             if ($existing.Count -gt 0) {
                 $partitionRoots[$key] = @($existing)
                 continue
