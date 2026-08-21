@@ -31,7 +31,7 @@
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    . .\src\windows\common\helpers\OfflineRepairLog.ps1
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
 }
 
 # Drive letter of the offline Windows installation, normally set by Get-OfflineWindowsDisk.ps1.
@@ -51,7 +51,7 @@ function Get-OfflineHiveFilePath {
         [string]$Hive
     )
 
-    return (Join-Path $WindowsPath "System32\Config\$Hive")
+    return (Join-OfflinePath -Root $WindowsPath -ChildPath "System32\Config\$Hive")
 }
 
 function Mount-OfflineHive {
@@ -67,7 +67,7 @@ function Mount-OfflineHive {
     )
 
     $offHive = Get-OfflineHiveFilePath -WindowsPath $WindowsPath -Hive $Hive
-    if (-not (Test-Path $offHive)) {
+    if (-not (Test-OfflinePath $offHive)) {
         throw "$Hive hive not found: $offHive"
     }
 
@@ -178,7 +178,7 @@ function Invoke-WithHive {
         if ([string]::IsNullOrWhiteSpace($script:OfflineWindowsDrive)) {
             throw 'The offline Windows drive is unknown. Run Get-OfflineWindowsDisk first, or pass -WindowsPath.'
         }
-        $WindowsPath = Join-Path $script:OfflineWindowsDrive 'Windows'
+        $WindowsPath = Join-OfflinePath -Root $script:OfflineWindowsDrive -ChildPath 'Windows'
     }
 
     $mountedHere = [System.Collections.Generic.List[string]]::new()
@@ -271,7 +271,7 @@ function Backup-OfflineHiveFile {
     )
 
     $source = Get-OfflineHiveFilePath -WindowsPath $WindowsPath -Hive $Hive
-    if (-not (Test-Path $source)) { throw "$Hive hive not found: $source" }
+    if (-not (Test-OfflinePath $source)) { throw "$Hive hive not found: $source" }
 
     $backup = "$source.bak-$(Get-Date -Format yyyyMMddHHmmss)"
     Copy-Item -LiteralPath $source -Destination $backup -Force

@@ -32,7 +32,7 @@
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    . .\src\windows\common\helpers\OfflineRepairLog.ps1
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
 }
 
 function Get-BcdStorePath {

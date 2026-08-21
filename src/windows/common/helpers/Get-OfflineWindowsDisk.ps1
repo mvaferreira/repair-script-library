@@ -35,7 +35,7 @@
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    . .\src\windows\common\helpers\OfflineRepairLog.ps1
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
 }
 
 function Test-DriveLetterInUse {
@@ -52,7 +52,7 @@ function Test-DriveLetterInUse {
     )
 
     $letter = $DriveLetter.TrimEnd(':', '\')
-    if (Test-Path -LiteralPath "${letter}:\") { return $true }
+    if (Test-OfflinePath "${letter}:\") { return $true }
     if (Get-PSDrive -Name $letter -PSProvider FileSystem -ErrorAction SilentlyContinue) { return $true }
     if (Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue) { return $true }
     return $false
@@ -186,7 +186,7 @@ exit
     $null = $diskpartScript | diskpart.exe 2>&1
     Start-Sleep -Milliseconds 500
 
-    if (Test-Path -LiteralPath "${DriveLetter}:\") {
+    if (Test-OfflinePath "${DriveLetter}:\") {
         Add-OfflineRepairLog -Level Info -Message "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber."
         return $DriveLetter
     }
@@ -194,7 +194,7 @@ exit
     # Fallback for partitions diskpart refuses to address, such as the MSR partition.
     try {
         Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -AccessPath "${DriveLetter}:" -ErrorAction Stop
-        if (Test-Path -LiteralPath "${DriveLetter}:\") {
+        if (Test-OfflinePath "${DriveLetter}:\") {
             Add-OfflineRepairLog -Level Info -Message "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber (access path)."
             return $DriveLetter
         }
@@ -224,11 +224,11 @@ function Get-OfflineWindowsInstallCandidate {
     )
 
     $normalizedPath = if ($AccessPath -match '\\$') { $AccessPath } else { "$AccessPath\" }
-    $windowsRoot = Join-Path $normalizedPath 'Windows'
-    $systemHivePath = Join-Path $windowsRoot 'System32\Config\SYSTEM'
-    $softwareHivePath = Join-Path $windowsRoot 'System32\Config\SOFTWARE'
+    $windowsRoot = Join-OfflinePath -Root $normalizedPath -ChildPath 'Windows'
+    $systemHivePath = Join-OfflinePath -Root $windowsRoot -ChildPath 'System32\Config\SYSTEM'
+    $softwareHivePath = Join-OfflinePath -Root $windowsRoot -ChildPath 'System32\Config\SOFTWARE'
     $winloadName = if ($Generation -eq 2) { 'System32\winload.efi' } else { 'System32\winload.exe' }
-    $expectedWinload = Join-Path $windowsRoot $winloadName
+    $expectedWinload = Join-OfflinePath -Root $windowsRoot -ChildPath $winloadName
 
     $candidate = [ordered]@{
         AccessPath          = $normalizedPath
@@ -238,9 +238,9 @@ function Get-OfflineWindowsInstallCandidate {
         PartitionType       = "$($PartitionInfo.Type)"
         IsActive            = [bool]$PartitionInfo.IsActive
         WindowsRoot         = $windowsRoot
-        SystemHivePresent   = [bool](Test-Path -LiteralPath $systemHivePath)
-        SoftwareHivePresent = [bool](Test-Path -LiteralPath $softwareHivePath)
-        HasExpectedWinload  = [bool](Test-Path -LiteralPath $expectedWinload)
+        SystemHivePresent   = Test-OfflinePath $systemHivePath
+        SoftwareHivePresent = Test-OfflinePath $softwareHivePath
+        HasExpectedWinload  = Test-OfflinePath $expectedWinload
         ProductName         = ''
         CurrentBuildNumber  = ''
         GuestComputerName   = ''
@@ -291,7 +291,7 @@ function Get-OfflineWindowsInstallCandidate {
         }
     }
 
-    if (Test-Path -LiteralPath (Join-Path $normalizedPath '$WINDOWS.~BT')) { $candidate.SetupInProgress = $true }
+    if (Test-OfflinePath (Join-OfflinePath -Root $normalizedPath -ChildPath '$WINDOWS.~BT')) { $candidate.SetupInProgress = $true }
 
     $score = 0
     if ($candidate.SystemHivePresent) { $score += 10 }
@@ -369,9 +369,15 @@ function Get-OfflineWindowsDisk {
         foreach ($part in (Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
             $key = "$($disk.Number)-$($part.PartitionNumber)"
 
-            $existing = @($part.AccessPaths | Where-Object { $_ -and $_ -match '^[A-Za-z]:' })
+            # A partition can advertise an access path whose drive is no longer mounted,
+            # so each reported letter is confirmed before it is trusted.
+            $existing = @($part.AccessPaths |
+                Where-Object { $_ -and $_ -match '^[A-Za-z]:' } |
+                ForEach-Object { $_.TrimEnd('\') } |
+                Where-Object { Test-OfflinePath "$_\" })
+
             if ($existing.Count -gt 0) {
-                $partitionRoots[$key] = @($existing | ForEach-Object { $_.TrimEnd('\') })
+                $partitionRoots[$key] = @($existing)
                 continue
             }
 
@@ -391,7 +397,7 @@ function Get-OfflineWindowsDisk {
         foreach ($part in (Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
             foreach ($accessPath in @($partitionRoots["$($disk.Number)-$($part.PartitionNumber)"])) {
                 if (-not $accessPath) { continue }
-                if (-not (Test-Path -LiteralPath (Join-Path $accessPath 'Windows\System32\ntdll.dll'))) { continue }
+                if (-not (Test-OfflinePath (Join-OfflinePath -Root $accessPath -ChildPath 'Windows\System32\ntdll.dll'))) { continue }
 
                 $normalized = if ($accessPath -match '\\$') { $accessPath } else { "$accessPath\" }
                 if ($candidates | Where-Object { $_.AccessPath -eq $normalized } | Select-Object -First 1) { continue }
@@ -433,13 +439,13 @@ function Get-OfflineWindowsDisk {
     foreach ($part in (Get-Partition -DiskNumber $selected.DiskNumber -ErrorAction SilentlyContinue)) {
         foreach ($accessPath in @($partitionRoots["$($selected.DiskNumber)-$($part.PartitionNumber)"])) {
             if (-not $accessPath) { continue }
-            $efiBcd = Join-Path $accessPath 'EFI\Microsoft\Boot\BCD'
-            $biosBcd = Join-Path $accessPath 'Boot\BCD'
+            $efiBcd = Join-OfflinePath -Root $accessPath -ChildPath 'EFI\Microsoft\Boot\BCD'
+            $biosBcd = Join-OfflinePath -Root $accessPath -ChildPath 'Boot\BCD'
 
-            if ($generation -eq 2 -and (Test-Path -LiteralPath $efiBcd)) {
+            if ($generation -eq 2 -and (Test-OfflinePath $efiBcd)) {
                 $bootDrive = $accessPath.TrimEnd('\'); $bcdStorePath = $efiBcd; break
             }
-            if ($generation -ne 2 -and (Test-Path -LiteralPath $biosBcd)) {
+            if ($generation -ne 2 -and (Test-OfflinePath $biosBcd)) {
                 $bootDrive = $accessPath.TrimEnd('\'); $bcdStorePath = $biosBcd; break
             }
         }
@@ -454,7 +460,7 @@ function Get-OfflineWindowsDisk {
             $root = @($partitionRoots["$($selected.DiskNumber)-$($part.PartitionNumber)"]) | Select-Object -First 1
             if ($root) {
                 $bootDrive = $root.TrimEnd('\')
-                $bcdStorePath = if ($generation -eq 2) { Join-Path $bootDrive 'EFI\Microsoft\Boot\BCD' } else { Join-Path $bootDrive 'Boot\BCD' }
+                $bcdStorePath = if ($generation -eq 2) { Join-OfflinePath -Root $bootDrive -ChildPath 'EFI\Microsoft\Boot\BCD' } else { Join-OfflinePath -Root $bootDrive -ChildPath 'Boot\BCD' }
                 Add-OfflineRepairLog -Level Warning -Message "No BCD store was found at $bcdStorePath, but the boot partition is present at $bootDrive."
                 break
             }

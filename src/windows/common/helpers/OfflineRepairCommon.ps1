@@ -1,8 +1,10 @@
 <#
 .SYNOPSIS
-    Buffered logging for helper functions that return a value.
+    Shared primitives for the offline repair helpers: buffered logging and drive-safe paths.
 
 .DESCRIPTION
+    Buffered logging
+    ----------------
     The library's Logger.ps1 functions write with Write-Output, which is the same stream
     a PowerShell function returns its value on. A helper that both logs and returns a
     value therefore returns the log lines as well, silently corrupting the result.
@@ -16,8 +18,16 @@
       - Call Write-OfflineRepairLog only at script level, never from a function whose
         return value is used, and always flush in the script's finally block.
 
+    Drive-safe paths
+    ----------------
+    Join-Path and Test-Path throw DriveNotFoundException when a path refers to a drive
+    letter that is not a live PowerShell drive. Offline repairs work with letters that
+    come and go (EFI and Recovery partitions are mounted temporarily, and a partition can
+    still advertise a stale access path), so Join-OfflinePath builds the string without
+    resolving the drive and Test-OfflinePath answers false instead of throwing.
+
 .NOTES
-    Name:   OfflineRepairLog.ps1
+    Name:   OfflineRepairCommon.ps1
     Requires: common/setup/init.ps1 to be dot-sourced first (for the Log-* functions).
 
 .VERSION
@@ -87,4 +97,55 @@ function Clear-OfflineRepairLog {
     if (Get-Variable -Name OfflineRepairLogBuffer -Scope Script -ErrorAction SilentlyContinue) {
         $script:OfflineRepairLogBuffer.Clear()
     }
+}
+
+function Join-OfflinePath {
+    <#
+    .SYNOPSIS
+        Joins a root and a child path without requiring the drive to exist.
+
+    .DESCRIPTION
+        Join-Path resolves the drive qualifier and throws DriveNotFoundException for a
+        letter that is not currently mounted. Offline repairs routinely build paths on
+        letters that are being mounted, are already unmounted, or are stale entries left
+        on a partition, so the join is done as plain string composition instead.
+
+    .PARAMETER Root
+        Root of the path, with or without a trailing backslash. For example 'D:' or 'D:\'.
+
+    .PARAMETER ChildPath
+        Relative path under the root, with or without a leading backslash.
+
+    .EXAMPLE
+        Join-OfflinePath -Root 'X:' -ChildPath 'Windows\System32\ntdll.dll'
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Root,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ChildPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
+    $trimmedRoot = $Root.TrimEnd('\')
+    if ([string]::IsNullOrWhiteSpace($ChildPath)) { return "$trimmedRoot\" }
+    return "$trimmedRoot\$($ChildPath.TrimStart('\'))"
+}
+
+function Test-OfflinePath {
+    <#
+    .SYNOPSIS
+        Tests a path, returning false instead of throwing when the drive does not exist.
+
+    .PARAMETER Path
+        Path to test. Treated literally, so square brackets and braces are safe.
+
+    .EXAMPLE
+        if (Test-OfflinePath 'X:\Windows\System32\ntdll.dll') { 'found' }
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try { return [bool](Test-Path -LiteralPath $Path -ErrorAction Stop) }
+    catch { return $false }
 }
