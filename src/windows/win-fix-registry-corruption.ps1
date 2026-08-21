@@ -701,6 +701,14 @@ try {
                 foreach ($finding in $findings) {
                     if ($finding.Item -in $restored) { $finding.Repaired = $true }
                 }
+
+                # A hive dragged in by the identity pair rule has had its in place repair
+                # overwritten by the older backup, so reporting it as repaired in place would
+                # misdescribe what is now on disk.
+                foreach ($name in @($repairedInPlace | Where-Object { $_ -in $restored })) {
+                    [void]$repairedInPlace.Remove($name)
+                    Log-Warning "$($name) was repaired in place, but has been replaced from RegBack to stay matched with its partner hive. The in place repair no longer applies." | Tee-Object -FilePath $logFile -Append
+                }
             }
         }
     }
