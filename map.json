@@ -158,5 +158,10 @@
 		"id": "win-crowdstrike-fix-bootloop-cvm",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
+	},
+	{
+		"id": "win-fix-third-party-drivers",
+		"path": "src/windows/win-fix-third-party-drivers.ps1",
+		"description": "Disables third party kernel drivers that stop a VM booting, refusing to touch any driver on the storage, network or boot path"
 	}
 ]
