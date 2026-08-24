@@ -85,6 +85,16 @@
 		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit, a portable executable scan for writable and executable sections as corroboration, and the offline Secure Boot state to prove a test signing conflict. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
 	},
 	{
+		"id" : "win-reset-group-policy",
+		"path" : "src/windows/win-reset-group-policy.ps1",
+		"description" : "Clears local Group Policy on an offline Windows disk when a VM boots but refuses every logon because of its own policy: Software Restriction Policies set to Disallowed, AppLocker enforcing rules that do not permit userinit.exe or explorer.exe, or a machine startup or user logon script that hangs. Reports what is configured and which of those three is set before changing anything. Renames the GroupPolicy and GroupPolicyUsers folders aside instead of deleting them and backs up the SOFTWARE hive, so both halves can be undone. Use parameter scope=files for the reversible half only, or detectOnly=true to report and change nothing. This is a deliberate blanket reset, not a targeted repair. NOTE: use option --run-on-repair."
+	},
+	{
+		"id" : "win-fix-logon-subsystem",
+		"path" : "src/windows/win-fix-logon-subsystem.ps1",
+		"description" : "Repairs the offline logon path behind stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI, and \"The User Profile Service service failed the sign-in\". Checks Session Manager BootExecute and SetupExecute, the SYSTEM\\Setup setup-mode command, Winlogon Shell and Userinit, and the ProfileList entries, resolving every command against the binary it actually names on the attached disk. Removes only the entries whose binary is missing, keeps the ones that resolve, and writes a Windows default back only when removing the broken entries would leave the value empty. Backs up each hive before it is written. Pass detectOnly=true to report only. Clearing local Group Policy is a separate job, handled by win-reset-group-policy. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-fix-ntfs-attribute-list",
 		"path" : "src/windows/win-fix-ntfs-attribute-list.ps1",
 		"description" : "Repairs the NTFS metafile attribute list entries that make a volume fail to mount with stop error 0x24 NTFS_FILE_SYSTEM, typically after a servicing operation. Corrects the single non-canonical name offset byte in place. This is not a chkdsk wrapper and chkdsk is not a substitute: faced with this layout chkdsk discards the whole attribute list, which orphans the child records it referenced and can leave $Secure without its security descriptor stream. Scans the reserved file records of every NTFS volume on the attached disk, writes a byte level restore manifest before the first write, and verifies through the same locked handle. Nothing is written when no correctable entry is found. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
