@@ -41,11 +41,18 @@
 #   Defaults to "false".
 #
 # .PARAMETER scope
-#   Which side of local Group Policy to clear. Defaults to "all".
-#     "files"    - the GroupPolicy and GroupPolicyUsers folders only. Fully reversible by renaming
-#                  them back, so this is the one to try first.
-#     "registry" - the SOFTWARE\Policies subkeys only.
-#     "all"      - both.
+#   How much of local Group Policy to clear. Defaults to "targeted".
+#     "targeted" - the policy folders, plus only the registry key(s) that detection proved can refuse
+#                  a logon: Software Restriction Policies at Disallowed, and AppLocker in enforce
+#                  mode. The rest of SOFTWARE\Policies is left alone. This is the default because it
+#                  repairs the lockout without discarding unrelated policy.
+#     "files"    - the GroupPolicy, GroupPolicyUsers and AppLocker folders only, and no registry
+#                  change at all. Fully reversible by renaming them back, and it matches the reset
+#                  procedure Microsoft documents, so it is the most conservative option.
+#     "registry" - the blanket registry reset only: every SOFTWARE\Policies branch that holds a
+#                  value, less the preserved trust material.
+#     "all"      - "registry" plus the folders. The escape hatch for when a policy is clearly the
+#                  cause but detection cannot say which one. Read the warning it prints.
 #
 # .PARAMETER windowsDrive
 #   Drive letter of the offline Windows installation, for example "F". Only needed when more than
@@ -53,11 +60,31 @@
 #
 # .EXAMPLE
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters detectOnly=true --run-on-repair --verbose
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters scope=files --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters scope=files --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters scope=all --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
+#
+#   Where this sits relative to what Microsoft documents. The reset Microsoft documents is deleting
+#   %WinDir%\System32\GroupPolicy and GroupPolicyUsers and then running "gpupdate /force", and for
+#   AppLocker, deleting the files under %WinDir%\System32\AppLocker. Scope "files" is exactly that,
+#   minus the gpupdate, which a machine that cannot boot obviously cannot run. Microsoft does not
+#   document deleting keys under SOFTWARE\Policies as a repair step at all; that part is this
+#   script's own, which is why it is scoped to the two keys detection can prove are blocking, and why
+#   the blanket form is opt-in.
+#
+#   Documented alternatives worth trying first when the machine can still be started. Microsoft's
+#   documented recovery from a Software Restriction Policy lockout is Safe Mode: "software
+#   restriction policies do not apply when Windows is started in Safe Mode", so booting the VM into
+#   Safe Mode, logging on as a local administrator and correcting the policy there avoids offline
+#   editing entirely. This script is for the case where that is not available - the VM will not boot
+#   far enough, or Safe Mode cannot be reached.
+#
+#   Not used here: "secedit /configure /cfg %windir%\inf\defltbase.inf". It is widely repeated as a
+#   way to reset security policy, but Microsoft declared it unsupported from Vista onward and warned
+#   it "may even result in the operating system becoming unstable".
 #
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
@@ -81,12 +108,26 @@
 #
 #   SOFTWARE\Policies is never empty in practice. A stock image carries a branch no administrator
 #   created, and a domain member also holds everything its GPOs push - on a freshly joined Server 2022
-#   that is already dozens of keys, the policy-managed firewall rules among them. So "registry" and
-#   "all" always report and clear keys, even on a VM nobody ever applied a policy to by hand. A domain
-#   member rebuilds that branch at the next refresh once it can reach a domain controller; a workgroup
-#   machine has nothing to rebuild it from, so there the loss is permanent. That is why "files" exists:
-#   it is the reversible half and it is the one to try first. Read the reported key list before
+#   that is already dozens of keys, the policy-managed firewall rules among them. That is why the
+#   default is "targeted" rather than a blanket wipe: on a normal machine the blanket reset discards
+#   a great deal of policy that was never the problem. A domain member rebuilds that branch at the
+#   next refresh once it can reach a domain controller; a workgroup or MDM-managed machine has
+#   nothing to rebuild it from, so there the loss is permanent. Read the reported key list before
 #   choosing "all".
+#
+#   "targeted" removes only what detection proved can refuse a logon on its own: Software Restriction
+#   Policies with a default level of Disallowed, and AppLocker with a collection in enforce mode. If
+#   neither is set, the registry is not touched at all and the script says so, rather than clearing
+#   policy on the off chance. The policy folders are still renamed aside in that case, because they
+#   are the source the policy would be re-applied from and renaming them is reversible.
+#
+#   Not everything under SOFTWARE\Policies is the kind of policy that can refuse a logon, and two
+#   branches are never cleared. Microsoft\SystemCertificates holds the enterprise root and
+#   intermediate CAs, the Disallowed store listing certificates the organisation has explicitly
+#   distrusted, and the EFS recovery agent certificate. Microsoft\Cryptography holds the TLS cipher
+#   suite order. Clearing those cannot fix a logon, and it would quietly weaken the machine: dropping
+#   the Disallowed store re-trusts certificates somebody deliberately revoked, and dropping the EFS
+#   certificate can cost access to encrypted files. They are reported as preserved, not as failures.
 #
 #   Windows protects a few keys inside the policy branch. SOFTWARE\Policies\Microsoft\Windows\Appx is
 #   owned by TrustedInstaller with a DACL that withholds DELETE from SYSTEM and Administrators, so no
@@ -107,7 +148,7 @@
 
 Param(
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$detectOnly = 'false',
-    [Parameter(Mandatory = $false)][ValidateSet('all', 'files', 'registry', IgnoreCase = $true)][string]$scope = 'all',
+    [Parameter(Mandatory = $false)][ValidateSet('targeted', 'all', 'files', 'registry', IgnoreCase = $true)][string]$scope = 'targeted',
     [Parameter(Mandatory = $false)][string]$windowsDrive = ''
 )
 
@@ -121,12 +162,28 @@ $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 
 $isDetectOnly = ($detectOnly -eq 'true')
-$clearFiles = ($scope -eq 'all' -or $scope -eq 'files')
-$clearRegistry = ($scope -eq 'all' -or $scope -eq 'registry')
 
-# The two folders that hold local Group Policy. Everything under them is policy, which is what makes
-# renaming the folder aside a safe way to clear it.
-$script:PolicyFolders = @('System32\GroupPolicy', 'System32\GroupPolicyUsers')
+# 'targeted' clears the policy files and only the two registry keys that can refuse a logon.
+# 'all' and 'registry' are the blanket reset: everything under SOFTWARE\Policies that holds a value.
+$isTargeted = ($scope -eq 'targeted')
+$clearFiles = ($scope -eq 'targeted' -or $scope -eq 'all' -or $scope -eq 'files')
+$clearRegistry = ($scope -eq 'targeted' -or $scope -eq 'all' -or $scope -eq 'registry')
+
+# The folders that hold local policy. Everything under them is policy, which is what makes renaming
+# the folder aside a safe way to clear it.
+#
+# System32\AppLocker is the AppLocker policy cache the Application Identity service reads. Microsoft
+# documents deleting its contents as the way to clear AppLocker rules, so the registry side alone is
+# not enough: leave the cache in place and the rules can still be enforced.
+# See https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/applocker/delete-an-applocker-rule
+$script:PolicyFolders = @('System32\GroupPolicy', 'System32\GroupPolicyUsers', 'System32\AppLocker')
+
+# The keys that can refuse a logon on their own, which is all that 'targeted' removes. Anything else
+# under SOFTWARE\Policies is left alone unless the operator asks for the blanket reset.
+$script:TargetedPolicyKeys = @{
+    Safer     = 'Microsoft\Windows\Safer\CodeIdentifiers'
+    AppLocker = 'Microsoft\Windows\SrpV2'
+}
 
 # Keys left behind because Windows itself refuses to delete them. Declared here so the summary can
 # read it even when the registry side never runs: @($null).Count is 1, not 0.
@@ -135,6 +192,52 @@ $script:ProtectedPolicyKeys = [System.Collections.Generic.List[string]]::new()
 # Keys left behind only because a protected key sits somewhere beneath them. These are ordinary
 # SYSTEM-owned keys and are reported separately, because calling them protected would be wrong.
 $script:RetainedParentKeys = [System.Collections.Generic.List[string]]::new()
+
+# Branches under SOFTWARE\Policies that are never cleared, relative to that key.
+#
+# SOFTWARE\Policies is the branch Group Policy manages, but not all of it is the kind of policy that
+# can refuse a logon. These two hold trust material: SystemCertificates carries the enterprise root
+# and intermediate CAs, the Disallowed store that records certificates the organisation has
+# explicitly distrusted, and the EFS recovery agent certificate; Cryptography carries the TLS cipher
+# suite order. Clearing them cannot fix a logon, and it silently weakens the machine - removing the
+# Disallowed store re-trusts revoked certificates, and removing the EFS certificate can cost access
+# to encrypted files. A domain member gets them back at the next policy refresh, but a workgroup or
+# MDM-managed machine does not, and none of it is recoverable from anything but the hive backup.
+$script:PreservedPolicyPaths = @(
+    'Microsoft\SystemCertificates',
+    'Microsoft\Cryptography'
+)
+
+# Keys left untouched on purpose, by the rule above.
+$script:PreservedPolicyKeys = [System.Collections.Generic.List[string]]::new()
+
+function Test-PreservedPolicyPath {
+    <#
+    .SYNOPSIS
+        Says whether a path under SOFTWARE\Policies is one this script must not clear.
+
+    .OUTPUTS
+        'self'     the path is preserved, or sits inside something preserved.
+        'ancestor' something preserved sits below the path, so it cannot be deleted wholesale.
+        'no'       neither, so the path can be cleared normally.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $RelativePath
+    )
+
+    foreach ($preserved in $script:PreservedPolicyPaths) {
+        if ($RelativePath -eq $preserved -or $RelativePath.StartsWith("$preserved\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            return 'self'
+        }
+        if ($preserved.StartsWith("$RelativePath\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            return 'ancestor'
+        }
+    }
+
+    return 'no'
+}
 
 # Software Restriction Policy default levels. 0 is the one that locks a machine out: everything is
 # disallowed unless a rule explicitly allows it, and the logon needs userinit.exe and explorer.exe.
@@ -223,8 +326,13 @@ function Get-PolicyRegistryState {
             # difference matters after this script has already run: what is left under Policies is
             # the shells of keys Windows would not let go, and counting those as policy would make
             # every later run repeat the work and copy the whole hive again for nothing.
+            #
+            # Preserved branches are skipped for the same reason. They keep their values by design,
+            # so counting them would make this script find work it has already decided not to do.
             $values = 0
             foreach ($key in @($branch) + @(Get-ChildItem -Path $branch.PSPath -Recurse -ErrorAction SilentlyContinue)) {
+                $rel = $key.Name -replace '^HKEY_LOCAL_MACHINE\\BROKENSOFTWARE\\Policies\\?', ''
+                if ((Test-PreservedPolicyPath -RelativePath $rel) -eq 'self') { continue }
                 try { $values += $key.ValueCount } catch { $null = $_ }
                 if ($values -gt 0) { break }
             }
@@ -363,18 +471,32 @@ function Remove-OfflineRegistryKeyTree {
     $full = "$ParentPath\$Name"
     $lastError = $null
 
-    try {
-        $parent = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($ParentPath, $true)
-        if ($null -ne $parent) {
-            try { $parent.DeleteSubKeyTree($Name, $false) } finally { $parent.Close() }
-        }
-    }
-    catch {
-        # Expected when the subtree holds a key Windows protects. Handled by the walk below.
-        $lastError = $_.Exception.Message
+    $relative = $Display -replace '^SOFTWARE\\Policies\\?', ''
+    $preserved = Test-PreservedPolicyPath -RelativePath $relative
+
+    if ($preserved -eq 'self') {
+        # Trust material, not logon policy. Left exactly as it is, values included.
+        $Survivors.Add($Display)
+        $script:PreservedPolicyKeys.Add($Display)
+        Add-OfflineRepairLog -Message "Kept $Display, which holds certificate or cryptography trust material rather than logon policy."
+        return
     }
 
-    if (-not (Test-Path -LiteralPath "HKLM:\$full")) { return }
+    # The subtree delete is all or nothing, so it cannot be used when something below has to stay.
+    if ($preserved -ne 'ancestor') {
+        try {
+            $parent = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($ParentPath, $true)
+            if ($null -ne $parent) {
+                try { $parent.DeleteSubKeyTree($Name, $false) } finally { $parent.Close() }
+            }
+        }
+        catch {
+            # Expected when the subtree holds a key Windows protects. Handled by the walk below.
+            $lastError = $_.Exception.Message
+        }
+
+        if (-not (Test-Path -LiteralPath "HKLM:\$full")) { return }
+    }
 
     $childNames = @()
     try {
@@ -450,7 +572,7 @@ function Remove-OfflineRegistryKeyTree {
 function Clear-PolicyRegistry {
     <#
     .SYNOPSIS
-        Removes the named subkeys of SOFTWARE\Policies from the mounted hive. SOFTWARE\Policies
+        Removes the named keys under SOFTWARE\Policies from the mounted hive. SOFTWARE\Policies
         itself is kept, because Windows expects the key to exist and recreates the branch under it
         on the next policy refresh.
 
@@ -458,34 +580,43 @@ function Clear-PolicyRegistry {
         Must be called inside Invoke-WithHive -Hive 'SOFTWARE'. The undo path is the SOFTWARE hive
         backup taken before this runs.
 
-        Only the branches that were found to hold policy are touched. A branch of empty keys
-        enforces nothing, and some of those keys cannot be deleted at all, so removing them would be
-        a change with no symptom behind it.
+        KeyPaths are relative to SOFTWARE\Policies and may be any depth, which is what lets the same
+        code serve both modes: 'targeted' passes the two keys that refuse a logon, such as
+        Microsoft\Windows\Safer\CodeIdentifiers, while the blanket reset passes the top-level
+        branches that were found to hold policy. A branch of empty keys enforces nothing, and some of
+        those keys cannot be deleted at all, so removing them would be a change with no symptom
+        behind it.
 
         Keys that cannot be deleted are left in place and reported through
         $script:ProtectedPolicyKeys and $script:RetainedParentKeys, so the caller can tell them
         apart from a real failure.
 
     .OUTPUTS
-        The number of top-level keys that were cleared.
+        The number of keys that were cleared.
     #>
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [string[]] $Branches
+        [string[]] $KeyPaths
     )
 
     $changes = 0
     $script:ProtectedPolicyKeys = [System.Collections.Generic.List[string]]::new()
     $script:RetainedParentKeys = [System.Collections.Generic.List[string]]::new()
+    $script:PreservedPolicyKeys = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($name in $Branches) {
-        if (-not (Test-Path -LiteralPath "HKLM:\BROKENSOFTWARE\Policies\$name")) { continue }
+    foreach ($relative in $KeyPaths) {
+        if (-not (Test-Path -LiteralPath "HKLM:\BROKENSOFTWARE\Policies\$relative")) { continue }
 
         $survivors = [System.Collections.Generic.List[string]]::new()
-        $branch = "SOFTWARE\Policies\$name"
+        $branch = "SOFTWARE\Policies\$relative"
 
-        Remove-OfflineRegistryKeyTree -ParentPath 'BROKENSOFTWARE\Policies' -Name $name `
+        # Split the last segment off so a nested path and a top-level branch take the same path.
+        $split = $relative.LastIndexOf('\')
+        $leaf = if ($split -ge 0) { $relative.Substring($split + 1) } else { $relative }
+        $parent = if ($split -ge 0) { "BROKENSOFTWARE\Policies\$($relative.Substring(0, $split))" } else { 'BROKENSOFTWARE\Policies' }
+
+        Remove-OfflineRegistryKeyTree -ParentPath $parent -Name $leaf `
             -Display $branch -Survivors $survivors
 
         if ($survivors.Count -eq 0) {
@@ -579,22 +710,53 @@ try {
         Log-Info 'None of the policies that can refuse a logon on their own are set. Local policy is configured but is not an obvious cause, so confirm the symptom before clearing it.' | Tee-Object -FilePath $logFile -Append
     }
 
+    # In targeted mode the registry side acts only on what detection proved is blocking. In blanket
+    # mode it acts on every branch that holds a value.
+    $targetKeys = [System.Collections.Generic.List[string]]::new()
+    if ($isTargeted) {
+        if ($null -ne $policyRegistry.Safer -and $policyRegistry.Safer.Blocking) {
+            [void]$targetKeys.Add($script:TargetedPolicyKeys.Safer)
+        }
+        if ($null -ne $policyRegistry.AppLocker -and $policyRegistry.AppLocker.Blocking) {
+            [void]$targetKeys.Add($script:TargetedPolicyKeys.AppLocker)
+        }
+    }
+    else {
+        foreach ($branch in @($policyRegistry.Keys)) { [void]$targetKeys.Add($branch) }
+    }
+
     $filesToClear = if ($clearFiles) { @($policyFile.Folders).Count } else { 0 }
-    $keysToClear = if ($clearRegistry) { @($policyRegistry.Keys).Count } else { 0 }
+    $keysToClear = if ($clearRegistry) { @($targetKeys).Count } else { 0 }
 
     if ($isDetectOnly) {
-        Log-Output "Detect only: would rename $filesToClear policy folder(s) holding $($policyFile.FileCount) file(s) and remove $keysToClear SOFTWARE\Policies key(s). No changes were made." | Tee-Object -FilePath $logFile -Append
+        $keyNote = if ($isTargeted) {
+            if ($keysToClear -gt 0) { "remove $keysToClear blocking key(s) ($(@($targetKeys) -join ', '))" }
+            else { 'remove no registry keys, because no policy that can refuse a logon on its own was found' }
+        }
+        else {
+            "remove $keysToClear SOFTWARE\Policies key(s)"
+        }
+        Log-Output "Detect only (scope '$scope'): would rename $filesToClear policy folder(s) holding $($policyFile.FileCount) file(s) and $keyNote. No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
 
     if ($filesToClear -eq 0 -and $keysToClear -eq 0) {
-        Log-Output "Nothing to clear in scope '$scope'. No local Group Policy is configured on this disk, so a policy is not what is stopping the logon. No changes were made." | Tee-Object -FilePath $logFile -Append
+        $hint = if ($isTargeted -and $policyRegistry.HasContent) {
+            " SOFTWARE\Policies does hold policy, but none of it is a policy that refuses a logon by itself. If a policy is still suspected, re-run with scope 'all' to clear the branch wholesale, and read the warning that comes with it."
+        }
+        else { '' }
+        Log-Output "Nothing to clear in scope '$scope'. No local Group Policy is configured on this disk, so a policy is not what is stopping the logon. No changes were made.$hint" | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
 
-    Log-Warning 'Clearing local Group Policy. This is a blanket reset, not a targeted repair: locally-defined policy is lost, and a domain-joined VM re-applies its domain policy at the next refresh.' | Tee-Object -FilePath $logFile -Append
+    if ($isTargeted) {
+        Log-Info "Clearing local Group Policy, targeted. The policy files are renamed aside and only the key(s) that refuse a logon are removed: $(if ($keysToClear -gt 0) { @($targetKeys) -join ', ' } else { 'none, so the registry is left untouched' }). The rest of SOFTWARE\Policies is left in place." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Warning 'Clearing local Group Policy. This is a blanket reset, not a targeted repair: every setting under SOFTWARE\Policies that holds a value goes, which on a real machine includes policy firewall rules, Remote Desktop settings, BITS and telemetry settings, not only the policy that is refusing the logon. A domain-joined VM re-applies all of it at the next policy refresh; a workgroup or MDM-managed VM does not, and the only way back is the hive backup taken above. Certificate and cryptography trust material is left alone. Scope "targeted" does the same repair without the collateral damage.' | Tee-Object -FilePath $logFile -Append
+    }
 
     # Back up the hive only when the registry side is actually going to be written.
     if ($keysToClear -gt 0) {
@@ -612,17 +774,21 @@ try {
     $registryChanges = 0
     if ($keysToClear -gt 0) {
         # Read inside the script block, which runs in a child scope, so this is set at script scope.
-        $script:BranchesToClear = @($policyRegistry.Keys)
+        $script:KeyPathsToClear = @($targetKeys)
         $registryChanges = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            return (Clear-PolicyRegistry -Branches $script:BranchesToClear)
+            return (Clear-PolicyRegistry -KeyPaths $script:KeyPathsToClear)
         }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
 
     # Verify against freshly read state rather than trusting the writes above.
     $remainingFile = Get-PolicyFileState -WindowsPath $offline.WindowsPath
+    $script:KeyPathsToVerify = @($targetKeys)
     $remainingRegistry = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        return (Get-PolicyRegistryState)
+        $state = Get-PolicyRegistryState
+        # Checked here because HKLM:\BROKENSOFTWARE only exists while the hive is mounted.
+        $stillThere = @($script:KeyPathsToVerify | Where-Object { Test-Path -LiteralPath "HKLM:\BROKENSOFTWARE\Policies\$_" })
+        return ($state | Add-Member -NotePropertyName TargetsStillPresent -NotePropertyValue $stillThere -PassThru)
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
@@ -630,7 +796,15 @@ try {
     if ($clearFiles -and $remainingFile.HasContent) {
         $stillPresent += "$(@($remainingFile.Folders).Count) policy folder(s)"
     }
-    if ($clearRegistry -and $remainingRegistry.HasContent) {
+    if ($clearRegistry -and $isTargeted) {
+        # Targeted mode leaves the rest of SOFTWARE\Policies standing on purpose, so the only
+        # question is whether the keys it aimed at are gone.
+        $notGone = @($remainingRegistry.TargetsStillPresent)
+        if ($notGone.Count -gt 0) {
+            $stillPresent += "$($notGone.Count) blocking key(s) ($($notGone -join ', '))"
+        }
+    }
+    elseif ($clearRegistry -and $remainingRegistry.HasContent) {
         # A branch that only survives because the operating system protects a key inside it is an
         # expected outcome, not a failure. Anything else genuinely did not clear.
         $protectedKeys = @($script:ProtectedPolicyKeys)
@@ -643,7 +817,8 @@ try {
         }
     }
 
-    $summary = "Renamed $fileChanges of $filesToClear policy folder(s) and removed $registryChanges of $keysToClear SOFTWARE\Policies key(s)."
+    $keyLabel = if ($isTargeted) { 'blocking' } else { 'SOFTWARE\Policies' }
+    $summary = "Renamed $fileChanges of $filesToClear policy folder(s) and removed $registryChanges of $keysToClear $keyLabel key(s)."
 
     if ($stillPresent.Count -gt 0) {
         Log-Error "$summary Still present: $($stillPresent -join ', ')." | Tee-Object -FilePath $logFile -Append
@@ -652,6 +827,10 @@ try {
     }
 
     Log-Output $summary | Tee-Object -FilePath $logFile -Append
+
+    if (@($script:PreservedPolicyKeys).Count -gt 0) {
+        Log-Info "Not cleared on purpose: $(@($script:PreservedPolicyKeys).Count) branch(es) holding trust material ($(@($script:PreservedPolicyKeys) -join ', ')). These carry the enterprise root and intermediate CAs, the store of certificates the organisation has distrusted, the EFS recovery agent certificate and the TLS cipher suite order. None of that can refuse a logon, and clearing it would weaken the machine rather than repair it." | Tee-Object -FilePath $logFile -Append
+    }
 
     if (@($script:ProtectedPolicyKeys).Count -gt 0 -or @($script:RetainedParentKeys).Count -gt 0) {
         $protected = @($script:ProtectedPolicyKeys)
