@@ -32,9 +32,18 @@
 #   Everything is driven by evidence. The script reports every marker it finds before it changes
 #   anything, and if it finds none it changes nothing and says so - which is the answer an operator
 #   needs, because it means the boot loop has some other cause and this script is aimed at the wrong
-#   problem. The TxR logs in particular are only cleared when a servicing marker was actually found:
-#   they are present and healthy on every running Windows installation, so clearing them on their own
-#   evidence would damage a machine that was never broken.
+#   problem. The TxR logs are never cleared on their own evidence: they are present and healthy on
+#   every running Windows installation. They are cleared when a servicing marker was found, or when
+#   CBS reports ERROR_LOG_FULL (0x800719e4), which is a transaction that stalled because it ran out
+#   of CLFS log space and leaves no marker of its own to find. Either way something independent has
+#   already established that the transaction is stuck.
+#
+#   Clearing them is verified rather than assumed. Every file is hash-verified into a backup before
+#   anything is deleted, the folder is re-examined afterwards against six checks - still present, not
+#   recreated, ACL unchanged, planned files gone, no other file touched, hives still loading - and any
+#   failure restores everything that was removed and fails the run. An operator who is told the logs
+#   were cleared and reboots into the same loop has been actively misled, so the run reports what
+#   actually happened.
 #
 #   The SOFTWARE and COMPONENTS hives are backed up before either is written to, and every reversible
 #   change is recorded in a manifest on the offline disk so "-revert true" can put it back.
@@ -122,10 +131,11 @@
 #     Deleting *.blf and *.regtrans-ms directly under System32\config. The transactional registry
 #     logs live in config\TxR, which is handled. The files sitting in config itself are the hive
 #     recovery logs, and removing those from under a hive that is dirty is a documented way to turn a
-#     recoverable installation into an unbootable one with STATUS_CANNOT_LOAD_REGISTRY_FILE. The
-#     patterns used here are the same ones the win-crowdstrike-fix-bootloop scripts already use -
-#     *.TxR.blf and *.TxR.*.regtrans-ms - which match the CLFS transaction artifacts and cannot match
-#     a .LOG1 or .LOG2 hive recovery log.
+#     recoverable installation into an unbootable one with STATUS_CANNOT_LOAD_REGISTRY_FILE. This
+#     script only ever looks inside config\TxR, where every file is a transaction artifact, and the
+#     removal helper additionally refuses .log, .log1 and .log2 by name wherever it is pointed. Use
+#     win-fix-transaction-logs when the logs in config itself, or under SMI\Store\Machine, need
+#     clearing - it takes a scope parameter for exactly that.
 #
 #   DISM exit codes that are not failures. 0x800F082F means there were no pending actions to revert,
 #   which on a disk whose markers were left behind by a half-finished transaction is a normal and
@@ -162,6 +172,7 @@ Param(
 . .\src\windows\common\helpers\OfflineRepairCommon.ps1
 . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
 . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
+. .\src\windows\common\helpers\Use-OfflineFileRemoval.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
@@ -200,10 +211,34 @@ $script:SessionsPendingKey = 'SessionsPending'
 # then drives; leaving it running puts the VM straight back where it started.
 $script:WindowsUpdateService = @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'UpdateOrchestrator')
 
-# CLFS transaction artifacts under config\TxR. These patterns are the ones the existing
-# win-crowdstrike-fix-bootloop scripts use. They match only the transaction log files and cannot
-# match a .LOG1 or .LOG2 hive recovery log, which must never be removed.
-$script:TxRPattern = @('*.TxR.blf', '*.TxR.*.regtrans-ms')
+# CLFS transaction artifacts under config\TxR. Selection is delegated to Use-OfflineFileRemoval,
+# which applies these as a two-layer allow-list: a file must match an allowed extension AND must not
+# match a protected one. That is stricter than a wildcard, because a protected name can never be
+# selected no matter what else matches.
+#
+# The earlier wildcard pair here - '*.TxR.blf' and '*.TxR.*.regtrans-ms' - was measured against a
+# real Server 2022 disk and matched only 4 of the 7 files actually present in config\TxR. It missed
+# '{guid}.TM.blf' and both '{guid}.TMContainer*.regtrans-ms', which are the transaction manager's own
+# logs - precisely the ones holding the uncommitted state this script is trying to clear. Clearing 4
+# of 7 leaves the transaction half-described, so the allow-list is by extension instead.
+#
+# Every file in config\TxR is a transaction artifact, so this is safe there. The hive recovery logs
+# that must never be removed live one level up in config itself, which this script does not touch.
+$script:TxRExtension = @('.blf', '.regtrans-ms')
+$script:ProtectedExtension = @('.log', '.log1', '.log2', '.dat', '.sav', '.bak')
+
+# config\TxR holds no registry hives, so there is nothing for the helper to revalidate there. The
+# limit is still passed so the behaviour is explicit rather than defaulted.
+$script:HiveTestMaxBytes = 512MB
+
+# What log exhaustion looks like in CBS.log. 0x800719e4 is ERROR_LOG_FULL as CBS prints it. This
+# duplicates the detection in win-fix-transaction-logs on purpose: both scenarios need the evidence,
+# and a scenario script has to stand on its own rather than send the operator to another run id.
+$script:LogFullPattern = '0x800719e4|ERROR_LOG_FULL'
+
+# CBS.log is large and the useful part is the end of it. Reading the tail keeps this to a bounded
+# read on a multi-hundred-megabyte file.
+$script:CbsTailLine = 4000
 
 $script:CbsSoftwareKey = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
 $script:ComponentsKey = 'HKLM:\BROKENCOMPONENTS'
@@ -320,24 +355,88 @@ function Test-PendingComponentValue {
 function Get-TxRState {
     <#
     .SYNOPSIS
-        Lists the CLFS transaction artifacts under System32\config\TxR.
+        Builds the removal plan for the CLFS transaction artifacts under System32\config\TxR.
+    .DESCRIPTION
+        Selection, backup, deletion, verification and rollback all live in Use-OfflineFileRemoval, so
+        this is a thin wrapper that supplies this script's allow-list and nothing else. Present and
+        Files are kept as aliases over the plan so the call sites below read the same as before.
+
+        config\TxR declares no hives, so no hive is loaded here. That matters: loading a hive in place
+        writes KTM logs next to it and would change the very folder this script is about to verify.
     #>
     param([Parameter(Mandatory = $true)][string]$WindowsPath)
 
     $txrPath = Join-Path $WindowsPath 'System32\config\TxR'
-    if (-not (Test-Path -LiteralPath $txrPath)) {
-        return [PSCustomObject]@{ Path = $txrPath; Present = $false; Files = @() }
+    $plan = Get-OfflineRemovalPlan -Path $txrPath -Label 'TxR' `
+        -MatchExtension $script:TxRExtension -ProtectedExtension $script:ProtectedExtension `
+        -HiveName @() -HiveMaxBytes $script:HiveTestMaxBytes `
+        -IncludeHash
+
+    # -IncludeHash is not optional here. Backup-OfflineFile re-hashes each copy and compares it with
+    # the hash recorded in the snapshot; with no hash recorded there is nothing to compare against and
+    # a silently corrupt backup would be accepted as good.
+    #
+    # Actionable is added by the caller rather than the helper, so it has to be spelled out the same
+    # way win-fix-transaction-logs spells it. A plan with no Actionable property reads as $false and
+    # would quietly disable the whole repair.
+    $snapshot = $plan.Snapshot
+    $plan | Add-Member -NotePropertyName 'Actionable' -NotePropertyValue (
+        $snapshot.Present -and $snapshot.Accessible -and @($snapshot.MatchedFile).Count -gt 0) -Force
+    $plan | Add-Member -NotePropertyName 'Present' -NotePropertyValue ([bool]$snapshot.Present) -Force
+    $plan | Add-Member -NotePropertyName 'Files' -NotePropertyValue (@($snapshot.MatchedFile)) -Force
+    return $plan
+}
+
+function Get-LogExhaustionEvidence {
+    <#
+    .SYNOPSIS
+        Looks for ERROR_LOG_FULL in the offline CBS logs.
+    .DESCRIPTION
+        A servicing transaction that ran out of CLFS log space reports 0x800719e4 and then stops
+        making progress, which presents as the same "Undoing changes" loop as any other stuck
+        transaction. Finding it here is what authorises clearing config\TxR, so that the operator gets
+        the whole repair from one run rather than being sent to win-fix-transaction-logs afterwards.
+
+        This is a twin of the function of the same name in win-fix-transaction-logs. The duplication
+        is deliberate: both scenarios need the evidence independently, and copying 60 lines of
+        read-only detection is cheaper than coupling two scenario scripts together.
+
+        Only the tail of each log is read. CBS.log runs to hundreds of megabytes on a machine that has
+        been patching for years, and the useful record is always at the end.
+    #>
+    param([Parameter(Mandatory = $true)][string]$WindowsPath)
+
+    $cbsFolder = Join-Path $WindowsPath 'Logs\CBS'
+    $result = [PSCustomObject]@{ Found = $false; Source = ''; Line = ''; LogsRead = 0 }
+
+    if (-not (Test-Path -LiteralPath $cbsFolder)) { return $result }
+
+    # CbsPersist_*.log are the rolled-over generations of CBS.log. A transaction that filled the log
+    # some time ago has its record in one of those rather than in the current file.
+    $logs = @(Get-ChildItem -LiteralPath $cbsFolder -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'CBS.log' -or $_.Name -like 'CbsPersist_*.log' } |
+            Sort-Object LastWriteTimeUtc -Descending)
+
+    foreach ($log in $logs) {
+        $result.LogsRead++
+        try {
+            $tail = @(Get-Content -LiteralPath $log.FullName -Tail $script:CbsTailLine -ErrorAction Stop)
+        }
+        catch {
+            Add-OfflineRepairLog -Level Info -Message "Could not read $($log.Name) ($($_.Exception.Message))."
+            continue
+        }
+
+        $hit = @($tail | Where-Object { $_ -match $script:LogFullPattern }) | Select-Object -Last 1
+        if ($hit) {
+            $result.Found = $true
+            $result.Source = $log.FullName
+            $result.Line = $hit.Trim()
+            return $result
+        }
     }
 
-    $files = foreach ($pattern in $script:TxRPattern) {
-        Get-ChildItem -LiteralPath $txrPath -Filter $pattern -File -Force -ErrorAction SilentlyContinue
-    }
-
-    return [PSCustomObject]@{
-        Path    = $txrPath
-        Present = $true
-        Files   = @($files)
-    }
+    return $result
 }
 
 function Get-WindowsUpdateServiceState {
@@ -637,11 +736,14 @@ try {
         }
 
         if ($manifest.TxRBackupFolder -and (Test-Path -LiteralPath $manifest.TxRBackupFolder)) {
+            # Restore-OfflineFileSet rather than a copy loop, so the attributes come back too. A
+            # transaction log restored without its original attributes is not the file that was taken.
             $txrPath = Join-Path $offline.WindowsPath 'System32\config\TxR'
-            $copied = 0
-            foreach ($file in @(Get-ChildItem -LiteralPath $manifest.TxRBackupFolder -File -Force -ErrorAction SilentlyContinue)) {
-                Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $txrPath $file.Name) -Force
-                $copied++
+            $result = Restore-OfflineFileSet -BackupPath $manifest.TxRBackupFolder -TargetPath $txrPath
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            $copied = [int]$result.Restored
+            if ($result.Failed -gt 0) {
+                Log-Warning "$($result.Failed) TxR transaction file(s) could not be restored from $($manifest.TxRBackupFolder)." | Tee-Object -FilePath $logFile -Append
             }
             if ($copied -gt 0) {
                 Log-Info "Restored $copied TxR transaction file(s) from $($manifest.TxRBackupFolder)." | Tee-Object -FilePath $logFile -Append
@@ -679,6 +781,25 @@ try {
 
     $txr = Get-TxRState -WindowsPath $offline.WindowsPath
 
+    # Log exhaustion is a second, independent reason the transaction logs need clearing. A servicing
+    # transaction that hit ERROR_LOG_FULL stalls in exactly the same way as one that was interrupted,
+    # but leaves none of the markers above behind, so without this check the operator would be told
+    # nothing is wrong on a VM that is genuinely stuck.
+    $logFull = Get-LogExhaustionEvidence -WindowsPath $offline.WindowsPath
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    if ($logFull.Found) {
+        Log-Warning "Log exhaustion: ERROR_LOG_FULL was reported in $($logFull.Source): $($logFull.Line)" | Tee-Object -FilePath $logFile -Append
+    }
+    elseif ($logFull.LogsRead -gt 0) {
+        Log-Info "No ERROR_LOG_FULL entry was found in the last $($script:CbsTailLine) lines of $($logFull.LogsRead) CBS log(s)." | Tee-Object -FilePath $logFile -Append
+    }
+
+    # Two separate authorisations, each tied to its own evidence. The servicing markers authorise the
+    # DISM revert, the pending.xml rename and the CBS registry edits. Either the markers or log
+    # exhaustion authorise clearing config\TxR. Clearing the logs on log exhaustion alone is the whole
+    # point: that is the case where there is no marker to find.
+    $clearTxR = ($findings.Count -gt 0 -or $logFull.Found) -and $txr.Actionable
+
     # Report the state before deciding anything.
     if ($findings.Count -gt 0) {
         Log-Info "Servicing is mid-transaction. $($findings.Count) marker(s) found:" | Tee-Object -FilePath $logFile -Append
@@ -691,7 +812,10 @@ try {
     }
 
     if ($txr.Present) {
-        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are only cleared when a servicing marker above was found." | Tee-Object -FilePath $logFile -Append
+        $why = if ($findings.Count -gt 0) { 'a servicing marker above was found' }
+        elseif ($logFull.Found) { 'CBS reported log exhaustion' }
+        else { 'neither a servicing marker nor log exhaustion was found, so they are left alone' }
+        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only because $why." | Tee-Object -FilePath $logFile -Append
     }
 
     # Name the pending packages. Evidence only; nothing here is removed by this script.
@@ -732,11 +856,11 @@ try {
             if ($sessions -gt 0) {
                 Log-Output "$sessions incomplete servicing session(s) would be left in place for DISM to resolve. Their records are history this script does not rewrite." | Tee-Object -FilePath $logFile -Append
             }
-            if ($txr.Present -and @($txr.Files).Count -gt 0) {
-                Log-Output "$(@($txr.Files).Count) TxR transaction file(s) would be backed up and removed." | Tee-Object -FilePath $logFile -Append
-            }
         }
-        else {
+        if ($clearTxR) {
+            Log-Output "$(@($txr.Files).Count) TxR transaction file(s) would be backed up and removed, and the removal verified before the run is called a success." | Tee-Object -FilePath $logFile -Append
+        }
+        if ($findings.Count -eq 0 -and -not $clearTxR) {
             Log-Output 'Nothing would be changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
         }
         if ($doDisableWindowsUpdate) {
@@ -747,7 +871,7 @@ try {
         return $STATUS_SUCCESS
     }
 
-    if ($findings.Count -eq 0 -and -not $doDisableWindowsUpdate) {
+    if ($findings.Count -eq 0 -and -not $clearTxR -and -not $doDisableWindowsUpdate) {
         Log-Output 'Nothing was changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
         Log-Output 'win-fix-inaccessible-boot-device covers a stop 0x7B, win-fix-registry-corruption covers a damaged hive, and win-sfc-sf-corruption covers damaged system files.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -765,6 +889,7 @@ try {
         TxRBackupFolder     = ''
     }
     $changes = 0
+    $txrRemoved = 0
 
     if ($findings.Count -gt 0) {
         $softwareBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
@@ -831,28 +956,44 @@ try {
         }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
         $changes += [int]$script:RegistryChanges
+    }
 
-        # Only now, with a marker proven, are the transaction logs cleared. They are present on every
-        # healthy installation, so on their own they are not evidence of anything.
-        if ($txr.Present -and @($txr.Files).Count -gt 0) {
-            $backupFolder = Join-Path $offline.WindowsPath "System32\config\TxR-backup-$scriptStartTime"
-            New-Item -Path $backupFolder -ItemType Directory -Force | Out-Null
-            $removed = 0
-            foreach ($file in @($txr.Files)) {
-                try {
-                    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $backupFolder $file.Name) -Force
-                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-                    $removed++
-                }
-                catch {
-                    Log-Warning "Could not remove $($file.Name) ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
-                }
+    # ---------------------------------------------------------------------------------------------
+    # Transaction logs
+    #
+    # Deliberately after the DISM revert rather than before it. The CLFS logs under config\TxR hold
+    # the uncommitted state of the transaction, which is what DISM reads to work out what to undo.
+    # Deleting them first would take that away from the supported tool and leave the revert with
+    # nothing to act on. Clearing them afterwards removes what the revert could not consume.
+    #
+    # Removal runs through Use-OfflineFileRemoval, so every file is hash-verified into a backup before
+    # anything is deleted, the folder is re-examined afterwards against six checks, and a failure
+    # restores everything it removed. A raw copy-then-delete loop cannot tell the difference between a
+    # clean removal and one that silently took a file it should not have.
+    # ---------------------------------------------------------------------------------------------
+    if ($clearTxR) {
+        $backupRoot = Join-Path $offline.WindowsPath "Temp\$scriptName\$scriptStartTime"
+        $outcome = Invoke-OfflineRemovalPlan -Plan $txr -BackupRoot $backupRoot
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if ($outcome.Success) {
+            $manifest.TxRBackupFolder = $outcome.BackupPath
+            $txrRemoved = @($outcome.Removed).Count
+            Log-Info "Removed $txrRemoved TxR transaction file(s) and verified the removal. Backed up to $($outcome.BackupPath)." | Tee-Object -FilePath $logFile -Append
+            $changes += $txrRemoved
+        }
+        else {
+            # The helper has already put back whatever it removed, so the disk is as it was found.
+            # Report it rather than continue quietly: an operator who believes the logs were cleared
+            # and reboots into the same loop has been actively misled.
+            Log-Error "The transaction logs could not be cleared safely: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+            foreach ($failure in @($outcome.Verification.Failure)) {
+                Log-Error "  $failure" | Tee-Object -FilePath $logFile -Append
             }
-            if ($removed -gt 0) {
-                $manifest.TxRBackupFolder = $backupFolder
-                Log-Info "Removed $removed TxR transaction file(s), backed up to $backupFolder." | Tee-Object -FilePath $logFile -Append
-                $changes += $removed
-            }
+            Log-Error 'Everything that was removed has been restored, so config\TxR is as it was found. No further change was made.' | Tee-Object -FilePath $logFile -Append
+            Write-RevertManifest -Manifest $manifest -WindowsDrive $offline.WindowsDrive | Out-Null
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
         }
     }
 
@@ -926,15 +1067,46 @@ try {
         if (Test-PendingComponentValue -Value $after.ComponentValues[$name]) { [void]$remaining.Add("COMPONENTS\$name") }
     }
 
+    # Report what was actually done rather than infer it from one condition. Three things can change
+    # this disk independently - the servicing markers, the transaction logs, and the Windows Update
+    # services - and any combination of them is possible, because the markers and log exhaustion are
+    # separate authorisations. Keying the summary on the markers alone produced "No stuck servicing
+    # transaction was found, so nothing was cleared. 7 change(s) ... all of them to the Windows
+    # Update services" on a run that had removed 7 transaction logs and touched no service at all.
+    #
+    # Finding a marker is not the same as clearing it. WinSxS is owned by TrustedInstaller and the
+    # CBS keys carry their own ACL, so the rename and the deletes can all be refused while the run
+    # still succeeds at everything else. Claim the transaction only when the disk agrees it is gone.
+    $serviceChanges = @($manifest.Services).Count
+    $markerWork = $changes - $txrRemoved - $serviceChanges
+
+    $did = [System.Collections.Generic.List[string]]::new()
     if ($findings.Count -gt 0) {
-        Log-Output "Cleared the stuck servicing transaction: $changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
+        if ($remaining.Count -eq 0) {
+            # Either the edits landed, or the DISM revert consumed pending.xml on its own - that one
+            # leaves nothing for this script to count, so trust the re-read rather than the counter.
+            [void]$did.Add('cleared the stuck servicing transaction')
+        }
+        elseif ($markerWork -gt 0) {
+            [void]$did.Add('cleared part of the stuck servicing transaction')
+        }
+    }
+    if ($txrRemoved -gt 0) { [void]$did.Add("removed $txrRemoved transaction log file(s) from config\TxR") }
+    if ($serviceChanges -gt 0) { [void]$did.Add("disabled $serviceChanges Windows Update service(s)") }
+
+    if ($did.Count -gt 0) {
+        $summary = $did -join ', '
+        Log-Output "$($summary.Substring(0, 1).ToUpper())$($summary.Substring(1)): $changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
     }
     else {
-        Log-Output "No stuck servicing transaction was found, so nothing was cleared. $changes change(s) on $($offline.WindowsPath), all of them to the Windows Update services." | Tee-Object -FilePath $logFile -Append
+        Log-Output "$changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
     }
 
     if ($remaining.Count -gt 0) {
-        Log-Warning "These markers are still present after the repair: $($remaining -join ', '). Re-run this script, and if they persist the component store itself is damaged - win-sfc-sf-corruption is the next step." | Tee-Object -FilePath $logFile -Append
+        # Log-Output, not Log-Warning: only Log-Output reaches the summary az prints. As a warning
+        # the one line that says the repair did not work was invisible to the operator, who saw
+        # only the success lines above it.
+        Log-Output "These markers are still present after the repair: $($remaining -join ', '). They are owned by TrustedInstaller and this script could not take them. Re-run this script, and if they persist the component store itself is damaged - win-sfc-sf-corruption is the next step." | Tee-Object -FilePath $logFile -Append
     }
     else {
         Log-Output 'No servicing pending markers remain on this disk.' | Tee-Object -FilePath $logFile -Append
