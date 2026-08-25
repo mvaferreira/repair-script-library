@@ -58,9 +58,9 @@
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
-#   Only registry causes are handled here. A 0x7B whose cause is a damaged BCD store belongs to
-#   win-fix-boot-configuration, and a 0x7B whose cause is an unloadable hive belongs to
-#   win-fix-registry-corruption.
+#   Only registry causes are handled here. A 0x7B whose cause is an unloadable hive belongs to
+#   win-fix-registry-corruption. A 0x7B whose cause is a damaged BCD store is out of scope for this
+#   script, and no run id in this library owns BCD repair yet.
 #
 #   The SYSTEM hive file is backed up next to itself before the first write.
 #
@@ -115,8 +115,9 @@ function Get-BootStorageDriverSpec {
     )
 }
 
-# Device classes whose filter drivers sit in the boot storage path. The network class is handled by
-# win-fix-network-connectivity because its filters cause a connectivity symptom, not a 0x7B.
+# Device classes whose filter drivers sit in the boot storage path. The network class is deliberately
+# absent: its filters cause a connectivity symptom rather than a 0x7B, so touching them here would be
+# a change this script has no evidence for.
 function Get-StorageClassFilterSpec {
     @(
         [PSCustomObject]@{ GUID = '{4d36e967-e325-11ce-bfc1-08002be10318}'; Name = 'DiskDrive'; SafeFilters = [string[]]@('partmgr', 'fvevol', 'iorate', 'storqosflt', 'wcifs', 'ehstorclass', 'storflt') }
