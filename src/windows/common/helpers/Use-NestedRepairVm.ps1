@@ -185,6 +185,134 @@ function Get-NestedRepairVm {
     return $result
 }
 
+function Connect-NestedRepairVmDisk {
+    <#
+    .SYNOPSIS
+        Makes sure the guest actually has the disk before it is asked to boot from it.
+
+    .DESCRIPTION
+        This exists because of a defect in win-enable-nested-hyperv, which is what
+        'az vm repair create --enable-nested' runs to build the guest. That script selects the
+        passthrough disk with:
+
+            get-disk | where {$_.FriendlyName -eq 'Msft Virtual Disk'}
+
+        Every disk on an Azure VM answers to that name, including the rescue VM's own boot disk,
+        so the pipeline that follows tries to take the boot disk offline. That fails, the script is
+        running with -ErrorAction Stop, and it aborts before it ever reaches Add-VMHardDiskDrive.
+        The guest is left created but empty, with a boot order containing only a network adapter.
+
+        A guest in that state starts happily and then sits in its firmware finding nothing to boot,
+        which looks exactly like a slow boot until the wait times out. Attaching the disk here turns
+        a silent ten minute failure into a working repair.
+
+        The disk has to be offline on the host before it can be attached, so this runs after the
+        caller has taken it offline.
+
+    .PARAMETER Vm
+        The guest to attach to, as returned in the Vm property of Get-NestedRepairVm.
+
+    .PARAMETER DiskNumber
+        Host disk numbers that the guest must be able to boot from.
+
+    .OUTPUTS
+        PSCustomObject with Attached, AlreadyAttached, BootOrderSet and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Vm,
+        [Parameter(Mandatory = $false)][int[]]$DiskNumber = @()
+    )
+
+    $result = [PSCustomObject]@{
+        Attached        = @()
+        AlreadyAttached = @()
+        BootOrderSet    = $false
+        Reason          = $null
+    }
+
+    if ($null -eq $Vm) {
+        $result.Reason = 'no nested guest was supplied'
+        return $result
+    }
+
+    if ($DiskNumber.Count -eq 0) { return $result }
+
+    $generation = 1
+    try { $generation = [int]$Vm.Generation } catch { $generation = 1 }
+
+    try {
+        $existing = @(Get-VMHardDiskDrive -VMName $Vm.Name -ErrorAction Stop)
+    }
+    catch {
+        $result.Reason = "the disks attached to '$($Vm.Name)' could not be read: $($_.Exception.Message)"
+        return $result
+    }
+
+    $present = @($existing | ForEach-Object { $_.DiskNumber } | Where-Object { $null -ne $_ })
+
+    foreach ($number in ($DiskNumber | Sort-Object -Unique)) {
+        if ($present -contains $number) {
+            $result.AlreadyAttached += $number
+            continue
+        }
+
+        try {
+            if ($generation -ge 2) {
+                Add-VMHardDiskDrive -VMName $Vm.Name -DiskNumber $number -ControllerType SCSI -ControllerNumber 0 -ErrorAction Stop
+            }
+            else {
+                Add-VMHardDiskDrive -VMName $Vm.Name -DiskNumber $number -ErrorAction Stop
+            }
+        }
+        catch {
+            $result.Reason = "disk $number could not be attached to '$($Vm.Name)': $($_.Exception.Message)"
+            return $result
+        }
+
+        # Read it back. An attach that silently did nothing produces a guest that boots to its
+        # firmware and waits, which is the failure this function exists to prevent.
+        $now = @(Get-VMHardDiskDrive -VMName $Vm.Name -ErrorAction SilentlyContinue | ForEach-Object { $_.DiskNumber })
+        if ($now -notcontains $number) {
+            $result.Reason = "disk $number does not appear on '$($Vm.Name)' after being attached"
+            return $result
+        }
+
+        Add-OfflineRepairLog -Level Info -Message "Disk $number attached to nested guest '$($Vm.Name)'."
+        $result.Attached += $number
+    }
+
+    # A Generation 2 guest boots in UEFI order. The guest created by the library ships with a
+    # network adapter first, so a drive has to be promoted or the guest will try to PXE boot.
+    if ($generation -ge 2) {
+        try {
+            $drives = @((Get-VMFirmware -VMName $Vm.Name -ErrorAction Stop).BootOrder |
+                    Where-Object { $_.BootType -eq 'Drive' })
+
+            if ($drives.Count -gt 0) {
+                Set-VMFirmware -VMName $Vm.Name -FirstBootDevice $drives[0] -ErrorAction Stop
+
+                $first = @((Get-VMFirmware -VMName $Vm.Name -ErrorAction SilentlyContinue).BootOrder)[0]
+                $result.BootOrderSet = ($null -ne $first -and $first.BootType -eq 'Drive')
+
+                if ($result.BootOrderSet) {
+                    Add-OfflineRepairLog -Level Info -Message "Nested guest '$($Vm.Name)' set to boot from its disk rather than the network."
+                }
+                else {
+                    Add-OfflineRepairLog -Level Warning -Message "Nested guest '$($Vm.Name)' still lists a non-disk device first in its boot order."
+                }
+            }
+            else {
+                Add-OfflineRepairLog -Level Warning -Message "Nested guest '$($Vm.Name)' has no drive in its boot order."
+            }
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "The boot order of '$($Vm.Name)' could not be set: $($_.Exception.Message)"
+        }
+    }
+
+    return $result
+}
+
 function Start-NestedRepairVm {
     <#
     .SYNOPSIS
@@ -208,7 +336,7 @@ function Start-NestedRepairVm {
         Windows install being repaired.
 
     .OUTPUTS
-        PSCustomObject with Started, AlreadyRunning, State, DisksOffline and Reason.
+        PSCustomObject with Started, AlreadyRunning, State, DisksOffline, DisksAttached and Reason.
     #>
     param(
         [Parameter(Mandatory = $true)][AllowNull()]$Vm,
@@ -220,6 +348,7 @@ function Start-NestedRepairVm {
         AlreadyRunning = $false
         State          = $null
         DisksOffline   = @()
+        DisksAttached  = @()
         Reason         = $null
     }
 
@@ -282,6 +411,16 @@ function Start-NestedRepairVm {
         $offlined += $number
     }
     $result.DisksOffline = $offlined
+
+    # The disk has to be attached before the guest is started, and it has to be offline before it
+    # can be attached, so this sits between the two. See Connect-NestedRepairVmDisk for why the
+    # guest may arrive with no disk at all.
+    $attach = Connect-NestedRepairVmDisk -Vm $current -DiskNumber $DiskNumber
+    if ($attach.Reason) {
+        $result.Reason = $attach.Reason
+        return $result
+    }
+    $result.DisksAttached = $attach.Attached
 
     try {
         Start-VM -Name $Vm.Name -ErrorAction Stop | Out-Null
