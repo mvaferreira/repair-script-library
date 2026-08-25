@@ -144,13 +144,25 @@ $script:ProtectedExtension = @('.log', '.log1', '.log2', '.dat', '.sav', '.bak')
 
 # Primary registry hives that live in the scope folders. These are revalidated after the deletion:
 # a hive that loaded before and does not load after means the folder was damaged, and the scope is
-# rolled back.
+# rolled back. Nothing here is ever selected for deletion - this list only observes.
 #
 # The list is longer than the six hives usually named because a measured Server 2022 config folder
-# holds ten: DRIVERS, ELAM, BBI and BCD-Template are hives too, and there is no reason to leave them
-# out of the check. All ten loaded cleanly through Test-OfflineHiveFile on that disk, so the check
-# is a real gate here rather than something advisory - Test-OfflineHiveFile parses with reg.exe,
-# which does not have the ERROR_BADDB problem that makes RegLoadAppKey reject primary OS hives.
+# holds ten: DRIVERS, ELAM, BBI and BCD-Template are hives too. Inclusion costs one scratch-copy
+# parse each and can never remove a file, so the bar is "is it a hive in a folder we mutate", not
+# "is it needed at boot".
+#
+# BCD-Template is the weakest of the ten and is kept deliberately. It is only the template bcdboot
+# copies to build a fresh BCD store - the live BCD is on the boot partition, not here - and on a
+# pristine disk it owns no transaction logs at all, so it contributes no deletion candidates. But
+# loading it creates them: on the test disk a single in-place reg.exe load produced
+# BCD-Template{guid}.TM.blf plus two .TMContainer files that were not there before. A machine that
+# reaches this script has usually already been worked on, so those logs can exist here, and once
+# they do a Config-scope run will delete them. Damaging BCD-Template would not cause a no-boot; it
+# would break the next bcdboot the operator runs, which is a far more confusing failure.
+#
+# All ten loaded cleanly through Test-OfflineHiveFile on that disk, so the check is a real gate here
+# rather than something advisory - Test-OfflineHiveFile parses with reg.exe, which does not have the
+# ERROR_BADDB problem that makes RegLoadAppKey reject primary OS hives.
 $script:RegistryHive = @{
     'TxR'    = @()
     'Config' = @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'COMPONENTS', 'DRIVERS', 'ELAM', 'BBI', 'BCD-Template')
