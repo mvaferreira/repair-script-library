@@ -902,6 +902,17 @@ try {
     #####################################################################################################
     Log-Output 'VERIFY: taking the disk back to read the result.' | Tee-Object -FilePath $logFile -Append
 
+    # The guest is asked to shut down rather than switched off. The payload clears the Setup hook by
+    # writing to the registry, and that write lives in a loaded hive until Windows flushes it, which
+    # it always does on an orderly shutdown. Pulling the power instead throws that write away while
+    # keeping the files the payload wrote, so the run looks successful and the hook is still armed.
+    $graceful = Stop-NestedRepairVmGraceful -Vm $vmState.Vm
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+    if (-not $graceful.Graceful) {
+        Log-Warning "The guest did not shut down cleanly: $($graceful.Reason). The Setup hook is re-checked below and repaired from here if the payload's own reset was lost." | Tee-Object -FilePath $logFile -Append
+    }
+
     $null = Stop-NestedRepairVm
     $null = Set-OfflineDisksOnline
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -958,7 +969,7 @@ try {
     # enter setup mode again on its next boot.
     $setupAfter = Get-OfflineSetupState -WindowsPath $windowsPath
     if ($setupAfter.Available -and $setupAfter.SetupType -ne 0) {
-        Log-Warning "SetupType is still $($setupAfter.SetupType) after the run, so the payload did not clear its own hook. Restoring it now." | Tee-Object -FilePath $logFile -Append
+        Log-Warning "SetupType is still $($setupAfter.SetupType) after the run, so the payload's own reset either did not run or did not reach the disk. Restoring it from here." | Tee-Object -FilePath $logFile -Append
         $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType $hook.PreviousSetupType -CmdLine $hook.PreviousCmdLine
         if (-not $restore.Restored) {
             Log-Warning "The Setup hook could not be restored: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append

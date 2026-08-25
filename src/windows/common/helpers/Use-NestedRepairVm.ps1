@@ -535,3 +535,123 @@ function Wait-NestedRepairVmBoot {
 
     return $result
 }
+
+function Stop-NestedRepairVmGraceful {
+    <#
+    .SYNOPSIS
+        Asks a nested guest to shut down cleanly, and only pulls the power if it will not.
+
+    .DESCRIPTION
+        A payload that runs inside the guest and writes to the registry is writing into a loaded
+        hive, not straight to the file on disk. Windows flushes that hive lazily, and always on an
+        orderly shutdown. Turning the VM off at the power button instead discards anything that has
+        not been flushed yet, which silently loses the payload's own cleanup even though the payload
+        ran correctly. Files written by the payload survive, because they are ordinary file writes,
+        so the damage is easy to miss: everything looks fine except the registry.
+
+        This matters here because the payload clears the Setup hook it was launched from. If that
+        write is lost the guest would enter setup mode again on its next boot, which is the exact
+        condition the repair is supposed to leave behind it.
+
+        So the shutdown is requested through the Integration Services shutdown component and the
+        guest is given time to finish. The power is only pulled if the guest does not stop in time,
+        and that case is reported as a non-graceful stop so the caller knows the registry state on
+        the disk cannot be trusted and has to be checked.
+
+    .PARAMETER Vm
+        The guest to stop, as returned in the Vm property of Get-NestedRepairVm.
+
+    .PARAMETER TimeoutSeconds
+        How long to wait for the guest to stop on its own before pulling the power. Defaults to 180.
+
+    .PARAMETER PollSeconds
+        How often to re-check. Defaults to 5.
+
+    .OUTPUTS
+        An object with Stopped, Graceful, WaitedSeconds, State and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Vm,
+        [int]$TimeoutSeconds = 180,
+        [int]$PollSeconds = 5
+    )
+
+    $result = [PSCustomObject]@{
+        Stopped       = $false
+        Graceful      = $false
+        WaitedSeconds = 0
+        State         = $null
+        Reason        = $null
+    }
+
+    if (-not $Vm) {
+        $result.Reason = 'no nested guest was supplied, so there was nothing to stop'
+        return $result
+    }
+
+    $name = $Vm.Name
+
+    $current = Get-VM -Name $name -ErrorAction SilentlyContinue
+    if (-not $current) {
+        $result.Reason = "the nested guest '$name' no longer exists"
+        return $result
+    }
+
+    if ($current.State -eq 'Off') {
+        # Deliberately not reported as graceful. Reaching here means the guest powered off on its
+        # own before it was asked to, and there is no way from the host to tell an orderly shutdown
+        # apart from a crash, so the caller is told to re-check the disk rather than trust it.
+        $result.Stopped = $true
+        $result.State = 'Off'
+        $result.Reason = "the nested guest '$name' was already off, so it is not known whether it shut down cleanly"
+        Add-OfflineRepairLog -Level Info -Message $result.Reason
+        return $result
+    }
+
+    Add-OfflineRepairLog -Level Info -Message "Asking the nested guest '$name' to shut down cleanly so anything it wrote to the registry is flushed to its disk."
+
+    try {
+        Stop-VM -Name $name -Force -AsJob -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $result.Reason = "the shutdown request to '$name' failed: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Warning -Message $result.Reason
+    }
+
+    $started = Get-Date
+    while (((Get-Date) - $started).TotalSeconds -lt $TimeoutSeconds) {
+        $current = Get-VM -Name $name -ErrorAction SilentlyContinue
+
+        if (-not $current) {
+            $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
+            $result.Reason = "the nested guest '$name' disappeared while it was shutting down"
+            Add-OfflineRepairLog -Level Warning -Message $result.Reason
+            return $result
+        }
+
+        if ($current.State -eq 'Off') {
+            $result.Stopped = $true
+            $result.Graceful = $true
+            $result.State = 'Off'
+            $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
+            Add-OfflineRepairLog -Level Info -Message "The nested guest '$name' shut down cleanly after $($result.WaitedSeconds) seconds."
+            return $result
+        }
+
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
+    Add-OfflineRepairLog -Level Warning -Message "The nested guest '$name' did not shut down within $($result.WaitedSeconds) seconds, so its power is being turned off. Anything it wrote to the registry and that Windows had not flushed yet is lost, so the disk has to be re-checked rather than trusted."
+
+    Stop-VM -Name $name -TurnOff -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+
+    $current = Get-VM -Name $name -ErrorAction SilentlyContinue
+    $result.State = if ($current) { [string]$current.State } else { $null }
+    $result.Stopped = (-not $current) -or ($current.State -eq 'Off')
+    $result.Graceful = $false
+    $result.Reason = "the nested guest '$name' had to be turned off at the power button after $($result.WaitedSeconds) seconds"
+
+    return $result
+}
