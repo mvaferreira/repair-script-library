@@ -475,12 +475,17 @@ function Write-TempUserPayload {
              groups, recording the exit code of each command.
           2. Writes those exit codes to a result file, which is how the rescue VM learns what
              happened inside a guest it cannot otherwise see.
-          3. Clears the Setup hook, so the VM does not enter setup mode again on its next boot.
+          3. Resets the Setup hook, in the same form Repair-AzVMDisk.ps1 uses. Windows owns that
+             value while it is in setup mode and puts it back until its own setup pass finishes, so
+             this reset does not survive a guest that is stopped part way through and the rescue VM
+             clears it afterwards. It is kept here because it is what makes the disk self-heal if it
+             is ever booted normally without that step.
           4. Deletes itself, so the password does not remain in a readable file on the disk.
 
         Step 4 is why the payload is written by this script rather than reused: it is single use by
         design. The library's existing Group Policy based script leaves its command file, and the
-        password in it, on the disk permanently.
+        password in it, on the disk permanently. It is also the signal that the payload ran to the
+        end, since it is the last line: if the file is still there, the run stopped early.
 
         The file is written as ASCII with CRLF because cmd.exe will not reliably parse a batch file
         saved as UTF-8 with a byte order mark.
@@ -965,18 +970,28 @@ try {
         return $STATUS_ERROR
     }
 
-    # The hook cleared itself from inside the guest. Confirm that, because if it did not, the VM will
-    # enter setup mode again on its next boot.
+    # Windows owns SYSTEM\Setup\SetupType while it is in setup mode and keeps rewriting it until its
+    # setup pass completes. That pass cannot complete in a guest that is deliberately shut down part
+    # way through, so the value is normally still 2 here even though the payload did reset it. The
+    # payload keeps its own reset anyway, because it is what makes the disk self-heal if it is ever
+    # booted normally without this step. Clearing it from the rescue VM is the expected finish, not
+    # a sign that anything went wrong, so it is only reported as a problem when the write fails.
     $setupAfter = Get-OfflineSetupState -WindowsPath $windowsPath
     if ($setupAfter.Available -and $setupAfter.SetupType -ne 0) {
-        Log-Warning "SetupType is still $($setupAfter.SetupType) after the run, so the payload's own reset either did not run or did not reach the disk. Restoring it from here." | Tee-Object -FilePath $logFile -Append
+        Log-Output 'FINALIZE: clearing the Setup hook from here, because Windows re-arms it until a setup pass it was not allowed to finish completes.' | Tee-Object -FilePath $logFile -Append
         $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType $hook.PreviousSetupType -CmdLine $hook.PreviousCmdLine
-        if (-not $restore.Restored) {
-            Log-Warning "The Setup hook could not be restored: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append
+
+        $setupFinal = Get-OfflineSetupState -WindowsPath $windowsPath
+        if ((-not $restore.Restored) -or ($setupFinal.Available -and $setupFinal.SetupType -ne 0)) {
+            Log-Warning "The Setup hook could not be cleared: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append
+            Log-Warning "SetupType is still $($setupFinal.SetupType), so this VM would boot into setup mode. Re-run with -revert true before restoring the disk." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output 'The Setup hook is cleared, so the VM will boot normally.' | Tee-Object -FilePath $logFile -Append
         }
     }
     else {
-        Log-Output 'The payload cleared its own Setup hook, so the VM will boot normally.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The Setup hook is already clear, so the VM will boot normally.' | Tee-Object -FilePath $logFile -Append
     }
 
     if (Test-Path -LiteralPath $manifestPath) {

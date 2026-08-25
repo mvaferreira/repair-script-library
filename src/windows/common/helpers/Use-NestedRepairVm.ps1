@@ -542,21 +542,20 @@ function Stop-NestedRepairVmGraceful {
         Asks a nested guest to shut down cleanly, and only pulls the power if it will not.
 
     .DESCRIPTION
-        A payload that runs inside the guest and writes to the registry is writing into a loaded
-        hive, not straight to the file on disk. Windows flushes that hive lazily, and always on an
-        orderly shutdown. Turning the VM off at the power button instead discards anything that has
-        not been flushed yet, which silently loses the payload's own cleanup even though the payload
-        ran correctly. Files written by the payload survive, because they are ordinary file writes,
-        so the damage is easy to miss: everything looks fine except the registry.
+        Turning a Windows guest off at the power button leaves its hives and file system dirty, and
+        discards anything the guest had written but not yet flushed. Here the guest has just created
+        a local account, so that write matters: it is the whole point of the run. Asking the guest to
+        shut down instead lets Windows commit it and close the hives cleanly, which also spares the
+        disk a chkdsk on the next boot.
 
-        This matters here because the payload clears the Setup hook it was launched from. If that
-        write is lost the guest would enter setup mode again on its next boot, which is the exact
-        condition the repair is supposed to leave behind it.
+        One value is deliberately not covered by this. While Windows is in setup mode it owns
+        SYSTEM\Setup\SetupType and rewrites it until its setup pass finishes, which cannot happen in
+        a guest that is stopped on purpose part way through. That value is therefore finalised from
+        the rescue VM after the disk comes back, not here.
 
-        So the shutdown is requested through the Integration Services shutdown component and the
-        guest is given time to finish. The power is only pulled if the guest does not stop in time,
-        and that case is reported as a non-graceful stop so the caller knows the registry state on
-        the disk cannot be trusted and has to be checked.
+        The power is only pulled if the guest does not stop in time, and that case is reported as a
+        non-graceful stop so the caller knows what is on the disk cannot be trusted and has to be
+        re-checked.
 
     .PARAMETER Vm
         The guest to stop, as returned in the Vm property of Get-NestedRepairVm.
