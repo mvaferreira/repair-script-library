@@ -173,5 +173,10 @@
 		"id": "win-fix-pending-servicing",
 		"path": "src/windows/win-fix-pending-servicing.ps1",
 		"description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer"
+	},
+	{
+		"id": "win-fix-transaction-logs",
+		"path": "src/windows/win-fix-transaction-logs.ps1",
+		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again"
 	}
 ]
