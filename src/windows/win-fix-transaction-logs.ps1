@@ -154,11 +154,13 @@ $script:ProtectedExtension = @('.log', '.log1', '.log2', '.dat', '.sav', '.bak')
 # BCD-Template is the weakest of the ten and is kept deliberately. It is only the template bcdboot
 # copies to build a fresh BCD store - the live BCD is on the boot partition, not here - and on a
 # pristine disk it owns no transaction logs at all, so it contributes no deletion candidates. But
-# loading it creates them: on the test disk a single in-place reg.exe load produced
-# BCD-Template{guid}.TM.blf plus two .TMContainer files that were not there before. A machine that
-# reaches this script has usually already been worked on, so those logs can exist here, and once
-# they do a Config-scope run will delete them. Damaging BCD-Template would not cause a no-boot; it
-# would break the next bcdboot the operator runs, which is a far more confusing failure.
+# loading a hive in place creates them: on the test disk a single in-place reg.exe load produced
+# BCD-Template{guid}.TM.blf plus two .TMContainer files that were not there before. This script
+# never loads in place - Test-OfflineHiveFile copies to scratch first, so it cannot create them -
+# but a machine that reaches this script has usually already been worked on, and a prior bcdboot or
+# repair attempt does load it in place. Once those logs exist a Config-scope run will delete them.
+# Damaging BCD-Template would not cause a no-boot; it would break the next bcdboot the operator
+# runs, which is a far more confusing failure.
 #
 # All ten loaded cleanly through Test-OfflineHiveFile on that disk, so the check is a real gate here
 # rather than something advisory - Test-OfflineHiveFile parses with reg.exe, which does not have the
