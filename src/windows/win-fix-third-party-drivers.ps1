@@ -72,6 +72,11 @@
 #   "true" to put back the Start values recorded by an earlier run of this script on this disk.
 #   Reads the revert manifest written to the root of the offline Windows drive.
 #
+# .PARAMETER disableDriverVerifier
+#   "true" to clear Driver Verifier as well. Defaults to "false". Driver Verifier state is reported
+#   on every run whether or not this is set, because a VM bugchecking on boot with it enabled looks
+#   exactly like a bad third party driver.
+#
 # .PARAMETER windowsDrive
 #   Drive letter of the offline Windows installation, for example "F". Only needed when more than
 #   one Windows installation is attached and the automatically selected one is not the right one.
@@ -80,6 +85,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters detectOnly=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters driverName=myfilter --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters disableDriverVerifier=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters revert=true --run-on-repair --verbose
 #
 # .NOTES
@@ -111,14 +117,23 @@
 #
 #   The SYSTEM hive file is backed up next to itself before the first write.
 #
+#   Driver Verifier is a diagnostic tool rather than a protection, so clearing it is a repair and
+#   not a workaround. It is left to an explicit parameter because it is a separate cause: the VM
+#   bugchecks on a stop such as 0xC4 the moment a watched driver misbehaves, rather than failing to
+#   load a driver at all. VerifyDrivers and VerifyDriverLevel are removed rather than blanked, and
+#   VeriDrv is set to Start=4, because a clean installation carries none of the three. Every value
+#   removed is recorded in the same revert manifest as the drivers.
+#
 # .VERSION
 #   v1.0: Initial version.
+#   v1.1: Added disableDriverVerifier.
 #
 #########################################################################################################
 
 Param(
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false')][string]$detectOnly = 'false',
     [Parameter(Mandatory = $false)][string]$driverName = '',
+    [Parameter(Mandatory = $false)][ValidateSet('true', 'false')][string]$disableDriverVerifier = 'false',
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false')][string]$revert = 'false',
     [Parameter(Mandatory = $false)][string]$windowsDrive = ''
 )
@@ -135,6 +150,7 @@ $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 $isDetectOnly = ($detectOnly -eq 'true')
 $isRevert = ($revert -eq 'true')
 $targetDriver = $driverName.Trim()
+$doDisableVerifier = ($disableDriverVerifier -eq 'true')
 
 # Drivers the VM boots through. Disabling one of these swaps the current failure for a 0x7B, so
 # they are never candidates, whoever the evidence names.
@@ -615,6 +631,18 @@ function Invoke-DriverRevert {
     $errors = [System.Collections.Generic.List[string]]::new()
 
     foreach ($entry in $Entries) {
+        # Entries written before this script handled Driver Verifier carry no Kind at all, so
+        # anything that is not explicitly a verifier entry is treated as a driver.
+        if ($entry.Kind -eq 'DriverVerifier') {
+            try {
+                $restored += Restore-DriverVerifier -SystemRoot $SystemRoot -Entry $entry
+            }
+            catch {
+                [void]$errors.Add("Driver Verifier: $($_.Exception.Message)")
+            }
+            continue
+        }
+
         $keyPath = "$SystemRoot\Services\$($entry.Service)"
         if (-not (Test-Path -LiteralPath $keyPath)) {
             [void]$errors.Add("$($entry.Service): the service key is no longer present.")
@@ -640,8 +668,148 @@ function Invoke-DriverRevert {
     return [PSCustomObject]@{ Restored = $restored; Errors = @($errors) }
 }
 
+function Get-DriverVerifierState {
+    <#
+    .SYNOPSIS
+        Reads the Driver Verifier configuration. Must be called with SYSTEM mounted.
+
+    .DESCRIPTION
+        Driver Verifier is a diagnostic tool, not a protection. It deliberately bugchecks the
+        machine the moment a driver it is watching misbehaves, so a VM left with it enabled boot
+        loops on a stop such as 0xC4 or 0xC9 and never reaches a logon screen.
+
+        A clean installation carries no VerifyDrivers value, no VerifyDriverLevel value and no
+        VeriDrv service key at all, so presence is what matters here rather than any content. That
+        was confirmed against a healthy Windows installation rather than assumed.
+    #>
+    param([Parameter(Mandatory = $true)][string]$SystemRoot)
+
+    $mmPath = "$SystemRoot\Control\Session Manager\Memory Management"
+    $veriDrvPath = "$SystemRoot\Services\VeriDrv"
+
+    $props = if (Test-Path -LiteralPath $mmPath) { Get-ItemProperty -LiteralPath $mmPath -ErrorAction SilentlyContinue } else { $null }
+    $hasDrivers = ($null -ne $props) -and ($null -ne $props.PSObject.Properties['VerifyDrivers'])
+    $hasLevel = ($null -ne $props) -and ($null -ne $props.PSObject.Properties['VerifyDriverLevel'])
+
+    $veriDrvStart = $null
+    if (Test-Path -LiteralPath $veriDrvPath) {
+        $veriDrvStart = (Get-ItemProperty -LiteralPath $veriDrvPath -Name 'Start' -ErrorAction SilentlyContinue).Start
+    }
+    $veriDrvEnabled = ($null -ne $veriDrvStart) -and ([int]$veriDrvStart -ne 4)
+
+    $described = [System.Collections.Generic.List[string]]::new()
+    if ($hasDrivers) { [void]$described.Add("VerifyDrivers='$($props.VerifyDrivers)'") }
+    if ($hasLevel) { [void]$described.Add("VerifyDriverLevel=$($props.VerifyDriverLevel)") }
+    if ($veriDrvEnabled) { [void]$described.Add("VeriDrv Start=$veriDrvStart") }
+
+    return [PSCustomObject]@{
+        MemoryManagementPath = $mmPath
+        VeriDrvPath          = $veriDrvPath
+        HasVerifyDrivers     = $hasDrivers
+        VerifyDrivers        = $(if ($hasDrivers) { $props.VerifyDrivers } else { $null })
+        HasVerifyDriverLevel = $hasLevel
+        VerifyDriverLevel    = $(if ($hasLevel) { $props.VerifyDriverLevel } else { $null })
+        VeriDrvPresent       = ($null -ne $veriDrvStart)
+        VeriDrvStart         = $veriDrvStart
+        Configured           = ($hasDrivers -or $hasLevel -or $veriDrvEnabled)
+        Summary              = $(if ($described.Count -gt 0) { $described -join ', ' } else { 'not configured' })
+    }
+}
+
+function Disable-DriverVerifier {
+    <#
+    .SYNOPSIS
+        Clears the Driver Verifier configuration, returning the manifest entry that undoes it.
+
+    .DESCRIPTION
+        The values are removed rather than blanked, because absence is what a clean installation
+        holds. Returns $null when there was nothing configured, so a run that changes nothing
+        records nothing.
+    #>
+    param([Parameter(Mandatory = $true)][string]$SystemRoot)
+
+    $state = Get-DriverVerifierState -SystemRoot $SystemRoot
+    if (-not $state.Configured) {
+        Add-OfflineRepairLog -Message 'Driver Verifier: not configured on this disk, nothing to do.'
+        return $null
+    }
+
+    $mmKey = 'HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+
+    if ($state.HasVerifyDrivers) {
+        Remove-ItemProperty -LiteralPath $state.MemoryManagementPath -Name 'VerifyDrivers' -Force -ErrorAction Stop
+        Add-OfflineRepairLog -Message "Driver Verifier: removed VerifyDrivers (was '$($state.VerifyDrivers)')."
+        Add-OfflineRepairLog -Message "Driver Verifier: to undo this after the VM boots, run: reg add `"$mmKey`" /v VerifyDrivers /t REG_SZ /d `"$($state.VerifyDrivers)`" /f"
+    }
+
+    if ($state.HasVerifyDriverLevel) {
+        Remove-ItemProperty -LiteralPath $state.MemoryManagementPath -Name 'VerifyDriverLevel' -Force -ErrorAction Stop
+        Add-OfflineRepairLog -Message "Driver Verifier: removed VerifyDriverLevel (was $($state.VerifyDriverLevel))."
+        Add-OfflineRepairLog -Message "Driver Verifier: to undo this after the VM boots, run: reg add `"$mmKey`" /v VerifyDriverLevel /t REG_DWORD /d $($state.VerifyDriverLevel) /f"
+    }
+
+    # Only record an undo for VeriDrv when this function is what disabled it. The driver loop
+    # runs first and may already have taken it to 4 while recording the true original Start in
+    # its own entry. A second entry here would hold the post-change value and, restored after
+    # that one, would silently put the driver back in the disabled state it was rescued from.
+    $veriDrvDisabled = $false
+    if ($state.VeriDrvPresent -and [int]$state.VeriDrvStart -ne 4) {
+        Set-ItemProperty -LiteralPath $state.VeriDrvPath -Name 'Start' -Value 4 -Type DWord -Force -ErrorAction Stop
+        $veriDrvDisabled = $true
+        Add-OfflineRepairLog -Message "Driver Verifier: VeriDrv Start $($state.VeriDrvStart) -> 4 (disabled)."
+        Add-OfflineRepairLog -Message "Driver Verifier: to undo this after the VM boots, run: reg add `"HKLM\SYSTEM\CurrentControlSet\Services\VeriDrv`" /v Start /t REG_DWORD /d $($state.VeriDrvStart) /f"
+    }
+
+    return [PSCustomObject]@{
+        Kind                 = 'DriverVerifier'
+        Service              = 'Driver Verifier'
+        HadVerifyDrivers     = $state.HasVerifyDrivers
+        VerifyDrivers        = $state.VerifyDrivers
+        HadVerifyDriverLevel = $state.HasVerifyDriverLevel
+        VerifyDriverLevel    = $state.VerifyDriverLevel
+        VeriDrvDisabled      = $veriDrvDisabled
+        VeriDrvStart         = $(if ($veriDrvDisabled) { $state.VeriDrvStart } else { $null })
+        DisabledAt           = (Get-Date -Format 'o')
+    }
+}
+
+function Restore-DriverVerifier {
+    <#
+    .SYNOPSIS
+        Puts back exactly the Driver Verifier values a previous run removed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SystemRoot,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+
+    $mmPath = "$SystemRoot\Control\Session Manager\Memory Management"
+    $veriDrvPath = "$SystemRoot\Services\VeriDrv"
+    $restored = 0
+
+    if ($Entry.HadVerifyDrivers -and (Test-Path -LiteralPath $mmPath)) {
+        Set-ItemProperty -LiteralPath $mmPath -Name 'VerifyDrivers' -Value ([string]$Entry.VerifyDrivers) -Type String -Force -ErrorAction Stop
+        Add-OfflineRepairLog -Message "Driver Verifier: VerifyDrivers restored to '$($Entry.VerifyDrivers)'."
+        $restored++
+    }
+
+    if ($Entry.HadVerifyDriverLevel -and (Test-Path -LiteralPath $mmPath)) {
+        Set-ItemProperty -LiteralPath $mmPath -Name 'VerifyDriverLevel' -Value ([int]$Entry.VerifyDriverLevel) -Type DWord -Force -ErrorAction Stop
+        Add-OfflineRepairLog -Message "Driver Verifier: VerifyDriverLevel restored to $($Entry.VerifyDriverLevel)."
+        $restored++
+    }
+
+    if ($Entry.VeriDrvDisabled -and $null -ne $Entry.VeriDrvStart -and (Test-Path -LiteralPath $veriDrvPath)) {
+        Set-ItemProperty -LiteralPath $veriDrvPath -Name 'Start' -Value ([int]$Entry.VeriDrvStart) -Type DWord -Force -ErrorAction Stop
+        Add-OfflineRepairLog -Message "Driver Verifier: VeriDrv Start restored to $($Entry.VeriDrvStart)."
+        $restored++
+    }
+
+    return $restored
+}
+
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
-Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly, driverName=$(if ($targetDriver) { $targetDriver } else { '<all>' }), revert=$isRevert)" | Tee-Object -FilePath $logFile -Append
+Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly, driverName=$(if ($targetDriver) { $targetDriver } else { '<all>' }), disableDriverVerifier=$doDisableVerifier, revert=$isRevert)" | Tee-Object -FilePath $logFile -Append
 
 try {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
@@ -661,11 +829,20 @@ try {
             return $STATUS_SUCCESS
         }
 
-        Log-Info "Revert manifest holds $($entries.Count) driver(s): $(@($entries.Service) -join ', ')" | Tee-Object -FilePath $logFile -Append
+        Log-Info "Revert manifest holds $($entries.Count) entry(s): $(@($entries | ForEach-Object { $_.Service }) -join ', ')" | Tee-Object -FilePath $logFile -Append
 
         if ($isDetectOnly) {
             foreach ($entry in $entries) {
-                Log-Output "  [WOULD RESTORE] $($entry.Service): Start -> $($entry.OriginalStart)" | Tee-Object -FilePath $logFile -Append
+                if ($entry.Kind -eq 'DriverVerifier') {
+                    $parts = [System.Collections.Generic.List[string]]::new()
+                    if ($entry.HadVerifyDrivers) { [void]$parts.Add("VerifyDrivers='$($entry.VerifyDrivers)'") }
+                    if ($entry.HadVerifyDriverLevel) { [void]$parts.Add("VerifyDriverLevel=$($entry.VerifyDriverLevel)") }
+                    if ($entry.VeriDrvDisabled) { [void]$parts.Add("VeriDrv Start=$($entry.VeriDrvStart)") }
+                    Log-Output "  [WOULD RESTORE] Driver Verifier: $($parts -join ', ')" | Tee-Object -FilePath $logFile -Append
+                }
+                else {
+                    Log-Output "  [WOULD RESTORE] $($entry.Service): Start -> $($entry.OriginalStart)" | Tee-Object -FilePath $logFile -Append
+                }
             }
             Log-Output "Detect only: no changes were made." | Tee-Object -FilePath $logFile -Append
             Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -683,13 +860,13 @@ try {
 
         if ($revertOutcome.Errors.Count -gt 0) {
             foreach ($failure in $revertOutcome.Errors) { Log-Warning $failure | Tee-Object -FilePath $logFile -Append }
-            Log-Error "Restored $($revertOutcome.Restored) of $($entries.Count) driver(s). $($revertOutcome.Errors.Count) failed." | Tee-Object -FilePath $logFile -Append
+            Log-Error "Restored $($revertOutcome.Restored) of $($entries.Count) entry(s). $($revertOutcome.Errors.Count) failed." | Tee-Object -FilePath $logFile -Append
             Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
             return $STATUS_ERROR
         }
 
         Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
-        Log-Output "Restored $($revertOutcome.Restored) driver(s) to their original Start value and removed the manifest." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Restored $($revertOutcome.Restored) item(s) from the manifest and removed it." | Tee-Object -FilePath $logFile -Append
         Log-Output "Run 'az vm repair restore' to swap the disk back to the original VM." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -707,6 +884,7 @@ try {
             Topology   = $topology
             Drivers    = $drivers
             Findings   = $findings
+            Verifier   = (Get-DriverVerifierState -SystemRoot $systemRoot)
         }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -727,6 +905,20 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
     $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
+    # Driver Verifier is reported on every run, because a VM that bugchecks on boot with it enabled
+    # looks exactly like a bad third party driver and the operator needs to see it either way.
+    if ($context.Verifier.Configured) {
+        Log-Info "Driver Verifier is configured on this disk: $($context.Verifier.Summary). It bugchecks the VM as soon as a watched driver misbehaves." | Tee-Object -FilePath $logFile -Append
+        if (-not $doDisableVerifier) {
+            Log-Info 'Re-run with -disableDriverVerifier true to clear it.' | Tee-Object -FilePath $logFile -Append
+        }
+    }
+    else {
+        Log-Info 'Driver Verifier is not configured on this disk.' | Tee-Object -FilePath $logFile -Append
+    }
+
+    $verifierPending = $doDisableVerifier -and $context.Verifier.Configured
+
     foreach ($finding in $protected) {
         Log-Info "PROTECTED $($finding.Message)" | Tee-Object -FilePath $logFile -Append
     }
@@ -734,10 +926,13 @@ try {
         Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
     }
 
-    if ($repairable.Count -eq 0) {
+    if ($repairable.Count -eq 0 -and -not $verifierPending) {
         Log-Output "No third party driver on this disk is both loading at Boot or System start and off every protected path. Nothing was changed." | Tee-Object -FilePath $logFile -Append
         if ($protected.Count -gt 0) {
             Log-Output "$($protected.Count) third party driver(s) were deliberately left alone because the VM boots or reaches the network through them. They are listed above with the reason." | Tee-Object -FilePath $logFile -Append
+        }
+        if ($doDisableVerifier) {
+            Log-Output 'Driver Verifier was already off, so there was nothing to clear.' | Tee-Object -FilePath $logFile -Append
         }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -750,6 +945,9 @@ try {
         }
         foreach ($finding in $unrepairable) {
             Log-Output "  [PROTECTED    ] $($finding.Item): $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+        if ($verifierPending) {
+            Log-Output "  [WOULD CLEAR  ] Driver Verifier: $($context.Verifier.Summary)" | Tee-Object -FilePath $logFile -Append
         }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -781,7 +979,22 @@ try {
             }
         }
 
-        return [PSCustomObject]@{ Repaired = $done; Entries = @($entries); Errors = @($errors) }
+        $verifierCleared = $false
+        if ($verifierPending) {
+            try {
+                $verifierEntry = Disable-DriverVerifier -SystemRoot $systemRoot
+                if ($null -ne $verifierEntry) {
+                    [void]$entries.Add($verifierEntry)
+                    $verifierCleared = $true
+                }
+            }
+            catch {
+                [void]$errors.Add("Driver Verifier: $($_.Exception.Message)")
+                Add-OfflineRepairLog -Level Warning -Message "Driver Verifier: could not be cleared ($($_.Exception.Message))."
+            }
+        }
+
+        return [PSCustomObject]@{ Repaired = $done; Entries = @($entries); Errors = @($errors); VerifierCleared = $verifierCleared }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
@@ -791,23 +1004,32 @@ try {
     }
 
     # Verify against freshly read state rather than trusting the writes above.
-    $remaining = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+    $verification = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath
         $topology = Get-DeviceTopology -SystemRoot $systemRoot
         $drivers = @(Get-DriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
-        return @(Get-AllFinding -Drivers $drivers -Topology $topology -TargetService $targetDriver)
+        return [PSCustomObject]@{
+            Findings = @(Get-AllFinding -Drivers $drivers -Topology $topology -TargetService $targetDriver)
+            Verifier = (Get-DriverVerifierState -SystemRoot $systemRoot)
+        }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $stillRepairable = @($remaining | Where-Object { $_.Repairable })
+    $stillRepairable = @($verification.Findings | Where-Object { $_.Repairable })
     foreach ($finding in $stillRepairable) {
         Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
     }
 
+    $verifierStillOn = $verifierPending -and $verification.Verifier.Configured
+    if ($verifierStillOn) {
+        Log-Warning "STILL PRESENT Driver Verifier: $($verification.Verifier.Summary)" | Tee-Object -FilePath $logFile -Append
+    }
+
     $summary = "Disabled $($repairOutcome.Repaired) of $($repairable.Count) third party driver(s)."
     if ($protected.Count -gt 0) { $summary += " $($protected.Count) driver(s) were protected and left alone." }
+    if ($repairOutcome.VerifierCleared) { $summary += ' Driver Verifier was cleared.' }
 
-    if ($repairOutcome.Errors.Count -gt 0 -or $stillRepairable.Count -gt 0) {
+    if ($repairOutcome.Errors.Count -gt 0 -or $stillRepairable.Count -gt 0 -or $verifierStillOn) {
         Log-Error "$summary $($repairOutcome.Errors.Count) change(s) failed and $($stillRepairable.Count) driver(s) are still enabled." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR

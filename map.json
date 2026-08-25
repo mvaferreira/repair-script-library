@@ -163,5 +163,10 @@
 		"id": "win-fix-third-party-drivers",
 		"path": "src/windows/win-fix-third-party-drivers.ps1",
 		"description": "Disables third party kernel drivers that stop a VM booting, refusing to touch any driver on the storage, network or boot path"
+	},
+	{
+		"id": "win-fix-pending-servicing",
+		"path": "src/windows/win-fix-pending-servicing.ps1",
+		"description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer"
 	}
 ]
