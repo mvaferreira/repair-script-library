@@ -44,7 +44,7 @@
 #       damaged Windows installation rather than a boot configuration fault, and rewriting the BCD
 #       to point at a file that is not there fixes nothing. Use win-sfc-sf-corruption.
 #     - No boot partition exists at all. There is nothing to write a BCD store to. That is the
-#       win-fix-boot-part scenario.
+#       win-fix-boot-partition scenario.
 #     - BCD-Template is missing from the Windows installation while a rebuild is required. bcdboot
 #       seeds a new store from that file and cannot run without it. The script stops before it
 #       renames anything, so the existing store is left intact.
@@ -99,7 +99,7 @@
 #   the operator's entries. A rebuild collapses them because it starts a fresh store.
 #
 #   Related scenarios, deliberately not folded in because they are different problems:
-#     win-fix-boot-part            the system partition itself is damaged or missing
+#     win-fix-boot-partition       the system partition itself is damaged or missing
 #     win-toggle-safe-mode              the safeboot flag is set
 #     win-fix-code-integrity-boot-failure  testsigning or nointegritychecks is set
 #     win-LKGC                          boot the previous control set instead
@@ -830,7 +830,7 @@ try {
     Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber)), Gen$($offline.Generation) / $($offline.PartitionStyle)." | Tee-Object -FilePath $logFile -Append
 
     if (-not $offline.BootDrive) {
-        Log-Error "No boot partition was found on disk $($offline.DiskNumber), so there is nowhere to read or write a BCD store. This is a damaged or missing system partition rather than a boot configuration fault. Use run id win-fix-boot-part." | Tee-Object -FilePath $logFile -Append
+        Log-Error "No boot partition was found on disk $($offline.DiskNumber), so there is nowhere to read or write a BCD store. This is a damaged or missing system partition rather than a boot configuration fault. Use run id win-fix-boot-partition." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR
     }
