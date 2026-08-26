@@ -173,6 +173,7 @@ Param(
 . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
 . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
 . .\src\windows\common\helpers\Use-OfflineFileRemoval.ps1
+. .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
@@ -905,17 +906,27 @@ try {
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
         if (Test-Path -LiteralPath $pendingXmlPath) {
-            # WinSxS is owned by TrustedInstaller and denies writes even to SYSTEM on some images, so
-            # the rename can fail. Record it only once it has demonstrably happened.
+            # WinSxS is owned by TrustedInstaller and denies writes even to SYSTEM, so the plain
+            # rename is refused on a real image. Rename-OfflineProtectedFile retries it after taking
+            # the parent folder, and puts the folder's owner and DACL back either way - measured on
+            # Server 2022, where the unassisted rename failed every time.
             $renamedTo = "pending.xml.bak-$scriptStartTime"
-            try {
-                Rename-Item -LiteralPath $pendingXmlPath -NewName $renamedTo -Force -ErrorAction Stop
-                $manifest.PendingXmlRenamedTo = Join-Path (Split-Path -Path $pendingXmlPath -Parent) $renamedTo
-                Log-Info "Renamed pending.xml to $renamedTo. To undo: Rename-Item -LiteralPath '$($manifest.PendingXmlRenamedTo)' -NewName 'pending.xml'" | Tee-Object -FilePath $logFile -Append
+            $rename = Rename-OfflineProtectedFile -Path $pendingXmlPath -NewName $renamedTo
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            if ($rename.Renamed) {
+                $manifest.PendingXmlRenamedTo = $rename.NewPath
+                Log-Info "Renamed pending.xml to $renamedTo. $($rename.Reason) To undo: Rename-Item -LiteralPath '$($manifest.PendingXmlRenamedTo)' -NewName 'pending.xml'" | Tee-Object -FilePath $logFile -Append
+                if ($rename.TookOwnership) {
+                    Log-Info "WinSxS ownership was borrowed for the rename and its original owner and ACL have been put back: restored=$($rename.Restored)." | Tee-Object -FilePath $logFile -Append
+                }
                 $changes++
             }
-            catch {
-                Log-Warning "pending.xml could not be renamed ($($_.Exception.Message)). WinSxS is owned by TrustedInstaller, so this is an access problem rather than a missing file. The DISM revert above is the supported way to consume it." | Tee-Object -FilePath $logFile -Append
+            else {
+                Log-Warning "pending.xml could not be renamed. $($rename.Reason) The DISM revert above is the supported way to consume it." | Tee-Object -FilePath $logFile -Append
+                if ($rename.TookOwnership -and -not $rename.Restored) {
+                    Log-Warning "WinSxS ownership was taken for the retry and could not be put back. Restore it with: icacls `"$(Split-Path -Path $pendingXmlPath -Parent)`" /setowner `"NT SERVICE\TrustedInstaller`"" | Tee-Object -FilePath $logFile -Append
+                }
             }
         }
         else {
@@ -926,31 +937,39 @@ try {
         Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
             foreach ($key in $script:PendingCbsKey) {
                 $path = Join-Path $script:CbsSoftwareKey $key
-                if (Test-Path $path) {
-                    Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
-                    if (Test-Path $path) {
-                        Add-OfflineRepairLog -Level Warning -Message "CBS\$key could not be removed."
-                    }
-                    else {
-                        Add-OfflineRepairLog -Level Info -Message "Removed CBS\$key."
-                        $script:RegistryChanges++
-                    }
+                if (-not (Test-Path $path)) { continue }
+
+                # The CBS pending keys are TrustedInstaller's and deny delete to everyone else, so
+                # the plain Remove-Item is refused and - with SilentlyContinue - refused silently.
+                # Invoke-OfflineProtectedKeyRemoval verifies the plain attempt, takes the subtree
+                # only if it is still there, and puts every descriptor back if the delete still
+                # fails, so a refusal never leaves a key owned by SYSTEM.
+                $outcome = Invoke-OfflineProtectedKeyRemoval -Path $path -Label "CBS\$key"
+                if ($outcome.Removed) {
+                    Add-OfflineRepairLog -Level Info -Message "Removed CBS\$key. $($outcome.Reason)"
+                    $script:RegistryChanges++
+                }
+                else {
+                    Add-OfflineRepairLog -Level Warning -Message "CBS\$key could not be removed. $($outcome.Reason)"
                 }
             }
 
             foreach ($name in $script:PendingComponentValue) {
                 $value = (Get-ItemProperty $script:ComponentsKey -ErrorAction SilentlyContinue).$name
-                if (Test-PendingComponentValue -Value $value) {
-                    Remove-ItemProperty -Path $script:ComponentsKey -Name $name -Force -ErrorAction SilentlyContinue
-                    # Read it back rather than assume: these keys can be ACL protected.
-                    $after = (Get-ItemProperty $script:ComponentsKey -ErrorAction SilentlyContinue).$name
-                    if (Test-PendingComponentValue -Value $after) {
-                        Add-OfflineRepairLog -Level Warning -Message "COMPONENTS\$name could not be cleared, it is still set to '$after'."
-                    }
-                    else {
-                        Add-OfflineRepairLog -Level Info -Message "Cleared COMPONENTS\$name (was '$value')."
-                        $script:RegistryChanges++
-                    }
+                if (-not (Test-PendingComponentValue -Value $value)) { continue }
+
+                # The value is read back rather than assumed either way: these keys carry their own
+                # ACL, and the removal reports nothing when it is denied. Unlike the CBS keys the
+                # COMPONENTS key survives, so its descriptor is always put back.
+                $outcome = Invoke-OfflineProtectedValueRemoval -Path $script:ComponentsKey -Name $name -StillSet {
+                    param($current) Test-PendingComponentValue -Value $current
+                }
+                if ($outcome.Removed) {
+                    Add-OfflineRepairLog -Level Info -Message "Cleared COMPONENTS\$name (was '$value'). $($outcome.Reason)"
+                    $script:RegistryChanges++
+                }
+                else {
+                    Add-OfflineRepairLog -Level Warning -Message "COMPONENTS\$name could not be cleared. $($outcome.Reason)"
                 }
             }
         }
