@@ -178,5 +178,10 @@
 		"id": "win-fix-transaction-logs",
 		"path": "src/windows/win-fix-transaction-logs.ps1",
 		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again"
+	},
+	{
+		"id": "win-fix-network-connectivity",
+		"path": "src/windows/win-fix-network-connectivity.ps1",
+		"description": "Restores network connectivity on a VM that boots but is unreachable - disabled networking services, a static address Azure did not allocate, an orphaned network provider that hangs logon, or an unreachable machine proxy"
 	}
 ]
