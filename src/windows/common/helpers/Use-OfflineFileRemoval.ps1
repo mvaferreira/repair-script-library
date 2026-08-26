@@ -27,6 +27,15 @@
          fails. A partially cleared CLFS log set is worse than a full one, because the .blf then
          refers to containers that no longer exist.
 
+    Deleting itself goes through Invoke-OfflineProtectedFileRemoval. An ordinary delete is tried
+    first, and
+    only when it is actually refused is ownership of the file and its parent folder taken, the
+    delete retried, and both descriptors put straight back. The parent matters because deleting a
+    file is a write to the folder holding it, so rights on the file alone are not enough. This is
+    not a fifth safety measure - it widens what the helper can remove - but it is safe to combine
+    with the four above because check 3 compares the folder's security descriptor before and after:
+    ownership that was taken and not handed back fails the run and rolls it back.
+
     Callers build a plan with Get-OfflineRemovalPlan and execute it with Invoke-OfflineRemovalPlan.
     The plan carries its own configuration - match list, protected list, hive names, size limit -
     so a caller can run several different plans in one script without threading parameters through.
@@ -35,8 +44,9 @@
     caller flushes it, because these functions return values and a Log-* call would corrupt them.
 
 .NOTES
-    Requires OfflineRepairCommon.ps1 (Add-OfflineRepairLog, Join-OfflinePath, Test-OfflinePath) and
-    Use-OfflineRegistryHive.ps1 (Test-OfflineHiveFile).
+    Requires OfflineRepairCommon.ps1 (Add-OfflineRepairLog, Join-OfflinePath, Test-OfflinePath),
+    Use-OfflineRegistryHive.ps1 (Test-OfflineHiveFile) and Use-OfflineProtectedResource.ps1
+    (Invoke-OfflineProtectedFileRemoval).
 #>
 
 function Get-OfflineFileHashValue {
@@ -529,9 +539,11 @@ function Invoke-OfflineRemovalPlan {
         between deciding and acting, so the set of files that gets deleted is exactly the set that
         was reported and backed up.
 
-        Read-only and System attributes are cleared immediately before the delete, on the same file
-        objects, because Remove-Item will not delete a read-only file. Nothing else in the folder is
-        opened.
+        Deleting is delegated to Invoke-OfflineProtectedFileRemoval, which clears the attributes that
+        block a delete and, only if the delete is actually refused, takes ownership of the file and
+        its parent folder, retries, and restores both descriptors. Verification check 3 compares the
+        folder's SDDL before and after, so an ownership change that was not handed back fails the
+        run and rolls it back rather than being left behind.
 
         A failure at any point rolls the whole plan back. A partially cleared CLFS log set is worse
         than a full one: the .blf refers to containers that would no longer exist.
@@ -556,6 +568,15 @@ function Invoke-OfflineRemovalPlan {
         Verification = $null
         Success      = $false
         Reason       = $null
+    }
+
+    # Checked here, before anything is copied or deleted, so a script that forgot to dot-source
+    # Use-OfflineProtectedResource.ps1 gets one clear sentence instead of an obscure failure part
+    # way through a set of deletes.
+    if (-not (Get-Command -Name 'Invoke-OfflineProtectedFileRemoval' -ErrorAction SilentlyContinue)) {
+        $result.Reason = 'Use-OfflineProtectedResource.ps1 has not been loaded, so a protected file could not be removed. Dot-source it alongside this helper.'
+        Add-OfflineRepairLog -Level Error -Message $result.Reason
+        return $result
     }
 
     $backupPath = Join-Path $BackupRoot $Plan.Label
@@ -589,22 +610,34 @@ function Invoke-OfflineRemovalPlan {
     }
 
     # Delete, working from the same list.
+    #
+    # Each file goes through Invoke-OfflineProtectedFileRemoval rather than a plain Remove-Item, so a
+    # file whose DACL refuses the delete is retried after ownership is taken and handed straight
+    # back. config\TxR is exactly that case: its CLFS artifacts are owned by TrustedInstaller, and
+    # without the escalation the whole set rolls back over one refused file.
     $removed = [System.Collections.Generic.List[object]]::new()
     $deleteFailed = $null
     foreach ($file in @($Plan.Snapshot.MatchedFile)) {
-        try {
-            $item = Get-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-            if ($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
-                $item.Attributes = ($item.Attributes -bxor [System.IO.FileAttributes]::ReadOnly)
-            }
-            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+        $attempt = Invoke-OfflineProtectedFileRemoval -Path $file.FullName
+
+        if ($attempt.Removed) {
             $removed.Add([PSCustomObject]@{ Name = $file.Name; Length = $file.Length })
-            Add-OfflineRepairLog -Message "Removed $($file.Name)."
+            if ($attempt.TookOwnership) {
+                Add-OfflineRepairLog -Message "Removed $($file.Name) after taking ownership of it and its folder."
+                if (-not $attempt.Restored) {
+                    Add-OfflineRepairLog -Level Warning -Message "The original permissions on $($file.Name) or its folder could not be fully restored."
+                }
+            }
+            else { Add-OfflineRepairLog -Message "Removed $($file.Name)." }
+            continue
         }
-        catch {
-            $deleteFailed = "$($file.Name) could not be removed: $($_.Exception.Message)"
-            break
-        }
+
+        # Anything else rolls the set back, including "the file was not present". Every file here
+        # was in the snapshot and was backed up seconds earlier, and nothing else should be touching
+        # a disk attached to a rescue VM, so a file that has since vanished is an anomaly rather
+        # than a result. Check 4 would fail it as unexpectedly gone in any case.
+        $deleteFailed = "$($file.Name) could not be removed: $($attempt.Reason)"
+        break
     }
     $result.Removed = @($removed)
 

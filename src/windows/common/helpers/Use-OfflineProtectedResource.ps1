@@ -763,3 +763,126 @@ function Rename-OfflineProtectedFile {
         Reason        = $reason
     }
 }
+
+function Clear-OfflineBlockingAttribute {
+    <#
+    .SYNOPSIS
+        Clearing the attributes that stop a file being deleted or renamed.
+
+    .DESCRIPTION
+        ReadOnly, Hidden and System all refuse a delete, and the write that clears them is itself
+        refused on a protected file - which is why this is called again after ownership is taken
+        rather than only before. Failure is deliberately swallowed: the attribute clear is a step
+        towards the delete, not the point of it, and the delete reports its own error.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $blocking = ([System.IO.FileAttributes]::ReadOnly -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)
+        if ($item.Attributes -band $blocking) {
+            $item.Attributes = ($item.Attributes -band (-bnot $blocking))
+        }
+    }
+    catch {
+        # Deliberately swallowed. Clearing the attributes is a step towards the delete, not the
+        # point of it, and on a protected file this write is refused for the same reason the delete
+        # was - which the caller is about to handle by taking ownership and calling this again.
+        Write-Verbose "Attributes on $Path could not be cleared: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-OfflineProtectedFileRemoval {
+    <#
+    .SYNOPSIS
+        Deleting a file in a protected folder, taking the folder only if the plain delete fails.
+
+    .DESCRIPTION
+        The same shape as Rename-OfflineProtectedFile, and for the same reason: deleting a file is a
+        write to the folder that contains it, so rights on the file alone are not enough. The parent
+        supplies FILE_DELETE_CHILD and the file supplies the DELETE that Remove-Item asks for when it
+        opens the source. Both are taken, and both are handed straight back in a finally.
+
+        Ownership is only taken after an ordinary delete has actually been refused. A folder whose
+        permissions were never in the way is never touched, so the common case leaves no trace.
+
+        The blocking attributes are cleared twice on purpose. The first attempt is part of the plain
+        delete; the second happens after ownership is taken, because on a genuinely protected file
+        the attribute write is refused for exactly the same reason the delete was.
+
+        Only the parent's descriptor is restored when the file goes, because a deleted file has no
+        descriptor to hand back. That is not a failure, and it is not counted as one.
+
+        Returns an object with Removed, TookOwnership, Restored and Reason.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # A denied existence check is a symptom of the problem this function exists to solve, not an
+    # answer. Only a clean "not there" counts as absent.
+    try {
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) {
+            return [PSCustomObject]@{ Removed = $false; TookOwnership = $false; Restored = $false; Absent = $true; Reason = 'The file was not present.' }
+        }
+    }
+    catch {
+        Add-OfflineRepairLog -Level Info -Message "Whether $Path exists could not even be checked ($($_.Exception.Message)). Treating that as protection rather than absence."
+    }
+
+    try {
+        Clear-OfflineBlockingAttribute -Path $Path
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return [PSCustomObject]@{ Removed = $true; TookOwnership = $false; Restored = $false; Absent = $false; Reason = 'Removed without changing any permission.' }
+    }
+    catch {
+        $firstError = $_.Exception.Message
+    }
+
+    $parent = Split-Path -Path $Path -Parent
+    Add-OfflineRepairLog -Level Info -Message "$Path could not be removed ($firstError). Taking ownership of $parent, retrying, and putting its ACL back either way."
+
+    $parentSddl = $null
+    $fileSddl = $null
+    $removed = $false
+    $absent = $false
+    try {
+        $parentSddl = Grant-OfflinePathAccess -Path $parent
+        if (-not $parentSddl) {
+            return [PSCustomObject]@{ Removed = $false; TookOwnership = $false; Restored = $false; Absent = $false; Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError" }
+        }
+
+        # Now that the folder can be read, the earlier check can be trusted.
+        if (-not (Test-Path -LiteralPath $Path)) {
+            $absent = $true
+            $reason = 'The file was not present once the folder could be read.'
+        }
+        else {
+            $fileSddl = Grant-OfflinePathAccess -Path $Path
+            Clear-OfflineBlockingAttribute -Path $Path
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $removed = $true
+            $reason = 'Removed after taking ownership of the file and its parent folder.'
+        }
+    }
+    catch {
+        $reason = "The delete was still refused after taking ownership of the file and its parent folder: $($_.Exception.Message)"
+    }
+    finally {
+        # The file's descriptor is only restorable when the file survived. Restoring a path that was
+        # successfully deleted would report false, which must not be read as a failure to hand back.
+        $restoredFile = $true
+        if ($fileSddl -and -not $removed) {
+            $restoredFile = Restore-OfflinePathSecurity -Path $Path -Sddl $fileSddl
+        }
+        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $parentSddl) -and $restoredFile
+    }
+
+    return [PSCustomObject]@{
+        Removed       = $removed
+        TookOwnership = -not $absent
+        Restored      = [bool]$restored
+        Absent        = $absent
+        Reason        = $reason
+    }
+}
