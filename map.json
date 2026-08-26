@@ -183,5 +183,10 @@
 		"id": "win-fix-network-connectivity",
 		"path": "src/windows/win-fix-network-connectivity.ps1",
 		"description": "Restores network connectivity on a VM that boots but is unreachable - disabled networking services, a static address Azure did not allocate, an orphaned network provider that hangs logon, or an unreachable machine proxy"
+	},
+	{
+		"id": "win-fix-bcd",
+		"path": "src/windows/win-fix-bcd.ps1",
+		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot"
 	}
 ]
