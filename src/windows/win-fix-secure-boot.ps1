@@ -144,6 +144,9 @@ $isDetectOnly = ($detectOnly -eq 'true')
 $isRevert = ($revert -eq 'true')
 
 $script:BackupSuffix = ".$scriptName-backup-$scriptStartTime"
+# A file this script creates has no content to back up, so its record has to be a marker on the
+# disk. An in-memory note would not survive the run, and -revert is a separate run.
+$script:AbsentMarkerSuffix = '.absent'
 $script:BackupManifest = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 # The boot chain, in the order the firmware and the loader walk it. Optional entries are absent on
@@ -649,13 +652,26 @@ function Backup-Artifact {
         Copies a file aside before it is replaced, and records it so -revert can find it.
 
     .DESCRIPTION
-        A file that does not exist yet is still recorded, with an empty backup path. Reverting then
-        means deleting what this script created, which is what putting the disk back requires.
+        A file that does not exist yet is recorded as an empty marker file beside where it will go.
+        Reverting then means deleting what this script created, which is what putting the disk back
+        requires. The marker has to be on the disk because -revert is a later, separate run of this
+        script and finds its work by looking at the disk, not by remembering it.
+
+        Failing to write the marker is reported but does not stop the repair. A missing boot file is
+        the more serious problem, and the only cost is that a later revert leaves the file in place.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        [void]$script:BackupManifest.Add([PSCustomObject]@{ Path = $Path; BackupPath = ''; Existed = $false })
+        $markerPath = "$(Get-BackupPath -Path $Path)$script:AbsentMarkerSuffix"
+        try {
+            New-Item -Path $markerPath -ItemType File -Force -ErrorAction Stop | Out-Null
+            [void]$script:BackupManifest.Add([PSCustomObject]@{ Path = $Path; BackupPath = $markerPath; Existed = $false })
+            Add-OfflineRepairLog -Level Info -Message "$Path is absent. Recorded $markerPath so a revert removes the file this script is about to create."
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "Could not record that $Path was absent ($($_.Exception.Message)). A revert will leave the created file in place."
+        }
         return $true
     }
 
@@ -818,6 +834,9 @@ function Get-RevertCandidate {
     .DESCRIPTION
         The run timestamp is part of the suffix, so the newest set is chosen and the rest are left
         alone. Reverting the newest run is what an operator means by "put it back".
+
+        A name ending in the absent marker is a file that was not there before the repair created it.
+        It carries no content, and putting it back means deleting the file rather than copying over it.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WindowsDrive,
@@ -838,11 +857,12 @@ function Get-RevertCandidate {
     foreach ($root in $roots) {
         if (-not (Test-OfflinePath $root)) { continue }
         foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter "*.$scriptName-backup-*" -File -Force -ErrorAction SilentlyContinue)) {
-            if ($file.Name -notmatch "^(?<original>.+)\.$([regex]::Escape($scriptName))-backup-(?<stamp>\d{14})(-\d+)?$") { continue }
+            if ($file.Name -notmatch "^(?<original>.+)\.$([regex]::Escape($scriptName))-backup-(?<stamp>\d{14})(-\d+)?(?<absent>$([regex]::Escape($script:AbsentMarkerSuffix)))?$") { continue }
             [void]$found.Add([PSCustomObject]@{
                     BackupPath   = $file.FullName
                     OriginalPath = Join-Path $root $Matches['original']
                     Stamp        = $Matches['stamp']
+                    Existed      = [string]::IsNullOrEmpty($Matches['absent'])
                 })
         }
     }
@@ -856,7 +876,7 @@ function Get-RevertCandidate {
 function Invoke-Revert {
     <#
     .SYNOPSIS
-        Puts back the files the most recent run replaced.
+        Puts back the files the most recent run replaced, and removes the ones it created.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WindowsDrive,
@@ -872,8 +892,23 @@ function Invoke-Revert {
     Log-Output "Restoring $($candidates.Count) file(s) backed up by the run of $($candidates[0].Stamp)." | Tee-Object -FilePath $logFile -Append
 
     $restored = 0
+    $removed = 0
     $failed = 0
     foreach ($candidate in $candidates) {
+        if (-not $candidate.Existed) {
+            $deletion = Invoke-OfflineProtectedFileRemoval -Path $candidate.OriginalPath
+            if ($deletion.Removed -or $deletion.Absent) {
+                $removed++
+                Log-Output "  Removed $($candidate.OriginalPath), which this script had created." | Tee-Object -FilePath $logFile -Append
+                Remove-Item -LiteralPath $candidate.BackupPath -Force -ErrorAction SilentlyContinue
+            }
+            else {
+                $failed++
+                Log-Warning "  Could not remove $($candidate.OriginalPath): $($deletion.Reason)" | Tee-Object -FilePath $logFile -Append
+            }
+            continue
+        }
+
         $copy = Copy-OfflineProtectedFile -Source $candidate.BackupPath -Destination $candidate.OriginalPath
         if ($copy.Copied) {
             $restored++
@@ -888,13 +923,15 @@ function Invoke-Revert {
 
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
+    $summary = "Restored $restored file(s) and removed $removed file(s) that the repair had created"
+
     if ($failed -gt 0) {
-        Log-Error "Restored $restored file(s), but $failed could not be put back." | Tee-Object -FilePath $logFile -Append
+        Log-Error "$summary, but $failed could not be put back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR
     }
 
-    Log-Output "Restored $restored file(s). The disk is back in the state it was in before this script ran." | Tee-Object -FilePath $logFile -Append
+    Log-Output "$summary. The disk is back in the state it was in before this script ran." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
     return $STATUS_SUCCESS
 }
