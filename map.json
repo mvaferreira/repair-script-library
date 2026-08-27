@@ -85,6 +85,11 @@
 		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit, a portable executable scan for writable and executable sections as corroboration, and the offline Secure Boot state to prove a test signing conflict. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
 	},
 	{
+		"id" : "win-fix-secure-boot",
+		"path" : "src/windows/win-fix-secure-boot.ps1",
+		"description" : "Repairs the signed EFI boot chain a Generation 2 VM starts through, for a loader failure such as 0xc0430001 that leaves no event log because nothing got far enough to write one. Compares the boot manager and Secure Boot policy on the EFI System Partition against the copies Windows keeps, and every boot chain file against the component store, by hash. Repairs a stale or missing EFI System Partition artifact by copying it from this installation, and a corrupt boot chain file with a targeted sfc against that one file. Never runs a full scan and never takes a file from another build. Gen2 only. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-reset-group-policy",
 		"path" : "src/windows/win-reset-group-policy.ps1",
 		"description" : "Clears local Group Policy on an offline Windows disk when a VM boots but refuses every logon because of its own policy: Software Restriction Policies set to Disallowed, AppLocker enforcing rules that do not permit userinit.exe or explorer.exe, or a machine startup or user logon script that hangs. Reports what is configured and which of those three is set before changing anything. Renames the GroupPolicy and GroupPolicyUsers folders aside instead of deleting them and backs up the SOFTWARE hive, so both halves can be undone. Use parameter scope=files for the reversible half only, or detectOnly=true to report and change nothing. This is a deliberate blanket reset, not a targeted repair. NOTE: use option --run-on-repair."
