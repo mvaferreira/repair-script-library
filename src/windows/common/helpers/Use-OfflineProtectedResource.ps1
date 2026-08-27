@@ -886,3 +886,92 @@ function Invoke-OfflineProtectedFileRemoval {
         Reason        = $reason
     }
 }
+
+function Copy-OfflineProtectedFile {
+    <#
+    .SYNOPSIS
+        Writing a file into a protected folder, taking ownership only if the plain copy fails.
+
+    .DESCRIPTION
+        The same shape as Invoke-OfflineProtectedFileRemoval, and it exists for the same measured
+        reason. On a Server 2022 disk attached to a rescue VM, opening
+        F:\Windows\System32\winload.efi for write as SYSTEM is refused outright: the file is owned
+        by NT SERVICE\TrustedInstaller, and SYSTEM is not the owner. A Copy-Item over the top fails
+        just as silently, which is how a repair reports success while having changed nothing.
+
+        Overwriting a file is a write to the file and, when it does not yet exist, a write to the
+        folder that will hold it. Both are taken when needed and both are handed straight back in a
+        finally, replaying the whole captured descriptor rather than removing the granted ACE.
+
+        The destination keeps its own original descriptor. A replacement file must not inherit the
+        rescue VM's idea of what the ACL should be, and it must not be left owned by whoever ran
+        the repair - the guest has to boot with TrustedInstaller owning its system files again.
+
+        Returns an object with Copied, TookOwnership, Restored and Reason.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        return [PSCustomObject]@{ Copied = $false; TookOwnership = $false; Restored = $false; Reason = "The source file $Source was not present." }
+    }
+
+    $existed = $false
+    try { $existed = Test-Path -LiteralPath $Destination -ErrorAction Stop } catch {
+        Add-OfflineRepairLog -Level Info -Message "Whether $Destination exists could not even be checked ($($_.Exception.Message)). Treating that as protection rather than absence."
+    }
+
+    try {
+        if ($existed) { Clear-OfflineBlockingAttribute -Path $Destination }
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        return [PSCustomObject]@{ Copied = $true; TookOwnership = $false; Restored = $false; Reason = 'Copied without changing any permission.' }
+    }
+    catch {
+        $firstError = $_.Exception.Message
+    }
+
+    $parent = Split-Path -Path $Destination -Parent
+    Add-OfflineRepairLog -Level Info -Message "$Destination could not be written ($firstError). Taking ownership of $parent, retrying, and putting its ACL back either way."
+
+    $parentSddl = $null
+    $fileSddl = $null
+    $copied = $false
+    $reason = ''
+    try {
+        $parentSddl = Grant-OfflinePathAccess -Path $parent
+        if (-not $parentSddl) {
+            return [PSCustomObject]@{ Copied = $false; TookOwnership = $false; Restored = $false; Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError" }
+        }
+
+        # Re-checked now that the folder can actually be read: the first check ran against a folder
+        # that may have been denying us, so its answer could not be trusted.
+        if (Test-Path -LiteralPath $Destination) {
+            $fileSddl = Grant-OfflinePathAccess -Path $Destination
+            Clear-OfflineBlockingAttribute -Path $Destination
+        }
+
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        $copied = $true
+        $reason = 'Copied after taking ownership of the destination and its parent folder.'
+    }
+    catch {
+        $reason = "The copy was still refused after taking ownership of the destination and its parent folder: $($_.Exception.Message)"
+    }
+    finally {
+        # The destination's own descriptor is replayed onto whatever now sits at that path, so a
+        # freshly written file ends up owned by TrustedInstaller exactly as the one it replaced was.
+        $restoredFile = $true
+        if ($fileSddl) { $restoredFile = Restore-OfflinePathSecurity -Path $Destination -Sddl $fileSddl }
+        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $parentSddl) -and $restoredFile
+    }
+
+    return [PSCustomObject]@{
+        Copied        = $copied
+        TookOwnership = $true
+        Restored      = [bool]$restored
+        Reason        = $reason
+    }
+}

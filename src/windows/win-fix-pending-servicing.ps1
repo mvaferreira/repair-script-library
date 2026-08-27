@@ -1010,7 +1010,7 @@ try {
                 Log-Error "  $failure" | Tee-Object -FilePath $logFile -Append
             }
             Log-Error 'Everything that was removed has been restored, so config\TxR is as it was found. No further change was made.' | Tee-Object -FilePath $logFile -Append
-            Write-RevertManifest -Manifest $manifest -WindowsDrive $offline.WindowsDrive | Out-Null
+            Write-RevertManifest -Path $manifestPath -Manifest $manifest | Out-Null
             Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
             return $STATUS_ERROR
         }
