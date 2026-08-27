@@ -594,6 +594,7 @@ function Get-BootChainFinding {
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $intact = [System.Collections.Generic.List[string]]::new()
 
     foreach ($spec in $script:BootChainFile) {
         $path = Join-OfflinePath -Root $WindowsDrive -ChildPath $spec.RelativePath
@@ -611,7 +612,7 @@ function Get-BootChainFinding {
         }
 
         if ($signature.Verdict -eq 'Intact') {
-            Add-OfflineRepairLog -Level Info -Message "$($spec.Label) is signed and its signature verifies."
+            [void]$intact.Add($spec.Label)
             continue
         }
 
@@ -625,6 +626,13 @@ function Get-BootChainFinding {
         [void]$findings.Add((New-Finding -Cause 'CorruptBootChainFile' -Item $spec.RelativePath `
                     -Message "The $($spec.Label) at $path is present but its signature does not verify ($($signature.Status)), so it is not the file Microsoft signed and the boot chain will refuse it. It will be repaired from the component store." `
                     -Data $spec))
+    }
+
+    # One line for the healthy files rather than one each. az vm repair keeps only the last 4 KB of
+    # the log and discards the start, so a line per verified file evicts the findings above it from
+    # everything the operator ever sees.
+    if ($intact.Count -gt 0) {
+        Add-OfflineRepairLog -Level Info -Message "$($intact.Count) boot chain file(s) signed and verified: $($intact -join ', ')."
     }
 
     return @($findings)
@@ -724,7 +732,7 @@ function Invoke-OfflineSfcScanFile {
         "/OFFLOGFILE=$sfcLog"
     )
 
-    Add-OfflineRepairLog -Level Info -Message "Running: sfc.exe $($sfcArgs -join ' ')"
+    Add-OfflineRepairLog -Level Info -Message "Running offline sfc /SCANFILE against $Path."
     try { $null = & sfc.exe @sfcArgs 2>&1 }
     catch {
         return [PSCustomObject]@{ Succeeded = $false; Detail = "sfc could not be started: $($_.Exception.Message)"; LogLines = @() }
@@ -736,16 +744,23 @@ function Invoke-OfflineSfcScanFile {
         Remove-Item -LiteralPath $sfcLog -Force -ErrorAction SilentlyContinue
     }
 
-    foreach ($line in ($lines | Select-Object -Last 8)) {
-        Add-OfflineRepairLog -Level Info -Message "  sfc: $($line.Trim())"
-    }
-
     if ($lines.Count -eq 0) {
         return [PSCustomObject]@{ Succeeded = $false; Detail = 'sfc produced no offline log, so nothing can be said about what it did.'; LogLines = @() }
     }
 
     $repaired = @($lines | Where-Object { $_ -match 'Repair complete|successfully repaired|Repairing file' })
     $unrepairable = @($lines | Where-Object { $_ -match 'Cannot repair member file' -and $_ -notmatch 'Repaired file' })
+
+    # sfc's [SR] narration runs to a few hundred characters a line, and az vm repair keeps only the
+    # last 4 KB of the log and discards the start. Dumping it on every success pushed the findings
+    # out of the operator's view entirely, so it is written only when sfc did not do what it was
+    # asked, which is the case where the detail earns the space. The full log always reaches the
+    # caller through LogLines regardless.
+    if ($repaired.Count -eq 0) {
+        foreach ($line in ($lines | Select-Object -Last 6)) {
+            Add-OfflineRepairLog -Level Info -Message "  sfc: $($line.Trim())"
+        }
+    }
 
     if ($repaired.Count -gt 0) {
         return [PSCustomObject]@{ Succeeded = $true; Detail = 'sfc repaired the file from the component store.'; LogLines = $lines }
