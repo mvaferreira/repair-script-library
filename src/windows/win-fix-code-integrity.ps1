@@ -69,9 +69,9 @@
 #   one Windows installation is attached and the automatically selected one is not the right one.
 #
 # .EXAMPLE
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-code-integrity-boot-failure --run-on-repair --verbose
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-code-integrity-boot-failure --parameters detectOnly=true --run-on-repair --verbose
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-code-integrity-boot-failure --parameters disableProtection=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-code-integrity --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-code-integrity --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-code-integrity --parameters disableProtection=true --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira

@@ -467,7 +467,7 @@ function Get-AllFinding {
     foreach ($driver in $Drivers) {
         if ($TargetService -and $driver.Service -ne $TargetService) { continue }
 
-        # Microsoft drivers are not what this scenario is for. win-fix-code-integrity-boot-failure
+        # Microsoft drivers are not what this scenario is for. win-fix-code-integrity
         # and win-fix-inaccessible-boot-device handle the inbox ones.
         if ($driver.IsMicrosoft) { continue }
 

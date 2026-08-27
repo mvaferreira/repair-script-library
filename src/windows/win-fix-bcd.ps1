@@ -99,10 +99,10 @@
 #   the operator's entries. A rebuild collapses them because it starts a fresh store.
 #
 #   Related scenarios, deliberately not folded in because they are different problems:
-#     win-fix-boot-partition       the system partition itself is damaged or missing
-#     win-toggle-safe-mode              the safeboot flag is set
-#     win-fix-code-integrity-boot-failure  testsigning or nointegritychecks is set
-#     win-LKGC                          boot the previous control set instead
+#     win-fix-boot-partition    the system partition itself is damaged or missing
+#     win-toggle-safe-mode      the safeboot flag is set
+#     win-fix-code-integrity    testsigning or nointegritychecks is set
+#     win-LKGC                  boot the previous control set instead
 #
 # .VERSION
 #   v1.0: Initial version.
