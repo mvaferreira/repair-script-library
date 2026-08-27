@@ -651,7 +651,7 @@ try {
 
     $findings = @($context.Findings)
     foreach ($finding in $findings) {
-        Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        Log-Output "[$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
     }
 
     $repairable = @($findings | Where-Object { $_.Repairable })
@@ -659,9 +659,6 @@ try {
 
     if ($isDetectOnly) {
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        foreach ($finding in $findings) {
-            Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-        }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
