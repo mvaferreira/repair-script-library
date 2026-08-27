@@ -80,9 +80,12 @@
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
-#   The offline Secure Boot state is read from Control\SecureBoot\State\UEFISecureBootEnabled,
-#   which Windows writes at boot from the firmware. On an attached disk it therefore describes the
-#   last successful boot, which is the best evidence available offline.
+#   The Secure Boot state cannot be read from an offline registry hive. Windows keeps it in
+#   Control\SecureBoot\State, which is a volatile key: it is recreated from the firmware at every
+#   boot and never written to the hive file, so on an attached disk it is simply absent. It is read
+#   from the Measured Boot log instead - see Get-OfflineSecureBootState in OfflineRepairCommon.ps1.
+#   An absent log is reported as unknown rather than as "off", and the two findings that depend on
+#   Secure Boot being on stay silent, because a wrong "off" would invent a conflict that is not there.
 #
 #   Credential Guard enabled with a UEFI lock (Control\Lsa\LsaCfgFlags=1) also sets an EFI firmware
 #   variable that a registry change cannot clear. That case is reported, because clearing it needs
@@ -361,19 +364,18 @@ function Get-ProtectionState {
         so nothing in this function produces a finding on its own.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$SystemRoot
+        [Parameter(Mandatory = $true)][string]$SystemRoot,
+        [Parameter(Mandatory = $true)][PSCustomObject]$SecureBoot
     )
 
     $hvciPath = "$SystemRoot\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
     $deviceGuardPath = "$SystemRoot\Control\DeviceGuard"
     $lsaPath = "$SystemRoot\Control\Lsa"
-    $secureBootPath = "$SystemRoot\Control\SecureBoot\State"
     $policyPath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\DeviceGuard'
 
     $hvci = Get-ItemProperty -Path $hvciPath -ErrorAction SilentlyContinue
     $deviceGuard = Get-ItemProperty -Path $deviceGuardPath -ErrorAction SilentlyContinue
     $lsa = Get-ItemProperty -Path $lsaPath -ErrorAction SilentlyContinue
-    $secureBoot = Get-ItemProperty -Path $secureBootPath -ErrorAction SilentlyContinue
     $policy = Get-ItemProperty -Path $policyPath -ErrorAction SilentlyContinue
 
     return [PSCustomObject]@{
@@ -392,8 +394,9 @@ function Get-ProtectionState {
         PolicyPath        = $policyPath
         PolicyVbs         = [int]($policy.EnableVirtualizationBasedSecurity)
         PolicyHvci        = [int]($policy.HypervisorEnforcedCodeIntegrity)
-        SecureBootKnown   = ($null -ne $secureBoot.UEFISecureBootEnabled)
-        SecureBootEnabled = ([int]($secureBoot.UEFISecureBootEnabled) -eq 1)
+        SecureBootKnown   = $SecureBoot.Known
+        SecureBootEnabled = $SecureBoot.Enabled
+        SecureBootSource  = $SecureBoot.Source
     }
 }
 
@@ -585,11 +588,13 @@ try {
         Log-Info "Code Integrity refused $($blockEvidence.Files.Count) image(s): $(@($blockEvidence.Files.FileName) -join ', ')" | Tee-Object -FilePath $logFile -Append
     }
 
+    $secureBootState = Get-OfflineSecureBootState -WindowsDrive $offline.WindowsDrive
+
     $bcdState = Get-BcdSigningState -StorePath $offline.BcdStorePath
 
     $context = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath
-        $protection = Get-ProtectionState -SystemRoot $systemRoot
+        $protection = Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState
         $drivers = @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
         $findings = @(Get-AllFinding -Protection $protection -BlockEvidence $blockEvidence -Drivers $drivers -BcdState $bcdState)
 
@@ -607,7 +612,7 @@ try {
     $thirdParty = @($context.Drivers | Where-Object { -not $_.IsMicrosoft })
 
     # Context only. None of this is a fault by itself, so none of it appears in the findings list.
-    Log-Info "Control set $($context.ControlSet): Memory Integrity $(if ($protection.HvciEnabled) { 'on' } else { 'off' })$(if ($protection.HvciLocked) { ' (locked)' }), Credential Guard $(if ($protection.CredentialGuard) { 'on' } else { 'off' })$(if ($protection.CgUefiLock) { ' (UEFI lock)' }), LSA protection $(if ($protection.RunAsPPL -eq 1) { 'on' } else { 'off' }), Secure Boot $(if (-not $protection.SecureBootKnown) { 'unknown' } elseif ($protection.SecureBootEnabled) { 'on' } else { 'off' })" | Tee-Object -FilePath $logFile -Append
+    Log-Info "Control set $($context.ControlSet): Memory Integrity $(if ($protection.HvciEnabled) { 'on' } else { 'off' })$(if ($protection.HvciLocked) { ' (locked)' }), Credential Guard $(if ($protection.CredentialGuard) { 'on' } else { 'off' })$(if ($protection.CgUefiLock) { ' (UEFI lock)' }), LSA protection $(if ($protection.RunAsPPL -eq 1) { 'on' } else { 'off' }), Secure Boot $(if (-not $protection.SecureBootKnown) { "unknown ($($protection.SecureBootSource))" } elseif ($protection.SecureBootEnabled) { 'on' } else { 'off' })" | Tee-Object -FilePath $logFile -Append
     Log-Info "Boot configuration: testsigning $(if ($bcdState.TestSigning) { 'Yes' } else { 'No' }), nointegritychecks $(if ($bcdState.NoIntegrityChecks) { 'Yes' } else { 'No' })" | Tee-Object -FilePath $logFile -Append
     Log-Info "$($context.Drivers.Count) kernel driver(s) configured to load, $($thirdParty.Count) of them non-Microsoft." | Tee-Object -FilePath $logFile -Append
 
@@ -710,7 +715,7 @@ try {
         }
         $protectionChanges = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
             $systemRoot = Get-OfflineSystemRootPath
-            return (Disable-Protection -Protection (Get-ProtectionState -SystemRoot $systemRoot))
+            return (Disable-Protection -Protection (Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState))
         }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
         if ($protectionChanges -eq 0) {
@@ -731,7 +736,7 @@ try {
     $verifyBcd = Get-BcdSigningState -StorePath $offline.BcdStorePath
     $remaining = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath
-        return @(Get-AllFinding -Protection (Get-ProtectionState -SystemRoot $systemRoot) `
+        return @(Get-AllFinding -Protection (Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState) `
                 -BlockEvidence $blockEvidence `
                 -Drivers @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive) `
                 -BcdState $verifyBcd)
