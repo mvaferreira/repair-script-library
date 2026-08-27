@@ -188,5 +188,10 @@
 		"id": "win-fix-bcd",
 		"path": "src/windows/win-fix-bcd.ps1",
 		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot"
+	},
+	{
+		"id": "win-fix-boot-partition",
+		"path": "src/windows/win-fix-boot-partition.ps1",
+		"description": "Repairs the system partition itself, the layer below the BCD store - a deleted EFI System Partition or System Reserved partition, an unformatted ESP, a missing 0x55AA boot signature, zeroed or NTLDR era bootstrap code, no Active partition or more than one, and a stale BPB HiddenSectors field that gives 'A disk read error occurred' after a partition move or restore while chkdsk and sfc report nothing"
 	}
 ]
