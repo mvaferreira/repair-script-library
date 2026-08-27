@@ -9,27 +9,26 @@
 #   Integrity policy files. Every one of those is signed, and every one of them is checked before
 #   the next is allowed to run.
 #
-#   When one of them is corrupt, or when the copy on the EFI System Partition is left behind by an
-#   update that refreshed only the Windows partition, the chain stops. The usual result is
-#   0xc0430001 - STATUS_ERROR_LOADING_REGISTRY, reported by winload before anything has started.
-#   There is no event log to read afterwards, because nothing ever got far enough to write one.
+#   When one of them is corrupt or missing, the chain stops. The usual result is 0xc0430001 -
+#   STATUS_ERROR_LOADING_REGISTRY, reported by winload before anything has started. There is no
+#   event log to read afterwards, because nothing ever got far enough to write one.
 #
 #   Evidence used, in order:
-#     1. The three artifacts on the EFI System Partition, compared by SHA256 against the copies
-#        Windows keeps on its own partition. Windows stages the boot manager at
-#        Windows\Boot\EFI\bootmgfw.efi and the Secure Boot policy at
-#        Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b, and servicing keeps those current. A
-#        difference means the EFI System Partition is stale; an absence means the firmware has
-#        nothing to run.
+#     1. The boot manager on the EFI System Partition, and the fallback loader beside it at
+#        \EFI\Boot. Each is checked for being present and for being a real EFI executable, by
+#        reading its PE header. It is deliberately NOT compared against the copy Windows stages at
+#        Windows\Boot\EFI\bootmgfw.efi - see the note on Secure Boot servicing below.
 #     2. The boot chain files on the Windows partition, compared by SHA256 against the copies held
 #        in the component store under Windows\WinSxS. A file that matches no copy in the store is
 #        not the file Windows shipped.
-#     3. The Secure Boot state the guest last booted with, read from the Measured Boot log. This
-#        sets how serious a stale policy file is, and is reported either way.
+#     3. The Secure Boot state the guest last booted with, read from the Measured Boot log. This is
+#        reported as context either way and is never itself treated as a fault.
 #
 #   Causes detected and repaired:
-#     1. A missing or stale artifact on the EFI System Partition. Repaired by copying the current
-#        file from the Windows partition, after backing up whatever was there.
+#     1. A boot manager missing from the EFI System Partition, or present but not an EFI executable
+#        because it was truncated, zeroed or overwritten. The fallback loader is restored from the
+#        working boot manager already on the EFI System Partition where there is one, because that
+#        is the file this VM has actually been booting; otherwise from the copy Windows stages.
 #     2. A boot chain file on the Windows partition that matches no copy in the component store.
 #        Repaired with a targeted "sfc /SCANFILE" against that one file, which sources the
 #        replacement from the guest's own store and so is always the right build.
@@ -37,20 +36,20 @@
 #   Reported but never repaired automatically:
 #     - A file with no copy at all in the component store. Nothing can be verified against it and
 #       nothing trustworthy can be put in its place, so it is reported with the path.
-#     - A source file missing from the Windows partition when the EFI System Partition needs it.
+#     - A boot manager that is missing or unusable when the staged copy is missing or unusable too.
 #       Copying a boot manager from anywhere other than this installation is how a VM ends up
 #       running a different build's loader, so the script stops and says what is missing.
 #
 # .RESOLVES
 #   Gen2 boot failures in the loader, before the kernel starts and before any event log exists.
 #   Typically 0xc0430001, a Secure Boot violation screen, or a VM that returns to the firmware boot
-#   menu after an update that refreshed the Windows partition but not the EFI System Partition.
+#   menu because the boot manager it was pointed at is gone or unreadable.
 #
 #   This script does NOT cover:
 #     - A driver being refused once Windows is running. That leaves Code Integrity events behind
 #       and is handled by win-fix-code-integrity.
 #     - Boot configuration content - a missing, empty or wrong BCD store. Use win-fix-bcd.
-#     - A missing or unreadable EFI System Partition itself, as opposed to stale files on a healthy
+#     - A missing or unreadable EFI System Partition itself, as opposed to bad files on a healthy
 #       one. Use win-fix-boot-partition.
 #     - Component store corruption in general. This script only ever touches the fixed list of boot
 #       chain files below and never runs a full scan. If corruption is broader, use
@@ -72,6 +71,23 @@
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
+#   The boot manager on the EFI System Partition is NOT expected to match the copy Windows stages
+#   at Windows\Boot\EFI\bootmgfw.efi, and a difference is never treated as staleness. Measured on a
+#   healthy, currently booting Server 2022 Azure Edition VM with Secure Boot on: the EFI System
+#   Partition held bootmgfw.efi version 10.0.28000.322 at 3,086,728 bytes, while the operating
+#   system was 10.0.20348 and staged 10.0.20348.5139 at 2,118,640 bytes. The file on the EFI System
+#   Partition matched none of the six copies of bootmgfw.efi in the component store. Secure Boot
+#   servicing updates that boot manager on its own schedule, ahead of the operating system, as part
+#   of the signing certificate and SBAT revocation work - so the newer, unmatched file is the
+#   correct one. Replacing it with the staged copy would roll back a security update, and where the
+#   firmware's SBAT level has already moved past that older boot manager it would be self-revoked
+#   and refused, turning a VM that boots into one that does not.
+#
+#   For the same reason there is no check on SKUSiPolicy.p7b. The same healthy VM had no
+#   SKUSiPolicy.p7b on its EFI System Partition at all while booting with Secure Boot enabled, so
+#   its absence is a normal state. The copy under Windows\System32\SecureBootUpdates is the
+#   servicing stack's source for that policy, not evidence that the partition should carry it.
+#
 #   Offline "sfc /VERIFYFILE" REPAIRS, despite its own help text saying "No repair operation is
 #   performed". Measured on a Server 2022 disk with winload.efi deliberately corrupted, /VERIFYFILE
 #   logged "Cannot repair member file 'winload.efi' ... hash mismatch" and then "Repairing file
@@ -81,6 +97,11 @@
 #
 #   sfc's exit code is 0 whether or not it found anything, and it writes UTF-16 to the console,
 #   which is unreadable when captured. Only /OFFLOGFILE is parsed, for the [SR] lines.
+#
+#   The component store is indexed in a single pass. WinSxS directories are named after the
+#   component rather than the file, so each file has to be matched one level down; doing that as a
+#   wildcard search per file measured 11 seconds a file over 15,286 directories, which for fifteen
+#   files is several minutes. Walking those directories once takes a tenth of a second.
 #
 #   The boot chain files are owned by NT SERVICE\TrustedInstaller and deny write even to SYSTEM, so
 #   every write goes through Copy-OfflineProtectedFile, which captures the original security
@@ -274,6 +295,65 @@ function Get-OfflineSecureBootState {
     return $result
 }
 
+function Get-PeImageInfo {
+    <#
+    .SYNOPSIS
+        Reads the PE header of an image and reports whether it is a real executable.
+
+    .DESCRIPTION
+        Used for two things: to learn the architecture of the installation, and to decide whether an
+        EFI binary on the EFI System Partition is intact.
+
+        Intact is deliberately a low bar - a valid PE header with an EFI subsystem - because that is
+        the strongest claim the evidence actually supports offline. It catches the failures that
+        really happen: a deleted file, a truncated one, a zeroed one, one overwritten with garbage.
+        It does not attempt to judge a well formed Microsoft signed boot manager, because there is no
+        offline way to do that and, as the ESP boot manager on a serviced VM shows, a boot manager
+        that differs from everything on the Windows partition is usually the correct one.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{
+        Exists    = $false
+        IsPe      = $false
+        Machine   = 0
+        Subsystem = 0
+        IsEfi     = $false
+        Length    = 0
+    }
+
+    if (-not (Test-OfflinePath $Path)) { return $result }
+    $result.Exists = $true
+
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $result.Length = $stream.Length
+            $header = New-Object byte[] 1024
+            $read = $stream.Read($header, 0, 1024)
+            if ($read -lt 512 -or $header[0] -ne 0x4D -or $header[1] -ne 0x5A) { return $result }
+
+            $peOffset = [BitConverter]::ToInt32($header, 0x3C)
+            if ($peOffset -le 0 -or ($peOffset + 94) -ge $read) { return $result }
+            if ([System.Text.Encoding]::ASCII.GetString($header, $peOffset, 4) -ne "PE`0`0") { return $result }
+
+            $result.IsPe = $true
+            $result.Machine = [BitConverter]::ToUInt16($header, $peOffset + 4)
+
+            # Subsystem sits at optional header offset 68 in both PE32 and PE32+, and the optional
+            # header starts 24 bytes after the PE signature.
+            $result.Subsystem = [BitConverter]::ToUInt16($header, $peOffset + 92)
+            $result.IsEfi = $result.Subsystem -ge 10 -and $result.Subsystem -le 13
+        }
+        finally { $stream.Dispose() }
+    }
+    catch {
+        Add-OfflineRepairLog -Level Info -Message "Could not read the PE header of $Path : $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
 function Get-EfiFallbackBootFileName {
     <#
     .SYNOPSIS
@@ -291,38 +371,74 @@ function Get-EfiFallbackBootFileName {
     param([Parameter(Mandatory = $true)][string]$WindowsDrive)
 
     $kernel = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\System32\ntoskrnl.exe'
-    $machine = 0
-
-    try {
-        $stream = [System.IO.File]::Open($kernel, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        try {
-            $header = New-Object byte[] 1024
-            $read = $stream.Read($header, 0, 1024)
-            if ($read -ge 512 -and $header[0] -eq 0x4D -and $header[1] -eq 0x5A) {
-                $peOffset = [BitConverter]::ToInt32($header, 0x3C)
-                if ($peOffset -gt 0 -and ($peOffset + 6) -lt $read -and
-                    [System.Text.Encoding]::ASCII.GetString($header, $peOffset, 4) -eq "PE`0`0") {
-                    $machine = [BitConverter]::ToUInt16($header, $peOffset + 4)
-                }
-            }
-        }
-        finally { $stream.Dispose() }
-    }
-    catch {
-        Add-OfflineRepairLog -Level Info -Message "Could not read the architecture from $kernel ($($_.Exception.Message)). Assuming x64, which is what every Azure Gen2 Windows image except the ARM64 sizes uses."
-    }
+    $machine = (Get-PeImageInfo -Path $kernel).Machine
 
     switch ($machine) {
         0xAA64 { return 'bootaa64.efi' }
         0x8664 { return 'bootx64.efi' }
         0x014C { return 'bootia32.efi' }
         default {
-            if ($machine -ne 0) {
-                Add-OfflineRepairLog -Level Warning -Message ("The kernel reports an unrecognised PE machine type 0x{0:X4}. Assuming x64." -f $machine)
-            }
+            Add-OfflineRepairLog -Level Info -Message ("Could not read an architecture from $kernel (PE machine 0x{0:X4}). Assuming x64, which is what every Azure Gen2 Windows image except the ARM64 sizes uses." -f $machine)
             return 'bootx64.efi'
         }
     }
+}
+
+function Get-ComponentStoreIndex {
+    <#
+    .SYNOPSIS
+        Indexes the component store once, by file name.
+
+    .DESCRIPTION
+        WinSxS directories are named after the component, not the file, so
+        "Get-ChildItem WinSxS -Filter '*winload*'" finds nothing at all - winload.efi lives in
+        amd64_microsoft-windows-b..vironment-os-loader_<key>_<version>_none_<hash>. The file has to
+        be matched one wildcard level down, which is where servicing puts it.
+
+        Doing that as a wildcard search per file is what makes the naive version slow: one pass for
+        winload.efi over a measured 15,286 component directories took 11 seconds, so the fifteen
+        files in the boot chain cost several minutes. Enumerating those directories once takes a
+        tenth of a second, so the store is walked a single time and every wanted name is picked up
+        on the way past.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsDrive,
+        [Parameter(Mandatory = $true)][string[]]$FileName
+    )
+
+    $index = @{}
+    foreach ($name in $FileName) { $index[$name] = [System.Collections.Generic.List[string]]::new() }
+
+    $winsxs = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\WinSxS'
+    if (-not (Test-OfflinePath $winsxs)) {
+        Add-OfflineRepairLog -Level Warning -Message "The component store $winsxs is not present, so no file can be checked against it."
+        return $index
+    }
+
+    $wanted = @{}
+    foreach ($name in $FileName) { $wanted[$name] = $true }
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $directories = 0
+    try {
+        foreach ($directory in [System.IO.Directory]::EnumerateDirectories($winsxs)) {
+            $directories++
+            try {
+                foreach ($file in [System.IO.Directory]::EnumerateFiles($directory)) {
+                    $leaf = [System.IO.Path]::GetFileName($file)
+                    if ($wanted.ContainsKey($leaf)) { [void]$index[$leaf].Add($file) }
+                }
+            }
+            catch { continue }
+        }
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "The component store could not be read in full: $($_.Exception.Message). Findings below may be incomplete."
+    }
+    $timer.Stop()
+
+    Add-OfflineRepairLog -Level Info -Message "Indexed $directories component store directories in $([math]::Round($timer.Elapsed.TotalSeconds, 1))s."
+    return $index
 }
 
 function Get-ComponentStoreCopy {
@@ -331,71 +447,49 @@ function Get-ComponentStoreCopy {
         Every copy of a file held in the component store.
 
     .DESCRIPTION
-        WinSxS directories are named after the component, not the file, so
-        "Get-ChildItem WinSxS -Filter '*winload*'" finds nothing at all - winload.efi lives in
-        amd64_microsoft-windows-b..vironment-os-loader_<key>_<version>_none_<hash>. The file is
-        matched one wildcard level down instead, which is where servicing puts it.
-
         Every copy is returned rather than the newest, because a file that matches ANY copy in the
-        store is a file the store vouches for. Picking the newest and demanding a match would flag
-        a perfectly healthy installation the moment an update is staged but not yet active.
+        store is a file the store vouches for. Picking the newest and demanding a match would flag a
+        perfectly healthy installation the moment an update is staged but not yet active.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$WindowsDrive,
+        [Parameter(Mandatory = $true)][hashtable]$Index,
         [Parameter(Mandatory = $true)][string]$FileName
     )
 
-    $winsxs = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\WinSxS'
-    if (-not (Test-OfflinePath $winsxs)) { return @() }
-
-    try {
-        return @(Get-ChildItem -Path (Join-Path $winsxs "*\$FileName") -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 0 })
-    }
-    catch {
-        Add-OfflineRepairLog -Level Info -Message "Could not search the component store for $FileName : $($_.Exception.Message)"
-        return @()
-    }
+    if (-not $Index.ContainsKey($FileName)) { return @() }
+    return @($Index[$FileName] | Where-Object { $_ })
 }
 
 function Get-EspArtifactSpec {
     <#
     .SYNOPSIS
-        The three files on the EFI System Partition, each with the Windows-partition copy that is
-        the authority for it.
+        The two EFI System Partition files this scenario is responsible for.
 
     .DESCRIPTION
-        The fallback loader is deliberately the same source file as the Microsoft one. Firmware that
-        has lost its boot entry falls back to \EFI\Boot, and Windows expects to find its own boot
-        manager there.
+        The Secure Boot SKU policy is deliberately not in this list. A healthy, currently booting
+        Server 2022 Gen2 VM with Secure Boot enabled was measured with no SKUSiPolicy.p7b on its
+        EFI System Partition at all, so its absence is a normal state and not a fault. The copy
+        under Windows\System32\SecureBootUpdates is the servicing stack's source for that policy if
+        it ever decides to apply one - it is not a statement that the EFI System Partition is
+        supposed to have it.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WindowsDrive,
         [Parameter(Mandatory = $true)][string]$BootDrive
     )
 
-    $bootManagerSource = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\Boot\EFI\bootmgfw.efi'
-    $skuPolicySource = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\System32\SecureBootUpdates\SKUSiPolicy.p7b'
     $fallbackName = Get-EfiFallbackBootFileName -WindowsDrive $WindowsDrive
 
     return @(
         @{
             Item        = 'bootmgfw'
             Label       = 'EFI boot manager'
-            Source      = $bootManagerSource
             Destination = Join-OfflinePath -Root $BootDrive -ChildPath 'EFI\Microsoft\Boot\bootmgfw.efi'
         }
         @{
             Item        = 'fallback'
             Label       = "EFI fallback boot manager ($fallbackName)"
-            Source      = $bootManagerSource
             Destination = Join-OfflinePath -Root $BootDrive -ChildPath "EFI\Boot\$fallbackName"
-        }
-        @{
-            Item        = 'skusipolicy'
-            Label       = 'Secure Boot SKU policy'
-            Source      = $skuPolicySource
-            Destination = Join-OfflinePath -Root $BootDrive -ChildPath 'EFI\Microsoft\Boot\SKUSiPolicy.p7b'
         }
     )
 }
@@ -403,46 +497,84 @@ function Get-EspArtifactSpec {
 function Get-EspFinding {
     <#
     .SYNOPSIS
-        Compares each EFI System Partition artifact with its Windows-partition source.
+        Reports an EFI System Partition boot manager that is missing or not an executable.
 
     .DESCRIPTION
         Hash comparison only. Nothing here writes, so this is safe under -detectOnly.
 
-        A missing source is reported and not repaired. The source is what makes the copy correct for
-        this installation, and taking a boot manager from anywhere else - the rescue VM, another
-        image - is how a guest ends up running a loader from a different build.
+        This deliberately does NOT report a boot manager that merely differs from the copy under
+        Windows\Boot\EFI. On a healthy, currently booting Server 2022 VM the boot manager on the EFI
+        System Partition was measured at version 10.0.28000.322 against an operating system of
+        10.0.20348, matching no copy in the component store and differing from the staged copy in
+        both size and hash. That is not staleness: Secure Boot servicing updates the boot manager on
+        the EFI System Partition on its own schedule, ahead of the operating system, as part of the
+        signing certificate and SBAT revocation work. The newer file is the correct one.
+
+        Overwriting it with the older staged copy would roll back a security update, and where the
+        firmware's SBAT level has already advanced past that older boot manager it would be
+        self-revoked and refused - turning a VM that boots into one that does not. So a difference
+        is reported for information and nothing is touched.
+
+        What is left is the failure that can be proven offline: the file is gone, or it is not an
+        EFI executable at all. That covers a deleted, truncated, zeroed or overwritten boot manager,
+        which is what actually strands a Gen2 VM.
     #>
     param(
-        [Parameter(Mandatory = $true)][array]$Specs
+        [Parameter(Mandatory = $true)][array]$Specs,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $stagedBootManager = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\Boot\EFI\bootmgfw.efi'
+    $espBootManager = ($Specs | Where-Object { $_.Item -eq 'bootmgfw' } | Select-Object -First 1).Destination
+    $espBootManagerOk = (Get-PeImageInfo -Path $espBootManager).IsEfi
 
     foreach ($spec in $Specs) {
-        $sourceHash = Get-FileHashValue -Path $spec.Source
-        if (-not $sourceHash) {
+        $image = Get-PeImageInfo -Path $spec.Destination
+
+        if ($image.Exists -and $image.IsEfi) {
+            $note = ''
+            if ($spec.Item -eq 'bootmgfw') {
+                $stagedHash = Get-FileHashValue -Path $stagedBootManager
+                $espHash = Get-FileHashValue -Path $spec.Destination
+                if ($stagedHash -and $espHash -and $stagedHash -ne $espHash) {
+                    $note = ' It does not match the copy staged at ' + $stagedBootManager +
+                    ', which is normal: Secure Boot servicing updates the EFI System Partition ahead of the operating system, so the file there is usually the newer of the two. It is left alone.'
+                }
+            }
+            Add-OfflineRepairLog -Level Info -Message "The $($spec.Label) is present on the EFI System Partition and is a valid EFI executable.$note"
+            continue
+        }
+
+        # Prefer the boot manager already on this EFI System Partition as the source for the
+        # fallback: it is the one this VM has actually been booting, and on a serviced VM it is
+        # newer than anything on the Windows partition.
+        $source = $stagedBootManager
+        $sourceNote = "the copy staged at $stagedBootManager. That copy can be older than the one Secure Boot servicing had put on the EFI System Partition, so if the VM still stops at a Secure Boot violation after this, the boot manager needs reapplying through Windows Update rather than replacing again."
+        if ($spec.Item -eq 'fallback' -and $espBootManagerOk) {
+            $source = $espBootManager
+            $sourceNote = "the working boot manager already on the EFI System Partition, $espBootManager, which is the one this VM has been booting."
+        }
+
+        $spec.Source = $source
+
+        if (-not (Get-PeImageInfo -Path $source).IsEfi) {
             [void]$findings.Add((New-Finding -Cause 'MissingSource' -Item $spec.Item -Repairable $false `
-                        -Message "The $($spec.Label) cannot be refreshed because its source on the Windows partition, $($spec.Source), is missing or unreadable. Only this installation's own copy is safe to use, so nothing was changed. Repair the component store from matching media, or apply the pending update, then run this again." `
+                        -Message "The $($spec.Label) is $(if ($image.Exists) { 'not a valid EFI executable' } else { 'missing' }) at $($spec.Destination), and it cannot be replaced because $source is missing or is not an EFI executable either. Only this installation's own boot manager is safe to use, so nothing was changed. Recover the boot manager from matching media or reapply the servicing update, then run this again." `
                         -Data $spec))
             continue
         }
 
-        $destinationHash = Get-FileHashValue -Path $spec.Destination
-        if (-not $destinationHash) {
+        if ($image.Exists) {
+            [void]$findings.Add((New-Finding -Cause 'CorruptEspArtifact' -Item $spec.Item `
+                        -Message "The $($spec.Label) at $($spec.Destination) is $($image.Length) bytes but is not an EFI executable, so the firmware has nothing it can run. It will be replaced from $sourceNote" `
+                        -Data $spec))
+        }
+        else {
             [void]$findings.Add((New-Finding -Cause 'MissingEspArtifact' -Item $spec.Item `
-                        -Message "The $($spec.Label) is missing from the EFI System Partition at $($spec.Destination), so the firmware has nothing to run. It will be copied from $($spec.Source)." `
+                        -Message "The $($spec.Label) is missing from the EFI System Partition at $($spec.Destination), so the firmware has nothing to run. It will be restored from $sourceNote" `
                         -Data $spec))
-            continue
         }
-
-        if ($destinationHash -ne $sourceHash) {
-            [void]$findings.Add((New-Finding -Cause 'StaleEspArtifact' -Item $spec.Item `
-                        -Message "The $($spec.Label) on the EFI System Partition does not match the copy Windows keeps at $($spec.Source), so an update refreshed the Windows partition without refreshing the EFI System Partition. It will be replaced." `
-                        -Data $spec))
-            continue
-        }
-
-        Add-OfflineRepairLog -Level Info -Message "$($spec.Label) on the EFI System Partition matches $($spec.Source)."
     }
 
     return @($findings)
@@ -462,7 +594,8 @@ function Get-BootChainFinding {
         way, and is reported rather than guessed at.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$WindowsDrive
+        [Parameter(Mandatory = $true)][string]$WindowsDrive,
+        [Parameter(Mandatory = $true)][hashtable]$StoreIndex
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -484,7 +617,7 @@ function Get-BootChainFinding {
         }
 
         $hash = Get-FileHashValue -Path $path
-        $storeCopies = @(Get-ComponentStoreCopy -WindowsDrive $WindowsDrive -FileName $fileName)
+        $storeCopies = @(Get-ComponentStoreCopy -Index $StoreIndex -FileName $fileName)
 
         if ($storeCopies.Count -eq 0) {
             [void]$findings.Add((New-Finding -Cause 'NoStoreCopy' -Item $spec.RelativePath -Repairable $false `
@@ -493,7 +626,7 @@ function Get-BootChainFinding {
             continue
         }
 
-        $storeHashes = @($storeCopies | ForEach-Object { Get-FileHashValue -Path $_.FullName } | Where-Object { $_ })
+        $storeHashes = @($storeCopies | ForEach-Object { Get-FileHashValue -Path $_ } | Where-Object { $_ })
         if ($hash -and ($storeHashes -contains $hash)) {
             Add-OfflineRepairLog -Level Info -Message "$($spec.Label) matches a copy in the component store."
             continue
@@ -627,7 +760,7 @@ function Repair-Finding {
     )
 
     switch ($Finding.Cause) {
-        { $_ -in @('MissingEspArtifact', 'StaleEspArtifact') } {
+        { $_ -in @('MissingEspArtifact', 'CorruptEspArtifact') } {
             $spec = $Finding.Data
             $destinationDir = Split-Path -Path $spec.Destination -Parent
             if (-not (Test-Path -LiteralPath $destinationDir)) {
@@ -808,14 +941,17 @@ try {
     }
 
     $espSpecs = @(Get-EspArtifactSpec -WindowsDrive $offline.WindowsDrive -BootDrive $offline.BootDrive)
+    $storeIndex = Get-ComponentStoreIndex -WindowsDrive $offline.WindowsDrive `
+        -FileName @($script:BootChainFile | ForEach-Object { Split-Path -Path $_.RelativePath -Leaf } | Sort-Object -Unique)
+
     $findings = @()
-    $findings += @(Get-EspFinding -Specs $espSpecs)
-    $findings += @(Get-BootChainFinding -WindowsDrive $offline.WindowsDrive)
+    $findings += @(Get-EspFinding -Specs $espSpecs -WindowsDrive $offline.WindowsDrive)
+    $findings += @(Get-BootChainFinding -WindowsDrive $offline.WindowsDrive -StoreIndex $storeIndex)
 
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
     if ($findings.Count -eq 0) {
-        Log-Output 'The EFI boot chain on this disk is intact. Every file on the EFI System Partition matches the copy Windows keeps, and every boot chain file matches the component store. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The EFI boot chain on this disk is intact. The boot manager on the EFI System Partition is present and is a valid EFI executable, and every boot chain file matches a copy in the component store. No changes were made.' | Tee-Object -FilePath $logFile -Append
         if ($secureBoot.Known -and -not $secureBoot.Enabled) {
             Log-Output 'Secure Boot was disabled at the last boot, so a signature problem in the boot chain would not have stopped this VM in the first place. Look at win-fix-bcd for the boot configuration, or win-fix-inaccessible-boot-device if the failure is a 0x7B.' | Tee-Object -FilePath $logFile -Append
         }
