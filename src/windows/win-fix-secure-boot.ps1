@@ -974,7 +974,7 @@ try {
 
     # Verified against freshly read state rather than by trusting the repairs above.
     $remaining = @()
-    $remaining += @(Get-EspFinding -Specs $espSpecs)
+    $remaining += @(Get-EspFinding -Specs $espSpecs -WindowsDrive $offline.WindowsDrive)
     $remaining += @(Get-BootChainFinding -WindowsDrive $offline.WindowsDrive)
     $stillRepairable = @($remaining | Where-Object { $_.Repairable })
     foreach ($finding in $stillRepairable) {
