@@ -14,28 +14,25 @@
 #   event log to read afterwards, because nothing ever got far enough to write one.
 #
 #   Evidence used, in order:
-#     1. The boot manager on the EFI System Partition, and the fallback loader beside it at
-#        \EFI\Boot. Each is checked for being present and for being a real EFI executable, by
-#        reading its PE header. It is deliberately NOT compared against the copy Windows stages at
-#        Windows\Boot\EFI\bootmgfw.efi - see the note on Secure Boot servicing below.
-#     2. The boot chain files on the Windows partition, compared by SHA256 against the copies held
-#        in the component store under Windows\WinSxS. A file that matches no copy in the store is
-#        not the file Windows shipped.
-#     3. The Secure Boot state the guest last booted with, read from the Measured Boot log. This is
+#     1. The digital signature of every file in the boot chain, and of the boot manager on the EFI
+#        System Partition. This is the same evidence the firmware and the boot manager themselves
+#        use, so a file that fails here is precisely a file the boot chain will refuse.
+#     2. The Secure Boot state the guest last booted with, read from the Measured Boot log. This is
 #        reported as context either way and is never itself treated as a fault.
 #
 #   Causes detected and repaired:
-#     1. A boot manager missing from the EFI System Partition, or present but not an EFI executable
-#        because it was truncated, zeroed or overwritten. The fallback loader is restored from the
-#        working boot manager already on the EFI System Partition where there is one, because that
-#        is the file this VM has actually been booting; otherwise from the copy Windows stages.
-#     2. A boot chain file on the Windows partition that matches no copy in the component store.
-#        Repaired with a targeted "sfc /SCANFILE" against that one file, which sources the
-#        replacement from the guest's own store and so is always the right build.
+#     1. A boot manager missing from the EFI System Partition, or present with a signature that no
+#        longer verifies because it was truncated, zeroed or overwritten. The fallback loader is
+#        restored from the working boot manager already on the EFI System Partition where there is
+#        one, because that is the file this VM has actually been booting; otherwise from the copy
+#        Windows stages.
+#     2. A boot chain file on the Windows partition whose signature no longer verifies. Repaired
+#        with a targeted "sfc /SCANFILE" against that one file, which sources the replacement from
+#        the guest's own store and so is always the right build.
 #
 #   Reported but never repaired automatically:
-#     - A file with no copy at all in the component store. Nothing can be verified against it and
-#       nothing trustworthy can be put in its place, so it is reported with the path.
+#     - A file whose signature is well formed but is not trusted by the rescue VM. That describes
+#       the rescue VM's certificate store, not the guest's file, so it is reported and left alone.
 #     - A boot manager that is missing or unusable when the staged copy is missing or unusable too.
 #       Copying a boot manager from anywhere other than this installation is how a VM ends up
 #       running a different build's loader, so the script stops and says what is missing.
@@ -88,6 +85,20 @@
 #   its absence is a normal state. The copy under Windows\System32\SecureBootUpdates is the
 #   servicing stack's source for that policy, not evidence that the partition should carry it.
 #
+#   Integrity is decided by the file's digital signature, NOT by comparing it with the copies in the
+#   component store. The store comparison cannot work: the files under System32 are hard links to
+#   their component store copy, so corrupting one corrupts the other and the two still agree.
+#   Measured on a Server 2022 disk with winload.efi deliberately corrupted, the store comparison
+#   reported it as matching a copy in the store - a false negative on a file that was plainly broken
+#   - while its signature had already stopped verifying. Signature verification also costs far less:
+#   thirteen files verified in 2.18 seconds against 193 seconds to index 15,286 component store
+#   directories.
+#
+#   The boot manager Secure Boot servicing installs is signed by the Windows UEFI CA 2023 and still
+#   verifies as Valid on a Server 2022 rescue VM, so the newer signing chain does not cause a false
+#   positive. A well formed signature that this rescue VM does not trust is reported and never
+#   repaired, because that describes the rescue VM rather than the guest.
+#
 #   Offline "sfc /VERIFYFILE" REPAIRS, despite its own help text saying "No repair operation is
 #   performed". Measured on a Server 2022 disk with winload.efi deliberately corrupted, /VERIFYFILE
 #   logged "Cannot repair member file 'winload.efi' ... hash mismatch" and then "Repairing file
@@ -97,11 +108,6 @@
 #
 #   sfc's exit code is 0 whether or not it found anything, and it writes UTF-16 to the console,
 #   which is unreadable when captured. Only /OFFLOGFILE is parsed, for the [SR] lines.
-#
-#   The component store is indexed in a single pass. WinSxS directories are named after the
-#   component rather than the file, so each file has to be matched one level down; doing that as a
-#   wildcard search per file measured 11 seconds a file over 15,286 directories, which for fifteen
-#   files is several minutes. Walking those directories once takes a tenth of a second.
 #
 #   The boot chain files are owned by NT SERVICE\TrustedInstaller and deny write even to SYSTEM, so
 #   every write goes through Copy-OfflineProtectedFile, which captures the original security
@@ -298,18 +304,11 @@ function Get-OfflineSecureBootState {
 function Get-PeImageInfo {
     <#
     .SYNOPSIS
-        Reads the PE header of an image and reports whether it is a real executable.
+        Reads the PE header of an image to learn its architecture.
 
     .DESCRIPTION
-        Used for two things: to learn the architecture of the installation, and to decide whether an
-        EFI binary on the EFI System Partition is intact.
-
-        Intact is deliberately a low bar - a valid PE header with an EFI subsystem - because that is
-        the strongest claim the evidence actually supports offline. It catches the failures that
-        really happen: a deleted file, a truncated one, a zeroed one, one overwritten with garbage.
-        It does not attempt to judge a well formed Microsoft signed boot manager, because there is no
-        offline way to do that and, as the ESP boot manager on a serviced VM shows, a boot manager
-        that differs from everything on the Windows partition is usually the correct one.
+        Used only to work out which fallback loader name this installation needs. Whether a file is
+        intact is decided by its signature instead - see Get-SignatureState.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -384,82 +383,67 @@ function Get-EfiFallbackBootFileName {
     }
 }
 
-function Get-ComponentStoreIndex {
+function Get-SignatureState {
     <#
     .SYNOPSIS
-        Indexes the component store once, by file name.
+        Verifies the digital signature of one boot chain file.
 
     .DESCRIPTION
-        WinSxS directories are named after the component, not the file, so
-        "Get-ChildItem WinSxS -Filter '*winload*'" finds nothing at all - winload.efi lives in
-        amd64_microsoft-windows-b..vironment-os-loader_<key>_<version>_none_<hash>. The file has to
-        be matched one wildcard level down, which is where servicing puts it.
+        This is the check the firmware and the boot manager themselves perform, which is what makes
+        it the right test for this scenario. A file whose signature no longer verifies is exactly a
+        file the boot chain will refuse.
 
-        Doing that as a wildcard search per file is what makes the naive version slow: one pass for
-        winload.efi over a measured 15,286 component directories took 11 seconds, so the fifteen
-        files in the boot chain cost several minutes. Enumerating those directories once takes a
-        tenth of a second, so the store is walked a single time and every wanted name is picked up
-        on the way past.
+        It replaced a comparison against the copies in the component store, which cannot work: the
+        files under System32 are hard links to their component store copy, so corrupting one
+        corrupts the other and the two still agree. Measured on a Server 2022 disk with winload.efi
+        deliberately corrupted, the store comparison reported it as matching a copy in the store
+        while its signature had already stopped verifying.
+
+        Verdicts:
+          Valid                                 the file is intact and is the file Microsoft signed
+          HashMismatch, NotSigned, UnknownError the bytes no longer match the signature, or the
+                                                signature is gone with them - repairable
+          NotTrusted                            the signature is well formed but its chain is not
+                                                trusted HERE. That is a statement about the rescue
+                                                VM, not about the guest, so it is reported and never
+                                                repaired.
+
+        A zeroed 3 MB file reports UnknownError with "The form specified for the subject is not one
+        supported or known by the specified trust provider"; a file with corrupted bytes over its
+        header reports NotSigned. Both mean the same thing for this purpose.
+
+        No network is needed. A second pass over the same thirteen files returned identical verdicts
+        in 0.26s, so nothing here depends on reaching a revocation list.
     #>
-    param(
-        [Parameter(Mandatory = $true)][string]$WindowsDrive,
-        [Parameter(Mandatory = $true)][string[]]$FileName
-    )
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    $index = @{}
-    foreach ($name in $FileName) { $index[$name] = [System.Collections.Generic.List[string]]::new() }
-
-    $winsxs = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\WinSxS'
-    if (-not (Test-OfflinePath $winsxs)) {
-        Add-OfflineRepairLog -Level Warning -Message "The component store $winsxs is not present, so no file can be checked against it."
-        return $index
+    $state = [PSCustomObject]@{
+        Status  = 'Missing'
+        Intact  = $false
+        Verdict = 'Missing'
+        Message = ''
     }
 
-    $wanted = @{}
-    foreach ($name in $FileName) { $wanted[$name] = $true }
+    if (-not (Test-OfflinePath $Path)) { return $state }
 
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    $directories = 0
     try {
-        foreach ($directory in [System.IO.Directory]::EnumerateDirectories($winsxs)) {
-            $directories++
-            try {
-                foreach ($file in [System.IO.Directory]::EnumerateFiles($directory)) {
-                    $leaf = [System.IO.Path]::GetFileName($file)
-                    if ($wanted.ContainsKey($leaf)) { [void]$index[$leaf].Add($file) }
-                }
-            }
-            catch { continue }
-        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $state.Status = "$($signature.Status)"
+        $state.Message = "$($signature.StatusMessage)"
     }
     catch {
-        Add-OfflineRepairLog -Level Warning -Message "The component store could not be read in full: $($_.Exception.Message). Findings below may be incomplete."
+        $state.Status = 'UnknownError'
+        $state.Message = $_.Exception.Message
     }
-    $timer.Stop()
 
-    Add-OfflineRepairLog -Level Info -Message "Indexed $directories component store directories in $([math]::Round($timer.Elapsed.TotalSeconds, 1))s."
-    return $index
+    switch ($state.Status) {
+        'Valid' { $state.Intact = $true; $state.Verdict = 'Intact' }
+        'NotTrusted' { $state.Verdict = 'Untrusted' }
+        default { $state.Verdict = 'Broken' }
+    }
+
+    return $state
 }
-
-function Get-ComponentStoreCopy {
-    <#
-    .SYNOPSIS
-        Every copy of a file held in the component store.
-
-    .DESCRIPTION
-        Every copy is returned rather than the newest, because a file that matches ANY copy in the
-        store is a file the store vouches for. Picking the newest and demanding a match would flag a
-        perfectly healthy installation the moment an update is staged but not yet active.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][hashtable]$Index,
-        [Parameter(Mandatory = $true)][string]$FileName
-    )
-
-    if (-not $Index.ContainsKey($FileName)) { return @() }
-    return @($Index[$FileName] | Where-Object { $_ })
-}
-
 function Get-EspArtifactSpec {
     <#
     .SYNOPSIS
@@ -515,9 +499,12 @@ function Get-EspFinding {
         self-revoked and refused - turning a VM that boots into one that does not. So a difference
         is reported for information and nothing is touched.
 
-        What is left is the failure that can be proven offline: the file is gone, or it is not an
-        EFI executable at all. That covers a deleted, truncated, zeroed or overwritten boot manager,
-        which is what actually strands a Gen2 VM.
+        What is left is the failure that can be proven offline: the file is gone, or its signature no
+        longer verifies. That covers a deleted, truncated, zeroed or overwritten boot manager, which
+        is what actually strands a Gen2 VM. The signature is the same evidence the firmware uses, and
+        the boot manager Secure Boot servicing installs - signed by the Windows UEFI CA 2023 - was
+        measured verifying as Valid on a Server 2022 rescue VM, so a newer signing chain does not
+        produce a false positive here.
     #>
     param(
         [Parameter(Mandatory = $true)][array]$Specs,
@@ -527,12 +514,12 @@ function Get-EspFinding {
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
     $stagedBootManager = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\Boot\EFI\bootmgfw.efi'
     $espBootManager = ($Specs | Where-Object { $_.Item -eq 'bootmgfw' } | Select-Object -First 1).Destination
-    $espBootManagerOk = (Get-PeImageInfo -Path $espBootManager).IsEfi
+    $espBootManagerOk = (Get-SignatureState -Path $espBootManager).Intact
 
     foreach ($spec in $Specs) {
-        $image = Get-PeImageInfo -Path $spec.Destination
+        $signature = Get-SignatureState -Path $spec.Destination
 
-        if ($image.Exists -and $image.IsEfi) {
+        if ($signature.Verdict -eq 'Intact') {
             $note = ''
             if ($spec.Item -eq 'bootmgfw') {
                 $stagedHash = Get-FileHashValue -Path $stagedBootManager
@@ -542,7 +529,14 @@ function Get-EspFinding {
                     ', which is normal: Secure Boot servicing updates the EFI System Partition ahead of the operating system, so the file there is usually the newer of the two. It is left alone.'
                 }
             }
-            Add-OfflineRepairLog -Level Info -Message "The $($spec.Label) is present on the EFI System Partition and is a valid EFI executable.$note"
+            Add-OfflineRepairLog -Level Info -Message "The $($spec.Label) is present on the EFI System Partition and its signature verifies.$note"
+            continue
+        }
+
+        if ($signature.Verdict -eq 'Untrusted') {
+            [void]$findings.Add((New-Finding -Cause 'UntrustedEspArtifact' -Item $spec.Item -Repairable $false `
+                        -Message "The $($spec.Label) at $($spec.Destination) carries a well formed signature that this rescue VM does not trust ($($signature.Status): $($signature.Message)). That is a statement about the rescue VM's certificate store, not proof that the guest's file is wrong, so nothing was changed. Check it against a VM of the same build before replacing it." `
+                        -Data $spec))
             continue
         }
 
@@ -558,16 +552,16 @@ function Get-EspFinding {
 
         $spec.Source = $source
 
-        if (-not (Get-PeImageInfo -Path $source).IsEfi) {
+        if (-not (Get-SignatureState -Path $source).Intact) {
             [void]$findings.Add((New-Finding -Cause 'MissingSource' -Item $spec.Item -Repairable $false `
-                        -Message "The $($spec.Label) is $(if ($image.Exists) { 'not a valid EFI executable' } else { 'missing' }) at $($spec.Destination), and it cannot be replaced because $source is missing or is not an EFI executable either. Only this installation's own boot manager is safe to use, so nothing was changed. Recover the boot manager from matching media or reapply the servicing update, then run this again." `
+                        -Message "The $($spec.Label) is $(if ($signature.Status -eq 'Missing') { 'missing' } else { "present but its signature does not verify ($($signature.Status))" }) at $($spec.Destination), and it cannot be replaced because $source is missing or its signature does not verify either. Only this installation's own boot manager is safe to use, so nothing was changed. Recover the boot manager from matching media or reapply the servicing update, then run this again." `
                         -Data $spec))
             continue
         }
 
-        if ($image.Exists) {
+        if ($signature.Status -ne 'Missing') {
             [void]$findings.Add((New-Finding -Cause 'CorruptEspArtifact' -Item $spec.Item `
-                        -Message "The $($spec.Label) at $($spec.Destination) is $($image.Length) bytes but is not an EFI executable, so the firmware has nothing it can run. It will be replaced from $sourceNote" `
+                        -Message "The $($spec.Label) at $($spec.Destination) is present but its signature does not verify ($($signature.Status)), so the firmware will refuse it. It will be replaced from $sourceNote" `
                         -Data $spec))
         }
         else {
@@ -583,29 +577,26 @@ function Get-EspFinding {
 function Get-BootChainFinding {
     <#
     .SYNOPSIS
-        Compares each boot chain file with the copies in the component store.
+        Verifies the signature of every file in the boot chain.
 
     .DESCRIPTION
-        Hash comparison only, for the reason set out in .NOTES: offline sfc rewrites files even when
-        asked only to verify, so it cannot be part of detection.
+        Signature verification only. Nothing here writes, so this is safe under -detectOnly: offline
+        sfc rewrites files even when asked merely to verify, so it can play no part in detection.
 
-        A file that matches at least one copy in the store is intact. A file that matches none is
-        not what Windows shipped. A file the store has no copy of at all cannot be judged either
-        way, and is reported rather than guessed at.
+        A file whose signature verifies is intact. A file whose signature does not is not the file
+        Microsoft signed, and is exactly what the boot chain refuses.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$WindowsDrive,
-        [Parameter(Mandatory = $true)][hashtable]$StoreIndex
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($spec in $script:BootChainFile) {
         $path = Join-OfflinePath -Root $WindowsDrive -ChildPath $spec.RelativePath
-        $fileName = Split-Path -Path $spec.RelativePath -Leaf
-        $present = Test-OfflinePath $path
+        $signature = Get-SignatureState -Path $path
 
-        if (-not $present) {
+        if ($signature.Status -eq 'Missing') {
             if ($spec.Optional) {
                 Add-OfflineRepairLog -Level Info -Message "$($spec.Label) is not present, which is normal on an installation that does not use it."
                 continue
@@ -616,24 +607,20 @@ function Get-BootChainFinding {
             continue
         }
 
-        $hash = Get-FileHashValue -Path $path
-        $storeCopies = @(Get-ComponentStoreCopy -Index $StoreIndex -FileName $fileName)
+        if ($signature.Verdict -eq 'Intact') {
+            Add-OfflineRepairLog -Level Info -Message "$($spec.Label) is signed and its signature verifies."
+            continue
+        }
 
-        if ($storeCopies.Count -eq 0) {
-            [void]$findings.Add((New-Finding -Cause 'NoStoreCopy' -Item $spec.RelativePath -Repairable $false `
-                        -Message "The $($spec.Label) at $path holds no copy in the component store, so whether it is intact cannot be established and nothing can be put in its place. Check it by hand against a VM of the same build, or repair the component store with win-sfc-sf-corruption." `
+        if ($signature.Verdict -eq 'Untrusted') {
+            [void]$findings.Add((New-Finding -Cause 'UntrustedBootChainFile' -Item $spec.RelativePath -Repairable $false `
+                        -Message "The $($spec.Label) at $path carries a well formed signature that this rescue VM does not trust ($($signature.Status): $($signature.Message)). That describes the rescue VM's certificate store rather than the guest's file, so nothing was changed. Compare it with a VM of the same build before replacing it." `
                         -Data $spec))
             continue
         }
 
-        $storeHashes = @($storeCopies | ForEach-Object { Get-FileHashValue -Path $_ } | Where-Object { $_ })
-        if ($hash -and ($storeHashes -contains $hash)) {
-            Add-OfflineRepairLog -Level Info -Message "$($spec.Label) matches a copy in the component store."
-            continue
-        }
-
         [void]$findings.Add((New-Finding -Cause 'CorruptBootChainFile' -Item $spec.RelativePath `
-                    -Message "The $($spec.Label) at $path matches none of the $($storeCopies.Count) copy(ies) the component store holds of $fileName, so it is not the file Windows shipped. It will be repaired from the store." `
+                    -Message "The $($spec.Label) at $path is present but its signature does not verify ($($signature.Status)), so it is not the file Microsoft signed and the boot chain will refuse it. It will be repaired from the component store." `
                     -Data $spec))
     }
 
@@ -790,7 +777,6 @@ function Repair-Finding {
         { $_ -in @('CorruptBootChainFile', 'MissingBootChainFile') } {
             $spec = $Finding.Data
             $path = Join-OfflinePath -Root $WindowsDrive -ChildPath $spec.RelativePath
-            $fileName = Split-Path -Path $spec.RelativePath -Leaf
 
             if (Test-Path -LiteralPath $path) {
                 if (-not (Backup-Artifact -Path $path)) {
@@ -803,14 +789,13 @@ function Repair-Finding {
                 return [PSCustomObject]@{ Repaired = $false; Detail = $sfc.Detail }
             }
 
-            $hash = Get-FileHashValue -Path $path
-            $storeHashes = @(Get-ComponentStoreCopy -WindowsDrive $WindowsDrive -FileName $fileName |
-                ForEach-Object { Get-FileHashValue -Path $_.FullName } | Where-Object { $_ })
-            if (-not $hash -or -not ($storeHashes -contains $hash)) {
-                return [PSCustomObject]@{ Repaired = $false; Detail = "sfc reported a repair, but $path still matches no copy in the component store." }
+            # Verified by re-checking the signature, the same test that found the fault.
+            $after = Get-SignatureState -Path $path
+            if (-not $after.Intact) {
+                return [PSCustomObject]@{ Repaired = $false; Detail = "sfc reported a repair, but the signature of $path still does not verify ($($after.Status))." }
             }
 
-            return [PSCustomObject]@{ Repaired = $true; Detail = "Repaired $path from the component store." }
+            return [PSCustomObject]@{ Repaired = $true; Detail = "Repaired $path from the component store; its signature verifies again." }
         }
 
         default {
@@ -941,17 +926,15 @@ try {
     }
 
     $espSpecs = @(Get-EspArtifactSpec -WindowsDrive $offline.WindowsDrive -BootDrive $offline.BootDrive)
-    $storeIndex = Get-ComponentStoreIndex -WindowsDrive $offline.WindowsDrive `
-        -FileName @($script:BootChainFile | ForEach-Object { Split-Path -Path $_.RelativePath -Leaf } | Sort-Object -Unique)
 
     $findings = @()
     $findings += @(Get-EspFinding -Specs $espSpecs -WindowsDrive $offline.WindowsDrive)
-    $findings += @(Get-BootChainFinding -WindowsDrive $offline.WindowsDrive -StoreIndex $storeIndex)
+    $findings += @(Get-BootChainFinding -WindowsDrive $offline.WindowsDrive)
 
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
     if ($findings.Count -eq 0) {
-        Log-Output 'The EFI boot chain on this disk is intact. The boot manager on the EFI System Partition is present and is a valid EFI executable, and every boot chain file matches a copy in the component store. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The EFI boot chain on this disk is intact. The boot manager on the EFI System Partition is present and every boot chain file carries a signature that verifies, which is the same evidence the firmware and the loader use. No changes were made.' | Tee-Object -FilePath $logFile -Append
         if ($secureBoot.Known -and -not $secureBoot.Enabled) {
             Log-Output 'Secure Boot was disabled at the last boot, so a signature problem in the boot chain would not have stopped this VM in the first place. Look at win-fix-bcd for the boot configuration, or win-fix-inaccessible-boot-device if the failure is a 0x7B.' | Tee-Object -FilePath $logFile -Append
         }
