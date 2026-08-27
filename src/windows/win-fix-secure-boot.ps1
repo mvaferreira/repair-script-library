@@ -686,6 +686,11 @@ function Invoke-OfflineSfcScanFile {
         is usable. /OFFLOGFILE is parsed instead. The log is written to the rescue VM rather than the
         guest, so a failed repair leaves nothing behind on the disk being repaired.
 
+        What this reports is only ever used as detail for the caller's message. Whether the repair
+        actually worked is decided by the caller re-reading the file's signature, because one sfc
+        transaction can repair files beyond the one it was given and will then report no repair for
+        a file that is already correct.
+
     .OUTPUTS
         PSCustomObject with Succeeded, Detail and LogLines.
     #>
@@ -785,17 +790,18 @@ function Repair-Finding {
             }
 
             $sfc = Invoke-OfflineSfcScanFile -Path $path -WindowsDrive $WindowsDrive
-            if (-not $sfc.Succeeded) {
-                return [PSCustomObject]@{ Repaired = $false; Detail = $sfc.Detail }
-            }
 
-            # Verified by re-checking the signature, the same test that found the fault.
+            # The outcome decides whether this worked, not what sfc said it did. One sfc transaction
+            # can repair more than the file it was pointed at - repairing ci.dll was measured also
+            # restoring CodeIntegrity\driver.stl - so by the time a later file's own sfc runs it can
+            # already be correct, and sfc then truthfully reports having repaired nothing. Treating
+            # that as a failure reported an error on a disk that was in fact fully repaired.
             $after = Get-SignatureState -Path $path
-            if (-not $after.Intact) {
-                return [PSCustomObject]@{ Repaired = $false; Detail = "sfc reported a repair, but the signature of $path still does not verify ($($after.Status))." }
+            if ($after.Intact) {
+                return [PSCustomObject]@{ Repaired = $true; Detail = "$path is present and its signature verifies." }
             }
 
-            return [PSCustomObject]@{ Repaired = $true; Detail = "Repaired $path from the component store; its signature verifies again." }
+            return [PSCustomObject]@{ Repaired = $false; Detail = "$($sfc.Detail) The signature of $path still does not verify ($($after.Status))." }
         }
 
         default {
