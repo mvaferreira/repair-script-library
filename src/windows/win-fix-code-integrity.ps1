@@ -84,8 +84,19 @@
 #   Control\SecureBoot\State, which is a volatile key: it is recreated from the firmware at every
 #   boot and never written to the hive file, so on an attached disk it is simply absent. It is read
 #   from the Measured Boot log instead - see Get-OfflineSecureBootState in OfflineRepairCommon.ps1.
-#   An absent log is reported as unknown rather than as "off", and the two findings that depend on
-#   Secure Boot being on stay silent, because a wrong "off" would invent a conflict that is not there.
+#   An absent log is reported as unknown rather than as "off".
+#
+#   testsigning and nointegritychecks are reported as context and are never repaired. This was
+#   measured rather than assumed, on Server 2022 Gen2 with Secure Boot and vTPM enabled:
+#     - bcdedit inside the running guest refuses to set either one, with "The value is protected by
+#       Secure Boot policy and cannot be modified or deleted".
+#     - Setting either one offline does persist to the disk: the value survives a dismount, an
+#       offline/online cycle and a remount.
+#     - Booting a disk carrying either value succeeds anyway. The guest reaches Ready and the value
+#       is gone from the store afterwards, so the boot manager drops it.
+#   An earlier version of this script raised these as findings that claimed the guest "cannot boot".
+#   That claim was wrong in both directions: the state is not fatal, and it does not survive to be
+#   the cause of anything. Clearing them offline would have been a change with no evidence behind it.
 #
 #   Credential Guard enabled with a UEFI lock (Control\Lsa\LsaCfgFlags=1) also sets an EFI firmware
 #   variable that a registry change cannot clear. That case is reported, because clearing it needs
@@ -433,14 +444,12 @@ function Get-AllFinding {
 
     .DESCRIPTION
         A protection being enabled is deliberately absent from this function. The only things that
-        become findings are a driver the guest actually refused to load, and a boot configuration
-        override that provably conflicts with the Secure Boot state the guest last booted with.
+        become findings are a driver the guest actually refused to load. Boot configuration
+        overrides are reported as context only - see the note in the file header.
     #>
     param(
-        [Parameter(Mandatory = $true)]$Protection,
         [Parameter(Mandatory = $true)]$BlockEvidence,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][PSCustomObject[]]$Drivers,
-        [Parameter(Mandatory = $true)]$BcdState
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][PSCustomObject[]]$Drivers
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -471,19 +480,6 @@ function Get-AllFinding {
                     -Data $driver))
     }
 
-    if ($BcdState.Available -and $Protection.SecureBootKnown -and $Protection.SecureBootEnabled) {
-        if ($BcdState.TestSigning) {
-            [void]$findings.Add((New-Finding -Cause 'TestSigningConflict' -Item 'testsigning' `
-                        -Message 'Test signing is on in the boot configuration while the guest last booted with Secure Boot enabled. Secure Boot refuses to start a test signed configuration, so this combination cannot boot.' `
-                        -Data $BcdState))
-        }
-        if ($BcdState.NoIntegrityChecks) {
-            [void]$findings.Add((New-Finding -Cause 'IntegrityChecksDisabled' -Item 'nointegritychecks' `
-                        -Message 'Integrity checks are disabled in the boot configuration while the guest last booted with Secure Boot enabled. Secure Boot ignores the override and refuses to start, so this combination cannot boot.' `
-                        -Data $BcdState))
-        }
-    }
-
     return @($findings)
 }
 
@@ -494,8 +490,7 @@ function Repair-Finding {
     #>
     param(
         [Parameter(Mandatory = $true)]$Finding,
-        [Parameter(Mandatory = $true)][string]$SystemRoot,
-        [Parameter(Mandatory = $false)][AllowNull()][string]$BcdStorePath = ''
+        [Parameter(Mandatory = $true)][string]$SystemRoot
     )
 
     switch ($Finding.Cause) {
@@ -506,18 +501,6 @@ function Repair-Finding {
             Set-ItemProperty -Path $keyPath -Name 'Start' -Value 4 -Type DWord -Force -ErrorAction Stop
             Add-OfflineRepairLog -Message "$($driver.Service): Start $($driver.Start) -> 4 (disabled). Memory Integrity and Credential Guard were left untouched."
             Add-OfflineRepairLog -Message "$($driver.Service): to undo this after the VM boots, run: reg add `"HKLM\SYSTEM\CurrentControlSet\Services\$($driver.Service)`" /v Start /t REG_DWORD /d $($driver.Start) /f"
-            return $true
-        }
-        'TestSigningConflict' {
-            $result = Invoke-BcdEdit -StorePath $BcdStorePath -Command "/set $($Finding.Data.LoaderId) testsigning Off"
-            if (-not $result.Success) { throw "bcdedit could not turn test signing off (exit $($result.ExitCode))." }
-            Add-OfflineRepairLog -Message 'testsigning: Yes -> Off.'
-            return $true
-        }
-        'IntegrityChecksDisabled' {
-            $result = Invoke-BcdEdit -StorePath $BcdStorePath -Command "/deletevalue $($Finding.Data.LoaderId) nointegritychecks"
-            if (-not $result.Success) { throw "bcdedit could not remove the integrity check override (exit $($result.ExitCode))." }
-            Add-OfflineRepairLog -Message 'nointegritychecks: removed.'
             return $true
         }
         default { return $false }
@@ -596,7 +579,7 @@ try {
         $systemRoot = Get-OfflineSystemRootPath
         $protection = Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState
         $drivers = @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
-        $findings = @(Get-AllFinding -Protection $protection -BlockEvidence $blockEvidence -Drivers $drivers -BcdState $bcdState)
+        $findings = @(Get-AllFinding -BlockEvidence $blockEvidence -Drivers $drivers)
 
         return [PSCustomObject]@{
             SystemRoot = $systemRoot
@@ -613,7 +596,18 @@ try {
 
     # Context only. None of this is a fault by itself, so none of it appears in the findings list.
     Log-Info "Control set $($context.ControlSet): Memory Integrity $(if ($protection.HvciEnabled) { 'on' } else { 'off' })$(if ($protection.HvciLocked) { ' (locked)' }), Credential Guard $(if ($protection.CredentialGuard) { 'on' } else { 'off' })$(if ($protection.CgUefiLock) { ' (UEFI lock)' }), LSA protection $(if ($protection.RunAsPPL -eq 1) { 'on' } else { 'off' }), Secure Boot $(if (-not $protection.SecureBootKnown) { "unknown ($($protection.SecureBootSource))" } elseif ($protection.SecureBootEnabled) { 'on' } else { 'off' })" | Tee-Object -FilePath $logFile -Append
-    Log-Info "Boot configuration: testsigning $(if ($bcdState.TestSigning) { 'Yes' } else { 'No' }), nointegritychecks $(if ($bcdState.NoIntegrityChecks) { 'Yes' } else { 'No' })" | Tee-Object -FilePath $logFile -Append
+    $bcdOverride = @()
+    if ($bcdState.TestSigning) { $bcdOverride += 'testsigning' }
+    if ($bcdState.NoIntegrityChecks) { $bcdOverride += 'nointegritychecks' }
+    if ($bcdOverride.Count -eq 0) {
+        Log-Info 'Boot configuration: no signing overrides are set.' | Tee-Object -FilePath $logFile -Append
+    }
+    elseif ($protection.SecureBootEnabled) {
+        Log-Info "Boot configuration: $($bcdOverride -join ' and ') set while Secure Boot is on. Measured on this platform, the boot manager drops these at the next boot and the guest starts normally, so this is context and not a boot fault." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Info "Boot configuration: $($bcdOverride -join ' and ') set with Secure Boot off, so driver signing is relaxed. That does not stop a boot, but it can explain how an unsigned or tampered driver was allowed to load." | Tee-Object -FilePath $logFile -Append
+    }
     Log-Info "$($context.Drivers.Count) kernel driver(s) configured to load, $($thirdParty.Count) of them non-Microsoft." | Tee-Object -FilePath $logFile -Append
 
     # Corroborating evidence. Reported as a lead, never repaired: a writable and executable section
@@ -673,10 +667,7 @@ try {
             Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
             Log-Info "SYSTEM hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
         }
-        if (@($repairable | Where-Object { $_.Cause -in @('TestSigningConflict', 'IntegrityChecksDisabled') }).Count -gt 0) {
-            [void](Backup-BcdStore -StorePath $offline.BcdStorePath)
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        }
+
 
         $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
             $systemRoot = Get-OfflineSystemRootPath
@@ -684,7 +675,7 @@ try {
             $errors = [System.Collections.Generic.List[string]]::new()
             foreach ($finding in $repairable) {
                 try {
-                    if (Repair-Finding -Finding $finding -SystemRoot $systemRoot -BcdStorePath $offline.BcdStorePath) {
+                    if (Repair-Finding -Finding $finding -SystemRoot $systemRoot) {
                         $finding.Repaired = $true
                         $done++
                     }
@@ -730,13 +721,10 @@ try {
     }
 
     # Verify against freshly read state rather than trusting the writes above.
-    $verifyBcd = Get-BcdSigningState -StorePath $offline.BcdStorePath
     $remaining = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath
-        return @(Get-AllFinding -Protection (Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState) `
-                -BlockEvidence $blockEvidence `
-                -Drivers @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive) `
-                -BcdState $verifyBcd)
+        return @(Get-AllFinding -BlockEvidence $blockEvidence `
+                -Drivers @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive))
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
