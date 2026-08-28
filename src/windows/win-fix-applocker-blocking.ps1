@@ -394,6 +394,50 @@ function Get-AppLockerGpoCacheKey {
     return @($keys)
 }
 
+function Read-NullTerminatedUnicodeString {
+    <#
+    .SYNOPSIS
+        Reads a null terminated UTF-16LE string and advances the caller's offset past the terminator.
+
+    .DESCRIPTION
+        Written as a function taking [ref] rather than an inline scriptblock on purpose. A
+        scriptblock invoked with & can read an enclosing variable but an assignment inside it
+        creates a local copy, so "$offset += 2" would silently fail to advance the caller's position
+        and the parse would run off the rails.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][ref]$Offset
+    )
+
+    $start = $Offset.Value
+    $index = $Offset.Value
+    while (($index + 1) -lt $Bytes.Length -and -not ($Bytes[$index] -eq 0 -and $Bytes[$index + 1] -eq 0)) { $index += 2 }
+
+    $length = $index - $start
+    if ($length -lt 0) { $length = 0 }
+    $text = [System.Text.Encoding]::Unicode.GetString($Bytes, $start, $length)
+    $Offset.Value = $index + 2
+    return $text
+}
+
+function Test-PolicyFileSeparator {
+    <#
+    .SYNOPSIS
+        Checks for an expected UTF-16LE separator character and advances past it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][ref]$Offset,
+        [Parameter(Mandatory = $true)][string]$Expected
+    )
+
+    if (($Offset.Value + 2) -gt $Bytes.Length) { return $false }
+    if ([System.Text.Encoding]::Unicode.GetString($Bytes, $Offset.Value, 2) -ne $Expected) { return $false }
+    $Offset.Value += 2
+    return $true
+}
+
 function Read-PolicyFileRecord {
     <#
     .SYNOPSIS
@@ -422,50 +466,44 @@ function Read-PolicyFileRecord {
 
     $result.Version = [BitConverter]::ToInt32($bytes, 4)
 
-    $unicode = [System.Text.Encoding]::Unicode
     $records = [System.Collections.Generic.List[PSCustomObject]]::new()
     $offset = 8
 
-    # Reads a null terminated UTF-16LE string and leaves $offset just past the terminator.
-    $readString = {
-        $start = $offset
-        while (($offset + 1) -lt $bytes.Length -and -not ($bytes[$offset] -eq 0 -and $bytes[$offset + 1] -eq 0)) { $offset += 2 }
-        $text = $unicode.GetString($bytes, $start, $offset - $start)
-        $offset += 2
-        return $text
-    }
-
     while ($offset -lt $bytes.Length) {
-        # Each record opens with '['. Anything else means the file is malformed from here on.
-        if (($offset + 1) -ge $bytes.Length) { break }
-        if ($unicode.GetString($bytes, $offset, 2) -ne '[') { $result.Reason = "unexpected byte at offset $offset"; return $result }
-        $offset += 2
+        if (-not (Test-PolicyFileSeparator -Bytes $bytes -Offset ([ref]$offset) -Expected '[')) {
+            $result.Reason = "unexpected byte at offset $offset"; return $result
+        }
 
-        $key = & $readString
-        if ($unicode.GetString($bytes, $offset, 2) -ne ';') { $result.Reason = "missing separator after key at offset $offset"; return $result }
-        $offset += 2
+        $key = Read-NullTerminatedUnicodeString -Bytes $bytes -Offset ([ref]$offset)
+        if (-not (Test-PolicyFileSeparator -Bytes $bytes -Offset ([ref]$offset) -Expected ';')) {
+            $result.Reason = "missing separator after key at offset $offset"; return $result
+        }
 
-        $valueName = & $readString
-        if ($unicode.GetString($bytes, $offset, 2) -ne ';') { $result.Reason = "missing separator after value name at offset $offset"; return $result }
-        $offset += 2
+        $valueName = Read-NullTerminatedUnicodeString -Bytes $bytes -Offset ([ref]$offset)
+        if (-not (Test-PolicyFileSeparator -Bytes $bytes -Offset ([ref]$offset) -Expected ';')) {
+            $result.Reason = "missing separator after value name at offset $offset"; return $result
+        }
 
         if (($offset + 4) -gt $bytes.Length) { $result.Reason = 'truncated type field'; return $result }
         $type = [BitConverter]::ToInt32($bytes, $offset); $offset += 4
-        if ($unicode.GetString($bytes, $offset, 2) -ne ';') { $result.Reason = "missing separator after type at offset $offset"; return $result }
-        $offset += 2
+        if (-not (Test-PolicyFileSeparator -Bytes $bytes -Offset ([ref]$offset) -Expected ';')) {
+            $result.Reason = "missing separator after type at offset $offset"; return $result
+        }
 
         if (($offset + 4) -gt $bytes.Length) { $result.Reason = 'truncated size field'; return $result }
         $size = [BitConverter]::ToInt32($bytes, $offset); $offset += 4
-        if ($unicode.GetString($bytes, $offset, 2) -ne ';') { $result.Reason = "missing separator after size at offset $offset"; return $result }
-        $offset += 2
+        if (-not (Test-PolicyFileSeparator -Bytes $bytes -Offset ([ref]$offset) -Expected ';')) {
+            $result.Reason = "missing separator after size at offset $offset"; return $result
+        }
 
         if ($size -lt 0 -or ($offset + $size) -gt $bytes.Length) { $result.Reason = "record data length $size is out of range"; return $result }
         $data = New-Object byte[] $size
         if ($size -gt 0) { [Array]::Copy($bytes, $offset, $data, 0, $size) }
         $offset += $size
 
-        if ($unicode.GetString($bytes, $offset, 2) -ne ']') { $result.Reason = "missing record terminator at offset $offset"; return $result }
-        $offset += 2
+        if (-not (Test-PolicyFileSeparator -Bytes $bytes -Offset ([ref]$offset) -Expected ']')) {
+            $result.Reason = "missing record terminator at offset $offset"; return $result
+        }
 
         [void]$records.Add([PSCustomObject]@{ Key = $key; ValueName = $valueName; Type = $type; Data = $data })
     }
@@ -488,34 +526,33 @@ function Write-PolicyFileRecord {
 
     $unicode = [System.Text.Encoding]::Unicode
     $stream = [System.IO.MemoryStream]::new()
+    $terminator = [byte[]]@(0, 0)
 
     $stream.Write([System.Text.Encoding]::ASCII.GetBytes('PReg'), 0, 4)
     $stream.Write([BitConverter]::GetBytes([int]$Version), 0, 4)
 
-    $writeText = {
-        param($Text)
-        $encoded = $unicode.GetBytes([string]$Text)
-        $stream.Write($encoded, 0, $encoded.Length)
-        $stream.Write(@(0, 0), 0, 2)
-    }
-    $writeSeparator = {
-        param($Character)
-        $encoded = $unicode.GetBytes([string]$Character)
-        $stream.Write($encoded, 0, $encoded.Length)
-    }
-
     foreach ($entry in $Record) {
-        & $writeSeparator '['
-        & $writeText $entry.Key
-        & $writeSeparator ';'
-        & $writeText $entry.ValueName
-        & $writeSeparator ';'
+        $open = $unicode.GetBytes('['); $stream.Write($open, 0, $open.Length)
+
+        $keyBytes = $unicode.GetBytes([string]$entry.Key)
+        $stream.Write($keyBytes, 0, $keyBytes.Length)
+        $stream.Write($terminator, 0, 2)
+
+        $sep = $unicode.GetBytes(';'); $stream.Write($sep, 0, $sep.Length)
+
+        $nameBytes = $unicode.GetBytes([string]$entry.ValueName)
+        $stream.Write($nameBytes, 0, $nameBytes.Length)
+        $stream.Write($terminator, 0, 2)
+
+        $stream.Write($sep, 0, $sep.Length)
         $stream.Write([BitConverter]::GetBytes([int]$entry.Type), 0, 4)
-        & $writeSeparator ';'
+        $stream.Write($sep, 0, $sep.Length)
         $stream.Write([BitConverter]::GetBytes([int]$entry.Data.Length), 0, 4)
-        & $writeSeparator ';'
+        $stream.Write($sep, 0, $sep.Length)
+
         if ($entry.Data.Length -gt 0) { $stream.Write($entry.Data, 0, $entry.Data.Length) }
-        & $writeSeparator ']'
+
+        $close = $unicode.GetBytes(']'); $stream.Write($close, 0, $close.Length)
     }
 
     [System.IO.File]::WriteAllBytes($Path, $stream.ToArray())
