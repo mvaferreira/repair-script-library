@@ -373,36 +373,44 @@ function Get-AppLockerAppliedPolicy {
 function Get-AppLockerGpoSource {
     <#
     .SYNOPSIS
-        Names the Group Policy objects that carry AppLocker settings on this disk.
+        Names the Group Policy objects that were applied to this disk. Context only.
 
     .DESCRIPTION
-        The Group Policy client keeps a per-GPO history under
-        SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History\<index>\<GUID>, where each
-        entry records the GPO's DisplayName and its DSPath. A DSPath containing "LDAP://" means the
-        GPO came from a domain, which is the case this script cannot fix at source.
+        The Group Policy client keeps a history under
+        SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History\<CSE GUID>\<index>, where
+        each entry records the GPO's DisplayName, its GPOName (the GPO's own GUID) and its DSPath.
+        A DSPath containing "LDAP://" means the GPO came from a domain.
 
-        The extension-specific history under the AppLocker CSE GUID is preferred, because a GPO
-        listed there is one that actually delivered AppLocker settings rather than merely applying
-        to the machine.
+        Note what this does NOT tell us. The same GPO appears once per client side extension that
+        delivered settings, so identity has to come from GPOName - the <index> is only a position
+        within one extension and repeats across extensions. Measured on a Server 2022 disk:
+        History\{35378EAC-...}\0 and History\{827D319E-...}\0 are both the Default Domain Policy,
+        so keying on the index would have silently discarded one GPO.
+
+        There is also no reliable way here to say which of these GPOs carries the AppLocker policy.
+        The per-GPO cache under Group Policy\Objects would answer it, but that key is simply absent
+        on the disk measured. So these names are reported as context for the engineer, never as an
+        accusation that a particular GPO is at fault, and never as a finding.
 
     .OUTPUTS
         Array of PSCustomObject with Guid, DisplayName, DSPath and IsDomain.
     #>
 
     $historyRoot = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History'
-    $found = @{}
+    $found = [ordered]@{}
 
     if (Test-Path $historyRoot) {
         foreach ($extension in @(Get-ChildItem -Path $historyRoot -ErrorAction SilentlyContinue)) {
-            foreach ($gpo in @(Get-ChildItem -Path $extension.PSPath -ErrorAction SilentlyContinue)) {
-                $displayName = [string](Get-OfflineRegistryValue -Path $gpo.PSPath -Name 'DisplayName')
-                $dsPath = [string](Get-OfflineRegistryValue -Path $gpo.PSPath -Name 'DSPath')
+            foreach ($entry in @(Get-ChildItem -Path $extension.PSPath -ErrorAction SilentlyContinue)) {
+                $displayName = [string](Get-OfflineRegistryValue -Path $entry.PSPath -Name 'DisplayName')
+                $dsPath = [string](Get-OfflineRegistryValue -Path $entry.PSPath -Name 'DSPath')
+                $gpoName = [string](Get-OfflineRegistryValue -Path $entry.PSPath -Name 'GPOName')
                 if ([string]::IsNullOrWhiteSpace($displayName) -and [string]::IsNullOrWhiteSpace($dsPath)) { continue }
 
-                $guid = $gpo.PSChildName
-                if ($found.ContainsKey($guid)) { continue }
-                $found[$guid] = [PSCustomObject]@{
-                    Guid        = $guid
+                $identity = if ($gpoName) { $gpoName } else { "$($extension.PSChildName)\$($entry.PSChildName)" }
+                if ($found.Contains($identity)) { continue }
+                $found[$identity] = [PSCustomObject]@{
+                    Guid        = $identity
                     DisplayName = $(if ($displayName) { $displayName } else { '(unnamed)' })
                     DSPath      = $dsPath
                     IsDomain    = ($dsPath -match '(?i)LDAP://')
@@ -1130,8 +1138,20 @@ try {
     else { "$($localPolicy.AppLockerRecordCount) AppLocker record(s) of $($localPolicy.RecordCount)" }
     Log-Info "Local Group Policy file: $localPolicySummary." | Tee-Object -FilePath $logFile -Append
 
+    # Full per-GPO detail goes to the detail log only. The returned log is capped at 4 KB and
+    # truncated from the start, so one line per GPO would push the findings off the top on any
+    # real domain member.
     foreach ($gpo in @($context.GpoSource)) {
-        Log-Info "Group Policy history: '$($gpo.DisplayName)' $($gpo.Guid) $(if ($gpo.IsDomain) { "from the domain ($($gpo.DSPath))" } else { 'local' })" | Tee-Object -FilePath $logFile -Append
+        "Group Policy history: '$($gpo.DisplayName)' $($gpo.Guid) $(if ($gpo.IsDomain) { "from the domain ($($gpo.DSPath))" } else { 'local' })" |
+            Out-File -FilePath $logFile -Append
+    }
+
+    $domainGpo = @($context.GpoSource | Where-Object { $_.IsDomain })
+    if ($policy.Present -and $domainGpo.Count -gt 0) {
+        $names = @($domainGpo | Select-Object -First 4 | ForEach-Object { "'$($_.DisplayName)'" }) -join ', '
+        $more = if ($domainGpo.Count -gt 4) { " and $($domainGpo.Count - 4) more" } else { '' }
+        Log-Info "$($domainGpo.Count) domain GPO(s) apply to this machine ($names$more). Which one carries AppLocker cannot be told from this disk. No GPO was changed - if the policy is domain sourced it will return at the next refresh and has to be fixed in the domain." |
+            Tee-Object -FilePath $logFile -Append
     }
 
     if ($context.Lsa.RunAsPPL) {
