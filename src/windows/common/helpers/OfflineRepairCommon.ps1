@@ -224,3 +224,96 @@ function Test-OfflineFileSignature {
 
     return $result
 }
+
+function Get-OfflineSecureBootState {
+    <#
+    .SYNOPSIS
+        Reads the Secure Boot state the guest last booted with, from the Measured Boot log.
+
+    .DESCRIPTION
+        The obvious source, Control\SecureBoot\State\UEFISecureBootEnabled, does not work offline.
+        That key is volatile: Windows recreates it from the firmware at every boot and never writes
+        it to the SYSTEM hive file. Saving and reloading the hive on a running Server 2022 VM shows
+        AvailableUpdates, SBAT and Servicing surviving while State disappears, so an attached disk
+        never carries it. On a Generation 1 VM the key does not exist even while running.
+
+        The firmware measures the EFI_GLOBAL_VARIABLE "SecureBoot" - a single byte, 0 or 1 - into
+        PCR[7], and Windows writes the whole TCG log to Windows\Logs\MeasuredBoot at every boot.
+        That is an ordinary file on the Windows partition, so it can simply be read.
+
+        The record is UEFI_VARIABLE_DATA from the TCG PC Client Platform Firmware Profile:
+
+            EFI_GUID VariableName;       // +0,  16 bytes
+            UINT64   UnicodeNameLength;  // +16, in CHAR16 units
+            UINT64   VariableDataLength; // +24, in bytes
+            CHAR16   UnicodeName[];      // +32
+            INT8     VariableData[];     // the state byte
+
+        An absent or empty log is reported as unknown rather than as "off". Azure allows Secure Boot
+        to be enabled with the vTPM disabled, and such a VM writes no Measured Boot log at all while
+        still having Secure Boot on, so absence proves nothing.
+
+    .OUTPUTS
+        PSCustomObject with Known, Enabled, Source and MeasuredUtc.
+    #>
+    param([Parameter(Mandatory = $true)][string]$WindowsDrive)
+
+    $result = [PSCustomObject]@{ Known = $false; Enabled = $false; Source = ''; MeasuredUtc = $null }
+
+    $logDir = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\Logs\MeasuredBoot'
+    if (-not (Test-OfflinePath $logDir)) {
+        $result.Source = 'no Measured Boot log folder'
+        return $result
+    }
+
+    $logs = @(Get-ChildItem -LiteralPath $logDir -Filter '*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    if ($logs.Count -eq 0) {
+        $result.Source = 'the Measured Boot log folder is empty'
+        return $result
+    }
+
+    # EFI_GLOBAL_VARIABLE {8BE4DF61-93CA-11D2-AA0D-00E098032B8C}, in the little-endian order the
+    # first three fields of an EFI_GUID are actually stored in.
+    $guid = [byte[]]@(0x61, 0xDF, 0xE4, 0x8B, 0xCA, 0x93, 0xD2, 0x11, 0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C)
+
+    foreach ($log in ($logs | Select-Object -First 3)) {
+        try { $bytes = [System.IO.File]::ReadAllBytes($log.FullName) }
+        catch {
+            Add-OfflineRepairLog -Level Info -Message "Could not read the Measured Boot log $($log.Name): $($_.Exception.Message)"
+            continue
+        }
+
+        for ($i = 0; $i -le $bytes.Length - 64; $i++) {
+            if ($bytes[$i] -ne $guid[0]) { continue }
+
+            $matched = $true
+            for ($j = 1; $j -lt 16; $j++) {
+                if ($bytes[$i + $j] -ne $guid[$j]) { $matched = $false; break }
+            }
+            if (-not $matched) { continue }
+
+            $nameLength = [BitConverter]::ToUInt64($bytes, $i + 16)
+            $dataLength = [BitConverter]::ToUInt64($bytes, $i + 24)
+
+            # Guards against a random 16-byte run that happens to match the GUID. A real record
+            # names a variable of a few characters and carries a byte or two of data.
+            if ($nameLength -eq 0 -or $nameLength -gt 64) { continue }
+            if ($dataLength -lt 1 -or $dataLength -gt 65536) { continue }
+            if (($i + 32 + ($nameLength * 2) + $dataLength) -gt $bytes.Length) { continue }
+
+            $nameBytes = New-Object byte[] ($nameLength * 2)
+            [Array]::Copy($bytes, $i + 32, $nameBytes, 0, $nameLength * 2)
+            if ([System.Text.Encoding]::Unicode.GetString($nameBytes) -ne 'SecureBoot') { continue }
+
+            $result.Known = $true
+            $result.Enabled = ($bytes[$i + 32 + ($nameLength * 2)] -eq 1)
+            $result.Source = "Measured Boot log $($log.Name)"
+            $result.MeasuredUtc = $log.LastWriteTimeUtc
+            return $result
+        }
+    }
+
+    $result.Source = 'the SecureBoot variable was not present in the most recent Measured Boot logs'
+    return $result
+}

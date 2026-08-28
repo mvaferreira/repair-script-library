@@ -82,7 +82,7 @@
 	{
 		"id" : "win-fix-code-integrity",
 		"path" : "src/windows/win-fix-code-integrity.ps1",
-		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit, a portable executable scan for writable and executable sections as corroboration, and the offline Secure Boot state to prove a test signing conflict. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
+		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit and a portable executable scan for writable and executable sections as corroboration. The offline Secure Boot state, read from the Measured Boot log, and any testsigning or nointegritychecks override are reported as context only: measurement shows the boot manager drops those overrides and the guest still boots, so they are not treated as a fault. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
 	},
 	{
 		"id" : "win-fix-secure-boot",
