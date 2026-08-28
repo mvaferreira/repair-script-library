@@ -197,6 +197,52 @@ function New-Finding {
     }
 }
 
+function Get-OfflineRegistryValue {
+    <#
+    .SYNOPSIS
+        Reads a single registry value from the offline hive without using Get-ItemProperty.
+
+    .DESCRIPTION
+        Get-ItemProperty is not safe here. On a real domain joined disk the Group Policy history
+        keys carry an lParam value that makes the Windows PowerShell 5.1 registry provider throw
+        InvalidCastException, and because that is a terminating exception from inside the provider,
+        -ErrorAction SilentlyContinue does not suppress it - it takes the whole run down. Measured
+        on a Server 2022 disk: every history key failed through the provider and every one of them
+        read correctly through the .NET API below.
+
+        Reading one named value at a time through Microsoft.Win32.Registry also means an unrelated
+        unreadable value in the same key cannot stop us reading the value we actually want.
+
+    .PARAMETER Path
+        Registry path under HKLM. Accepts the PowerShell drive form (HKLM:\Foo), the provider
+        qualified form returned by Get-ChildItem, or a bare subkey path.
+
+    .PARAMETER Name
+        Value name. Use an empty string for the key's default value.
+
+    .OUTPUTS
+        The value, or $null if the key, the value, or the permission to read it is missing.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name
+    )
+
+    $subKey = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+    $subKey = $subKey -replace '^HKEY_LOCAL_MACHINE\\?', ''
+    $subKey = $subKey -replace '^HKLM:\\?', ''
+    $subKey = $subKey.TrimStart('\')
+
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKey)
+        if ($null -eq $key) { return $null }
+        return $key.GetValue($Name, $null)
+    }
+    catch { return $null }
+    finally { if ($null -ne $key) { $key.Close() } }
+}
+
 function ConvertFrom-AppLockerRuleXml {
     <#
     .SYNOPSIS
@@ -294,13 +340,13 @@ function Get-AppLockerAppliedPolicy {
         $key = Join-Path $script:SrpAppliedKey $name
         if (-not (Test-Path $key)) { continue }
 
-        $mode = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).EnforcementMode
+        $mode = Get-OfflineRegistryValue -Path $key -Name 'EnforcementMode'
         $mode = if ($null -eq $mode) { 0 } else { [int]$mode }
 
         $rules = [System.Collections.Generic.List[PSCustomObject]]::new()
         $unparsed = 0
         foreach ($child in @(Get-ChildItem -Path $key -ErrorAction SilentlyContinue)) {
-            $value = (Get-ItemProperty -Path $child.PSPath -ErrorAction SilentlyContinue).Value
+            $value = Get-OfflineRegistryValue -Path $child.PSPath -Name 'Value'
             $rule = ConvertFrom-AppLockerRuleXml -Xml ([string]$value)
             if ($null -eq $rule) { $unparsed++; continue }
             Add-Member -InputObject $rule -NotePropertyName 'KeyPath' -NotePropertyValue $child.PSPath
@@ -349,9 +395,8 @@ function Get-AppLockerGpoSource {
     if (Test-Path $historyRoot) {
         foreach ($extension in @(Get-ChildItem -Path $historyRoot -ErrorAction SilentlyContinue)) {
             foreach ($gpo in @(Get-ChildItem -Path $extension.PSPath -ErrorAction SilentlyContinue)) {
-                $properties = Get-ItemProperty -Path $gpo.PSPath -ErrorAction SilentlyContinue
-                $displayName = [string]$properties.DisplayName
-                $dsPath = [string]$properties.DSPath
+                $displayName = [string](Get-OfflineRegistryValue -Path $gpo.PSPath -Name 'DisplayName')
+                $dsPath = [string](Get-OfflineRegistryValue -Path $gpo.PSPath -Name 'DSPath')
                 if ([string]::IsNullOrWhiteSpace($displayName) -and [string]::IsNullOrWhiteSpace($dsPath)) { continue }
 
                 $guid = $gpo.PSChildName
@@ -709,7 +754,7 @@ function Get-AppIdServiceState {
 
     $key = "$SystemRoot\Services\AppIDSvc"
     $start = $null
-    if (Test-Path $key) { $start = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).Start }
+    if (Test-Path $key) { $start = Get-OfflineRegistryValue -Path $key -Name 'Start' }
 
     $label = switch ($start) {
         0 { 'Boot' } 1 { 'System' } 2 { 'Automatic' } 3 { 'Manual/trigger' } 4 { 'Disabled' }
@@ -735,14 +780,13 @@ function Get-LsaProtectionState {
     )
 
     $key = "$SystemRoot\Control\Lsa"
-    $properties = if (Test-Path $key) { Get-ItemProperty -Path $key -ErrorAction SilentlyContinue } else { $null }
 
     return [PSCustomObject]@{
         KeyPath      = $key
         Present      = (Test-Path $key)
-        RunAsPPL     = $properties.RunAsPPL
-        RunAsPPLBoot = $properties.RunAsPPLBoot
-        LsaCfgFlags  = $properties.LsaCfgFlags
+        RunAsPPL     = (Get-OfflineRegistryValue -Path $key -Name 'RunAsPPL')
+        RunAsPPLBoot = (Get-OfflineRegistryValue -Path $key -Name 'RunAsPPLBoot')
+        LsaCfgFlags  = (Get-OfflineRegistryValue -Path $key -Name 'LsaCfgFlags')
     }
 }
 
