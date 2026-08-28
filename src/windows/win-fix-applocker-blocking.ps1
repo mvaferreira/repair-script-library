@@ -829,7 +829,8 @@ function Get-AllFinding {
     .DESCRIPTION
         AppLocker being configured, or enforcing, is deliberately absent from this function. A
         collection only becomes a finding when it provably refuses Windows' own binaries: through a
-        Deny rule that covers them, through an allowlist that does not, or through being empty.
+        Deny rule that covers them, or through an allowlist that does not allow them. An enforcing
+        collection holding no rules allows everything, so it is not a fault.
     #>
     param(
         [Parameter(Mandatory = $true)]$Policy,
@@ -850,23 +851,30 @@ function Get-AllFinding {
                         -Data ([PSCustomObject]@{ Kind = 'Rule'; Collection = $collection; Rule = $rule }))) 
         }
 
-        if ($denyRules.Count -gt 0) { continue }
+        # The allowlist test has to be made against the rules that will still be there once the
+        # Deny rules above are removed, not against the rules present now. Removing a Deny rule
+        # does not necessarily unblock the collection: if what is left is an enforcing allowlist
+        # that never names the Windows directory, Windows' own binaries are still refused. Judging
+        # the collection as it stands would report only the Deny rule, "repair" it, and hand back a
+        # VM that still cannot boot - which is exactly what a first run of this script did.
+        $remainingRules = @($collection.Rules | Where-Object { $denyRules -notcontains $_ })
 
         # An enforcing collection with no rules allows everything, so it is not a fault. Only a
         # collection that holds rules becomes an allowlist, and only then can it deny Windows.
-        if ($collection.Rules.Count -eq 0) { continue }
+        if ($remainingRules.Count -eq 0) { continue }
 
-        $allowsSystem = @($collection.Rules | Where-Object {
+        $allowsSystem = @($remainingRules | Where-Object {
                 $_.Action -eq 'Allow' -and (Test-AppLockerPathCoversSystem -Path $_.Paths) -and (Test-AppLockerSidIsBroad -Sid $_.Sid)
             }).Count -gt 0
 
         # A publisher or hash rule can legitimately allow Windows binaries without naming a path, so
         # an allowlist built that way is not called out unless the log proves something was denied.
-        $hasNonPathAllow = @($collection.Rules | Where-Object { $_.Action -eq 'Allow' -and $_.Type -ne 'FilePathRule' }).Count -gt 0
+        $hasNonPathAllow = @($remainingRules | Where-Object { $_.Action -eq 'Allow' -and $_.Type -ne 'FilePathRule' }).Count -gt 0
 
         if (-not $allowsSystem -and -not $hasNonPathAllow) {
+            $afterDeny = if ($denyRules.Count -gt 0) { " once the $($denyRules.Count) Deny rule(s) above are removed" } else { '' }
             [void]$findings.Add((New-Finding -Cause 'NoSystemAllowRule' -Item $collection.Name `
-                        -Message "The $($collection.Name) collection is set to Enforce and has $($collection.Rules.Count) rule(s), but none of them allows the Windows directory. Once a collection holds any rule it becomes an allowlist, so anything unmatched is denied and Windows' own binaries cannot run in a user session. Moving this collection to AuditOnly stops the blocking, keeps every rule, and keeps logging what it would have denied." `
+                        -Message "The $($collection.Name) collection is set to Enforce and is left with $($remainingRules.Count) rule(s)$afterDeny, none of which allows the Windows directory. Once a collection holds any rule it becomes an allowlist, so anything unmatched is denied and Windows' own binaries cannot run in a user session. Moving this collection to AuditOnly stops the blocking, keeps every rule, and keeps logging what it would have denied." `
                         -Data ([PSCustomObject]@{ Kind = 'Collection'; Collection = $collection; TargetMode = 2 })))
         }
     }
