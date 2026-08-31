@@ -19,15 +19,26 @@
 #   actions, and then clears the markers the boot path reads to decide there is servicing work
 #   outstanding:
 #     1. WinSxS\pending.xml, the manifest of the operations the next boot is expected to finish.
-#     2. The Component Based Servicing keys PackagesPending, RebootPending and RebootInProgress.
+#     2. Control\Session Manager\SetupExecute, the hook smss.exe reads to launch poqexec.exe against
+#        that manifest. A healthy installation carries this as an empty REG_MULTI_SZ. It is cleared
+#        both when it was already stale and when this run is what made it stale by renaming
+#        pending.xml aside - leaving it set is what turns this repair into a boot stopper.
+#     3. The Component Based Servicing keys PackagesPending, RebootPending and RebootInProgress.
 #        CBS\SessionsPending is read but never removed: a healthy image carries one completed record
 #        per servicing session there, so only a session that never reached Complete=1 is reported,
 #        and the records themselves are history this script does not rewrite.
-#     3. The COMPONENTS values that record an interrupted transaction - ExecutionState,
+#     4. The COMPONENTS values that record an interrupted transaction - ExecutionState,
 #        PendingXmlIdentifier, NextQueueEntryIndex, NextQueueEntryIndexBCDB,
 #        AdvancedInstallersNeedResolving and StoreDirty.
-#     4. The transactional registry logs under System32\config\TxR, which hold the uncommitted
+#     5. The transactional registry logs under System32\config\TxR, which hold the uncommitted
 #        registry side of that same transaction.
+#
+#   A leftover SetupExecute is worth calling out because it presents differently from the boot loop
+#   above and leaves no other marker behind. smss.exe runs the hook before the Event Log service
+#   starts, so a VM stopped there writes nothing about it: the console shows a black screen with a
+#   spinner rather than "Undoing changes", the guest agent never reports Ready, extension operations
+#   wedge, and the newest event in System.evtx is from the previous boot. Every servicing marker
+#   reads clean, because the transaction really did finish - only the hook was left behind.
 #
 #   Everything is driven by evidence. The script reports every marker it finds before it changes
 #   anything, and if it finds none it changes nothing and says so - which is the answer an operator
@@ -243,6 +254,20 @@ $script:CbsTailLine = 4000
 
 $script:CbsSoftwareKey = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
 $script:ComponentsKey = 'HKLM:\BROKENCOMPONENTS'
+
+# Session Manager runs SetupExecute before anything else in the boot chain, and servicing points it
+# at poqexec.exe to finish the operations listed in pending.xml. Windows clears the value when the
+# operation completes, so on a healthy installation it is an empty REG_MULTI_SZ - measured against a
+# freshly deployed Server 2022 marketplace image, which reports exactly that.
+#
+# A value left behind with no pending.xml to read is a boot stopper of its own. smss.exe launches
+# poqexec against a manifest that is not there and the boot goes no further, which lands before the
+# Event Log service starts, so the VM writes nothing about it: the console shows a black screen with
+# a spinner, the guest agent never reports Ready, extensions wedge, and the newest event in
+# System.evtx is from the previous boot. Nothing in the CBS or COMPONENTS markers records this, so
+# without checking the value directly the disk reads as perfectly clean.
+$script:SessionManagerSubKey = 'Control\Session Manager'
+$script:SetupExecuteValue = 'SetupExecute'
 
 function New-Finding {
     <#
@@ -462,6 +487,37 @@ function Get-WindowsUpdateServiceState {
     return @($state)
 }
 
+function Get-SetupExecuteState {
+    <#
+    .SYNOPSIS
+        The Session Manager SetupExecute hook. Must be called with SYSTEM mounted.
+
+    .DESCRIPTION
+        Returns the raw value rather than a verdict, because whether it counts as evidence depends
+        on something this function cannot see: whether the pending.xml it names still exists. That
+        decision is made in Get-ServicingFinding with both halves in hand.
+
+        The value is REG_MULTI_SZ. An absent value and an empty one are the same thing to the boot
+        path and are reported as the same thing here.
+    #>
+    $root = Get-OfflineSystemRootPath
+    $path = "$root\$script:SessionManagerSubKey"
+
+    if (-not (Test-Path $path)) {
+        return [PSCustomObject]@{ KeyPresent = $false; Path = $path; Entries = @(); Set = $false }
+    }
+
+    $raw = (Get-ItemProperty $path -ErrorAction SilentlyContinue).$script:SetupExecuteValue
+    $entries = @(@($raw) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    return [PSCustomObject]@{
+        KeyPresent = $true
+        Path       = $path
+        Entries    = $entries
+        Set        = ($entries.Count -gt 0)
+    }
+}
+
 function Get-DismPendingPackage {
     <#
     .SYNOPSIS
@@ -560,13 +616,24 @@ function Get-ServicingFinding {
     param(
         [Parameter(Mandatory = $true)][bool]$HasPendingXml,
         [Parameter(Mandatory = $false)][long]$PendingXmlSize = 0,
-        [Parameter(Mandatory = $true)]$RegistryState
+        [Parameter(Mandatory = $true)]$RegistryState,
+        [Parameter(Mandatory = $false)]$SetupExecuteState = $null
     )
 
     $findings = [System.Collections.Generic.List[object]]::new()
 
     if ($HasPendingXml) {
         [void]$findings.Add((New-Finding -Marker 'WinSxS\pending.xml' -Detail "present, $PendingXmlSize byte(s)"))
+    }
+
+    # SetupExecute counts only when the manifest it points at is gone. With pending.xml present the
+    # hook is doing its job and describes real outstanding work, which the finding above already
+    # covers; clearing it there would strand the operation rather than finish it. With pending.xml
+    # absent nothing can satisfy the hook and Session Manager has no way past it.
+    if ($SetupExecuteState -and $SetupExecuteState.Set -and -not $HasPendingXml) {
+        [void]$findings.Add((New-Finding -Marker "$script:SessionManagerSubKey\$script:SetupExecuteValue" `
+                    -Detail "set to '$($SetupExecuteState.Entries -join ' | ')' with no pending.xml for it to read" `
+                    -Kind 'SetupExecute'))
     }
 
     foreach ($key in $script:PendingCbsKey) {
@@ -654,6 +721,9 @@ function Write-RevertManifest {
         if ([string]::IsNullOrEmpty($Manifest.TxRBackupFolder) -and $existing.TxRBackupFolder) {
             $Manifest.TxRBackupFolder = $existing.TxRBackupFolder
         }
+        if (-not @($Manifest.SetupExecute).Count -and @($existing.SetupExecute).Count) {
+            $Manifest.SetupExecute = $existing.SetupExecute
+        }
 
         $known = @(@($Manifest.Services) | ForEach-Object { $_.Service })
         $carried = @(@($existing.Services) | Where-Object { $known -notcontains $_.Service })
@@ -725,6 +795,32 @@ try {
         # $script:RevertCount is used because the hive script block runs in a child scope.
         $restored = [int]$script:RevertCount
 
+        $setupExecuteOriginal = @(@($manifest.SetupExecute) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($setupExecuteOriginal.Count -gt 0) {
+            $script:SetupExecuteRestored = $false
+            # Passed through a script-scoped variable rather than $using:, which is only valid in a
+            # remote or job script block. Invoke-WithHive runs this one locally in a child scope.
+            $script:SetupExecuteToRestore = [string[]]$setupExecuteOriginal
+            Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+                $state = Get-SetupExecuteState
+                if (-not $state.KeyPresent) {
+                    Add-OfflineRepairLog -Level Warning -Message "$script:SessionManagerSubKey is no longer present, so $script:SetupExecuteValue was not restored."
+                    return
+                }
+                Set-ItemProperty -Path $state.Path -Name $script:SetupExecuteValue -Value $script:SetupExecuteToRestore -Type MultiString -Force -ErrorAction Stop
+                $after = Get-SetupExecuteState
+                if ($after.Set) {
+                    $script:SetupExecuteRestored = $true
+                    Add-OfflineRepairLog -Level Info -Message "Restored $script:SessionManagerSubKey\$script:SetupExecuteValue to '$($after.Entries -join ' | ')'."
+                }
+                else {
+                    Add-OfflineRepairLog -Level Error -Message "$script:SetupExecuteValue reads back empty after the restore. It was NOT restored."
+                }
+            }
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            if ($script:SetupExecuteRestored) { $restored++ }
+        }
+
         if ($manifest.PendingXmlRenamedTo -and (Test-Path -LiteralPath $manifest.PendingXmlRenamedTo)) {
             if (Test-Path -LiteralPath $pendingXmlPath) {
                 Log-Warning "pending.xml already exists again, so $($manifest.PendingXmlRenamedTo) was left in place." | Tee-Object -FilePath $logFile -Append
@@ -778,7 +874,12 @@ try {
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $findings = Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState
+    $setupExecute = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+        return (Get-SetupExecuteState)
+    }
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+    $findings = Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState -SetupExecuteState $setupExecute
 
     $txr = Get-TxRState -WindowsPath $offline.WindowsPath
 
@@ -809,7 +910,11 @@ try {
         }
     }
     else {
-        Log-Info 'No servicing pending markers are present: pending.xml is absent, the CBS pending keys do not exist, every recorded servicing session completed, and the COMPONENTS transaction values are unset or zero.' | Tee-Object -FilePath $logFile -Append
+        Log-Info 'No servicing pending markers are present: pending.xml is absent, the CBS pending keys do not exist, every recorded servicing session completed, the COMPONENTS transaction values are unset or zero, and Session Manager holds no leftover SetupExecute hook.' | Tee-Object -FilePath $logFile -Append
+    }
+
+    if ($setupExecute.Set -and $hasPendingXml) {
+        Log-Info "Session Manager SetupExecute is set to '$($setupExecute.Entries -join ' | ')'. pending.xml is present, so the hook still has a manifest to read and is not a fault on its own. It is cleared alongside that manifest, because renaming pending.xml aside while leaving the hook set is what turns a servicing repair into a boot stopper." | Tee-Object -FilePath $logFile -Append
     }
 
     if ($txr.Present) {
@@ -851,17 +956,22 @@ try {
     # ---------------------------------------------------------------------------------------------
     if ($isDetectOnly) {
         if ($findings.Count -gt 0) {
-            $clearable = @($findings | Where-Object { $_.Kind -ne 'Session' }).Count
-            $sessions = @($findings).Count - $clearable
-            Log-Output "$clearable servicing marker(s) would be cleared, and DISM would be asked to revert the pending actions." | Tee-Object -FilePath $logFile -Append
+            $clearable = @($findings | Where-Object { $_.Kind -notin @('Session', 'SetupExecute') }).Count
+            $sessions = @($findings | Where-Object { $_.Kind -eq 'Session' }).Count
+            if ($clearable -gt 0) {
+                Log-Output "$clearable servicing marker(s) would be cleared, and DISM would be asked to revert the pending actions." | Tee-Object -FilePath $logFile -Append
+            }
             if ($sessions -gt 0) {
                 Log-Output "$sessions incomplete servicing session(s) would be left in place for DISM to resolve. Their records are history this script does not rewrite." | Tee-Object -FilePath $logFile -Append
             }
         }
+        if ($setupExecute.Set) {
+            Log-Output "Session Manager $script:SetupExecuteValue would be cleared to the empty value a healthy installation carries, so smss.exe stops launching poqexec.exe at boot." | Tee-Object -FilePath $logFile -Append
+        }
         if ($clearTxR) {
             Log-Output "$(@($txr.Files).Count) TxR transaction file(s) would be backed up and removed, and the removal verified before the run is called a success." | Tee-Object -FilePath $logFile -Append
         }
-        if ($findings.Count -eq 0 -and -not $clearTxR) {
+        if ($findings.Count -eq 0 -and -not $clearTxR -and -not $setupExecute.Set) {
             Log-Output 'Nothing would be changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
         }
         if ($doDisableWindowsUpdate) {
@@ -872,7 +982,7 @@ try {
         return $STATUS_SUCCESS
     }
 
-    if ($findings.Count -eq 0 -and -not $clearTxR -and -not $doDisableWindowsUpdate) {
+    if ($findings.Count -eq 0 -and -not $clearTxR -and -not $doDisableWindowsUpdate -and -not $setupExecute.Set) {
         Log-Output 'Nothing was changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
         Log-Output 'win-fix-inaccessible-boot-device covers a stop 0x7B, win-fix-registry-corruption covers a damaged hive, and win-sfc-sf-corruption covers damaged system files.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -888,9 +998,11 @@ try {
         Services            = @()
         PendingXmlRenamedTo = ''
         TxRBackupFolder     = ''
+        SetupExecute        = $null
     }
     $changes = 0
     $txrRemoved = 0
+    $script:SystemHiveBackedUp = $false
 
     if ($findings.Count -gt 0) {
         $softwareBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
@@ -978,6 +1090,68 @@ try {
     }
 
     # ---------------------------------------------------------------------------------------------
+    # Session Manager SetupExecute
+    #
+    # Outside the findings block on purpose. The hook has to be cleared in both of the cases that
+    # reach here, and only one of them is a finding:
+    #   1. pending.xml was already gone. The hook is stale, it is the finding, and it is the whole
+    #      reason the VM will not boot.
+    #   2. pending.xml was present and has just been renamed aside above. The hook was legitimate a
+    #      moment ago and is stale now, because this run is what removed the file it reads. Leaving
+    #      it set would hand the VM back with a boot stopper this script created.
+    #
+    # It runs after the rename for that reason, so case 2 is decided on what the disk looks like
+    # when the repair is finished rather than when it started.
+    # ---------------------------------------------------------------------------------------------
+    if ($setupExecute.Set) {
+        $script:SetupExecuteCleared = $false
+        $original = @($setupExecute.Entries)
+
+        if (-not $script:SystemHiveBackedUp) {
+            $systemBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SYSTEM'
+            Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
+            $script:SystemHiveBackedUp = $true
+        }
+
+        Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            $state = Get-SetupExecuteState
+            if (-not $state.KeyPresent) {
+                Add-OfflineRepairLog -Level Warning -Message "$script:SessionManagerSubKey is not present on this disk, so $script:SetupExecuteValue could not be cleared."
+                return
+            }
+            if (-not $state.Set) {
+                Add-OfflineRepairLog -Level Info -Message "$script:SetupExecuteValue is already empty, so there was nothing to clear."
+                return
+            }
+
+            $was = ($state.Entries -join ' | ')
+
+            # Set to an empty REG_MULTI_SZ rather than deleting the value. That is what a healthy
+            # installation carries - measured on a freshly deployed Server 2022 image - and Session
+            # Manager reads the value's contents, not its presence.
+            Set-ItemProperty -Path $state.Path -Name $script:SetupExecuteValue -Value ([string[]]@()) -Type MultiString -Force -ErrorAction Stop
+
+            # Read back rather than assume. This value sits in the SYSTEM hive under an ACL that can
+            # refuse a write without raising, and an operator told the hook was cleared who then
+            # reboots into the same black screen has been actively misled.
+            $after = Get-SetupExecuteState
+            if ($after.Set) {
+                Add-OfflineRepairLog -Level Error -Message "$script:SetupExecuteValue still reads back as '$($after.Entries -join ' | ')' after the write. It was NOT cleared."
+            }
+            else {
+                $script:SetupExecuteCleared = $true
+                Add-OfflineRepairLog -Level Info -Message "Cleared $script:SessionManagerSubKey\$script:SetupExecuteValue (was '$was'), verified empty on read-back. To undo: reg add `"HKLM\SYSTEM\ControlSet001\$script:SessionManagerSubKey`" /v $script:SetupExecuteValue /t REG_MULTI_SZ /d `"$was`" /f"
+            }
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if ($script:SetupExecuteCleared) {
+            $manifest.SetupExecute = $original
+            $changes++
+        }
+    }
+
+    # ---------------------------------------------------------------------------------------------
     # Transaction logs
     #
     # Deliberately after the DISM revert rather than before it. The CLFS logs under config\TxR hold
@@ -1032,8 +1206,11 @@ try {
         }
 
         if ($recorded.Count -gt 0) {
-            $systemBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SYSTEM'
-            Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
+            if (-not $script:SystemHiveBackedUp) {
+                $systemBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SYSTEM'
+                Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
+                $script:SystemHiveBackedUp = $true
+            }
 
             $script:ServiceChanges = 0
             Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
@@ -1066,7 +1243,7 @@ try {
         return $STATUS_SUCCESS
     }
 
-    if ($manifest.PendingXmlRenamedTo -or $manifest.TxRBackupFolder -or @($manifest.Services).Count -gt 0) {
+    if ($manifest.PendingXmlRenamedTo -or $manifest.TxRBackupFolder -or @($manifest.Services).Count -gt 0 -or @($manifest.SetupExecute).Count -gt 0) {
         Write-RevertManifest -Path $manifestPath -Manifest $manifest
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
@@ -1086,6 +1263,15 @@ try {
         if (Test-PendingComponentValue -Value $after.ComponentValues[$name]) { [void]$remaining.Add("COMPONENTS\$name") }
     }
 
+    # The hook is re-read for the same reason as the markers above: the SYSTEM hive carries its own
+    # ACL, Set-ItemProperty can be refused, and a summary that reports it cleared on the strength of
+    # having attempted the write would send the operator back into the same black screen.
+    $setupExecuteAfter = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+        return (Get-SetupExecuteState)
+    }
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    if ($setupExecuteAfter.Set) { [void]$remaining.Add("$script:SessionManagerSubKey\$script:SetupExecuteValue") }
+
     # Report what was actually done rather than infer it from one condition. Three things can change
     # this disk independently - the servicing markers, the transaction logs, and the Windows Update
     # services - and any combination of them is possible, because the markers and log exhaustion are
@@ -1097,10 +1283,11 @@ try {
     # CBS keys carry their own ACL, so the rename and the deletes can all be refused while the run
     # still succeeds at everything else. Claim the transaction only when the disk agrees it is gone.
     $serviceChanges = @($manifest.Services).Count
-    $markerWork = $changes - $txrRemoved - $serviceChanges
+    $setupExecuteChanges = if (@($manifest.SetupExecute).Count -gt 0) { 1 } else { 0 }
+    $markerWork = $changes - $txrRemoved - $serviceChanges - $setupExecuteChanges
 
     $did = [System.Collections.Generic.List[string]]::new()
-    if ($findings.Count -gt 0) {
+    if ($findings.Count -gt 0 -and @($findings | Where-Object { $_.Kind -ne 'SetupExecute' }).Count -gt 0) {
         if ($remaining.Count -eq 0) {
             # Either the edits landed, or the DISM revert consumed pending.xml on its own - that one
             # leaves nothing for this script to count, so trust the re-read rather than the counter.
@@ -1110,6 +1297,7 @@ try {
             [void]$did.Add('cleared part of the stuck servicing transaction')
         }
     }
+    if ($setupExecuteChanges -gt 0) { [void]$did.Add("cleared the leftover Session Manager $script:SetupExecuteValue hook") }
     if ($txrRemoved -gt 0) { [void]$did.Add("removed $txrRemoved transaction log file(s) from config\TxR") }
     if ($serviceChanges -gt 0) { [void]$did.Add("disabled $serviceChanges Windows Update service(s)") }
 
