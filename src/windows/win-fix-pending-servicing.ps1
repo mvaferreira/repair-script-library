@@ -87,8 +87,9 @@
 #
 #   Reverting deliberately puts the servicing transaction back, so a VM that was in a boot loop will
 #   go back into it. It exists for the case where this script was aimed at the wrong problem and the
-#   disk needs to be handed on unchanged. The registry keys are not restored from the manifest; they
-#   come back with the hive backup, whose path is printed in the summary.
+#   disk needs to be handed on unchanged. SetupExecute is recorded in the manifest and is restored
+#   from it; the CBS and COMPONENTS keys are not, and come back with the hive backup, whose path is
+#   printed in the summary.
 #
 # .PARAMETER windowsDrive
 #   Drive letter of the offline Windows installation, for example "F". Only needed when more than
@@ -851,7 +852,10 @@ try {
         if ($restored -gt 0) {
             Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
             Log-Output "Restored $restored item(s) and removed the manifest." | Tee-Object -FilePath $logFile -Append
-            Log-Output "The registry keys this script cleared are not restored from the manifest. Use the hive backup recorded in the log of the original run if they are needed." | Tee-Object -FilePath $logFile -Append
+            # SetupExecute is recorded in the manifest and genuinely is restored, so this caveat must not
+            # claim otherwise - it is about the CBS and COMPONENTS keys, whose prior contents the manifest
+            # does not carry. Printing it unconditionally contradicted the "Restored ..." line directly above.
+            Log-Output "The CBS and COMPONENTS registry keys this script cleared are not restored from the manifest. Use the hive backup recorded in the log of the original run if they are needed." | Tee-Object -FilePath $logFile -Append
         }
         else {
             Log-Output 'Nothing in the manifest could be restored. The manifest was left in place.' | Tee-Object -FilePath $logFile -Append
