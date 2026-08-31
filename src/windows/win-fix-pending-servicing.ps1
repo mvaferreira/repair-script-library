@@ -33,12 +33,19 @@
 #     5. The transactional registry logs under System32\config\TxR, which hold the uncommitted
 #        registry side of that same transaction.
 #
-#   A leftover SetupExecute is worth calling out because it presents differently from the boot loop
-#   above and leaves no other marker behind. smss.exe runs the hook before the Event Log service
-#   starts, so a VM stopped there writes nothing about it: the console shows a black screen with a
-#   spinner rather than "Undoing changes", the guest agent never reports Ready, extension operations
-#   wedge, and the newest event in System.evtx is from the previous boot. Every servicing marker
-#   reads clean, because the transaction really did finish - only the hook was left behind.
+#   A leftover SetupExecute is worth calling out because it leaves no other marker behind: every
+#   servicing marker reads clean, because the transaction really did finish - only the hook was left
+#   pointing at a pending.xml that is no longer there.
+#
+#   It is reported and cleared as inconsistent state, not as a boot stopper, and that distinction was
+#   measured rather than assumed. Planting exactly this value on an otherwise healthy Server 2022 and
+#   rebooting produced a completely normal boot: the guest agent reported Ready, System.evtx carried
+#   fresh 6005/6009 events, and the hook was still set afterwards. poqexec exits quietly when the
+#   manifest it is pointed at does not exist. So the hook on its own does not stop a boot and must not
+#   be described to an operator as though it does. It is still wrong, and this script clears it,
+#   because Windows leaves the value empty whenever no transaction is open, and because the repair
+#   below renames pending.xml aside - which would otherwise leave the hook aimed at a manifest this
+#   very script had just removed.
 #
 #   Everything is driven by evidence. The script reports every marker it finds before it changes
 #   anything, and if it finds none it changes nothing and says so - which is the answer an operator
@@ -261,12 +268,13 @@ $script:ComponentsKey = 'HKLM:\BROKENCOMPONENTS'
 # operation completes, so on a healthy installation it is an empty REG_MULTI_SZ - measured against a
 # freshly deployed Server 2022 marketplace image, which reports exactly that.
 #
-# A value left behind with no pending.xml to read is a boot stopper of its own. smss.exe launches
-# poqexec against a manifest that is not there and the boot goes no further, which lands before the
-# Event Log service starts, so the VM writes nothing about it: the console shows a black screen with
-# a spinner, the guest agent never reports Ready, extensions wedge, and the newest event in
-# System.evtx is from the previous boot. Nothing in the CBS or COMPONENTS markers records this, so
-# without checking the value directly the disk reads as perfectly clean.
+# A value left behind with no pending.xml to read is inconsistent state: the hook names a manifest
+# that is not there. On the evidence it is NOT a boot stopper. Planting exactly this value on a
+# healthy Server 2022 marketplace VM and rebooting produced a normal boot - agent Ready, fresh
+# 6005/6009 in System.evtx, and the hook still set afterwards - because poqexec exits quietly when
+# the manifest is missing. It is cleared because Windows itself leaves the value empty when no
+# transaction is open, and because the repair renames pending.xml aside. Nothing in the CBS or
+# COMPONENTS markers records the hook, so without reading the value directly the disk reads clean.
 $script:SessionManagerSubKey = 'Control\Session Manager'
 $script:SetupExecuteValue = 'SetupExecute'
 
@@ -630,7 +638,9 @@ function Get-ServicingFinding {
     # SetupExecute counts only when the manifest it points at is gone. With pending.xml present the
     # hook is doing its job and describes real outstanding work, which the finding above already
     # covers; clearing it there would strand the operation rather than finish it. With pending.xml
-    # absent nothing can satisfy the hook and Session Manager has no way past it.
+    # absent the hook names a manifest that is not there. Measured on a healthy Server 2022, that is
+    # inconsistent state rather than a boot stopper - poqexec exits quietly and the machine boots -
+    # but it is still not what a healthy installation carries, so it is reported and cleared.
     if ($SetupExecuteState -and $SetupExecuteState.Set -and -not $HasPendingXml) {
         [void]$findings.Add((New-Finding -Marker "$script:SessionManagerSubKey\$script:SetupExecuteValue" `
                     -Detail "set to '$($SetupExecuteState.Entries -join ' | ')' with no pending.xml for it to read" `
@@ -940,7 +950,7 @@ try {
     }
 
     if ($setupExecute.Set -and $hasPendingXml) {
-        Log-Info "Session Manager SetupExecute is set to '$($setupExecute.Entries -join ' | ')'. pending.xml is present, so the hook still has a manifest to read and is not a fault on its own. It is cleared alongside that manifest, because renaming pending.xml aside while leaving the hook set is what turns a servicing repair into a boot stopper." | Tee-Object -FilePath $logFile -Append
+        Log-Info "Session Manager SetupExecute is set to '$($setupExecute.Entries -join ' | ')'. pending.xml is present, so the hook still has a manifest to read and is not a fault on its own. It is cleared alongside that manifest, because renaming pending.xml aside while leaving the hook set would leave the value naming a file that is no longer there." | Tee-Object -FilePath $logFile -Append
     }
 
     if ($txr.Present) {
@@ -1291,7 +1301,7 @@ try {
 
     # The hook is re-read for the same reason as the markers above: the SYSTEM hive carries its own
     # ACL, Set-ItemProperty can be refused, and a summary that reports it cleared on the strength of
-    # having attempted the write would send the operator back into the same black screen.
+    # having attempted the write would leave the disk in the state the operator was told was fixed.
     $setupExecuteAfter = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
         return (Get-SetupExecuteState)
     }
