@@ -954,10 +954,13 @@ try {
     }
 
     if ($txr.Present) {
-        $why = if ($servicingFindings.Count -gt 0) { 'a servicing marker above was found' }
-        elseif ($logFull.Found) { 'CBS reported log exhaustion' }
-        else { 'neither a servicing marker nor log exhaustion was found, so they are left alone' }
-        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only because $why." | Tee-Object -FilePath $logFile -Append
+        # Built as whole sentences rather than by splicing a reason into "cleared only because ...".
+        # That phrasing produced "are cleared only because neither a servicing marker nor log
+        # exhaustion was found, so they are left alone", which says the opposite of what happens.
+        $txrNote = if ($servicingFindings.Count -gt 0) { 'They are cleared here because a servicing marker above was found.' }
+        elseif ($logFull.Found) { 'They are cleared here because CBS reported log exhaustion.' }
+        else { 'Neither a servicing marker nor CBS log exhaustion was found, so they are left alone.' }
+        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only when a stuck transaction is proven. $txrNote" | Tee-Object -FilePath $logFile -Append
     }
 
     # Name the pending packages. Evidence only; nothing here is removed by this script.
