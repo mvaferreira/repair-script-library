@@ -509,6 +509,192 @@ function Invoke-OfflineProtectedValueRemoval {
     }
 }
 
+function Test-OfflineRegistryAccessDenied {
+    <#
+    .SYNOPSIS
+        Deciding whether a failed registry operation failed because of an ACL.
+
+    .DESCRIPTION
+        An offline hive refuses an operation in two different ways depending on which layer rejects
+        it: the provider surfaces UnauthorizedAccessException, while the RegistryKey APIs raise
+        SecurityException. Either one means "the ACL said no", and only those two are worth retrying
+        behind an ownership change.
+
+        Everything else - a missing key, a wrong value type - must keep failing loudly. Retrying
+        those behind an ownership change would rewrite a security descriptor to work around a bug in
+        the caller, and then still fail.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $ex = $ErrorRecord.Exception
+    while ($ex) {
+        if ($ex -is [System.UnauthorizedAccessException] -or $ex -is [System.Security.SecurityException]) { return $true }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
+function Get-OfflineNearestExistingKey {
+    <#
+    .SYNOPSIS
+        Finding the key whose ACL actually governs an operation on a path that may not exist yet.
+
+    .DESCRIPTION
+        Setting a value needs rights on its own key, but creating a key needs rights on the nearest
+        ancestor that already exists, because that is the descriptor consulted when the first
+        missing level is created. Taking the leaf would be taking something that is not there.
+
+        Returns $null when nothing on the path exists, which for a mounted hive means the caller was
+        given a path outside it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $current = $Path
+    while ($current) {
+        if (Test-Path -LiteralPath $current) { return $current }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
+        $current = $parent
+    }
+    return $null
+}
+
+function Invoke-OfflineProtectedRegistryWrite {
+    <#
+    .SYNOPSIS
+        Writing to an offline hive key, taking the key only if the plain write is refused.
+
+    .DESCRIPTION
+        The write counterpart of Invoke-OfflineProtectedValueRemoval, and it exists for the same
+        reason: a key in an offline hive can be owned by TrustedInstaller and deny write to
+        Administrators, so a repair reports success having changed nothing.
+
+        The plain write is attempted first and the descriptor is only touched when the write is
+        actually refused. That matters more here than it does for a removal, because this sits
+        behind every value a repair sets: unconditionally rewriting a descriptor per value would be
+        slow and would be a change the guest never asked for. The overwhelming majority of writes
+        take the fast path and cost nothing.
+
+        Only the guarded key itself is taken, never its subtree. Setting a value needs KEY_SET_VALUE
+        on one key, and recursing a key like Services would rewrite the descriptor of every key
+        beneath it for no benefit.
+
+        The restore runs in a finally, so a write that fails after ownership was taken still leaves
+        the descriptor as it was found. Returns an object with Written, TookOwnership, Restored and
+        Reason.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [Parameter(Mandatory = $false)][string]$Description = 'the value'
+    )
+
+    try {
+        & $Action
+        return [PSCustomObject]@{ Written = $true; TookOwnership = $false; Restored = 0; Reason = 'Written without changing any permission.' }
+    }
+    catch {
+        $firstError = $_
+        if (-not (Test-OfflineRegistryAccessDenied -ErrorRecord $firstError)) { throw }
+    }
+
+    # Captured before anything changes so the descriptor can be replayed verbatim. A path that
+    # cannot be addressed by these APIs leaves the original access-denied error as the honest answer.
+    $guardPath = Get-OfflineNearestExistingKey -Path $Path
+    if (-not $guardPath) { throw $firstError }
+
+    Add-OfflineRepairLog -Level Info -Message "$guardPath is protected by its own ACL. Taking the key to write $Description, then putting the ACL back."
+
+    $captured = @()
+    try { $captured = @(Grant-OfflineRegistryKeyAccess -Path $guardPath -NoRecurse) }
+    catch {
+        [void](Restore-OfflineRegistrySecurity -Captured $captured)
+        return [PSCustomObject]@{ Written = $false; TookOwnership = $false; Restored = 0; Reason = "Ownership could not be taken: $($_.Exception.Message)" }
+    }
+
+    $written = $false
+    $failure = $null
+    try {
+        & $Action
+        $written = $true
+    }
+    catch { $failure = $_ }
+    finally {
+        # Always. The key is still here, so an unrestored descriptor is a permanent change to a
+        # system this script was only meant to borrow.
+        $restored = Restore-OfflineRegistrySecurity -Captured $captured
+    }
+
+    return [PSCustomObject]@{
+        Written       = $written
+        TookOwnership = $true
+        Restored      = $restored
+        Reason        = $(if ($written) { "Written after taking the key. $restored descriptor(s) were put back." }
+                          else { "The write still failed after the key was taken ($($failure.Exception.Message)). $restored descriptor(s) were put back." })
+    }
+}
+
+function Get-OfflineProtectedRegistryValue {
+    <#
+    .SYNOPSIS
+        Reading a value from an offline hive key that may deny read to Administrators.
+
+    .DESCRIPTION
+        The read counterpart of Invoke-OfflineProtectedRegistryWrite. A key locked to SYSTEM:Read
+        denies Administrators even READ_CONTROL, so reporting the current value of a guarded key
+        needs the same ownership dance the write does.
+
+        -Found distinguishes "the value is genuinely not set" from "the value could not be read",
+        which are different outcomes and must not be confused: mislabelling a locked value as absent
+        is how a repair ends up logging 'was: (not set)' about a value it never managed to see, and
+        then writing a default over something it never looked at.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $false)]$DefaultValue = $null,
+        [Parameter(Mandatory = $false)][ref]$Found,
+        [Parameter(Mandatory = $false)][ref]$Denied
+    )
+
+    if ($Found) { $Found.Value = $false }
+    if ($Denied) { $Denied.Value = $false }
+
+    $read = {
+        $props = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        if ($props -and ($props.PSObject.Properties.Name -contains $Name)) {
+            if ($Found) { $Found.Value = $true }
+            return $props.$Name
+        }
+        return $DefaultValue
+    }
+
+    try { return & $read }
+    catch {
+        if (-not (Test-OfflineRegistryAccessDenied -ErrorRecord $_)) { return $DefaultValue }
+    }
+
+    if ($Denied) { $Denied.Value = $true }
+
+    $guardPath = Get-OfflineNearestExistingKey -Path $Path
+    if (-not $guardPath) { return $DefaultValue }
+
+    $captured = @()
+    try { $captured = @(Grant-OfflineRegistryKeyAccess -Path $guardPath -NoRecurse) }
+    catch {
+        [void](Restore-OfflineRegistrySecurity -Captured $captured)
+        return $DefaultValue
+    }
+
+    try { return & $read }
+    catch { return $DefaultValue }
+    finally { [void](Restore-OfflineRegistrySecurity -Captured $captured) }
+}
+
 function Get-OfflinePathSecurity {
     <#
     .SYNOPSIS
