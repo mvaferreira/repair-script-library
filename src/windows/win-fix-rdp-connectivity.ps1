@@ -73,8 +73,12 @@
 #       NLA being enabled is the supported state and is never reported as a fault.
 #     - A non-standard listener port is reported, never reset, unless -resetListenerPort is passed.
 #       The document specifies 3389 for an image being prepared, but a deployed VM whose port was
-#       moved deliberately has a network security group that followed it, and resetting the port on
-#       one of those removes the access it was meant to restore.
+#       moved deliberately has a firewall rule and a network security group that followed it, and
+#       resetting the port on one of those removes the access it was meant to restore. Measured on
+#       a repaired VM: with the listener moved to 33890 the service started and listened on
+#       0.0.0.0:33890, and the connection was still refused, because the built-in "Remote Desktop -
+#       User Mode (TCP-In)" rule is scoped to 3389. A moved port needs its own rule at both layers,
+#       which is why this is reported for a decision rather than repaired.
 #     - The machine-wide SSL cipher suite policy is only cleared with -clearCipherSuitePolicy. It is
 #       present on a healthy Azure image, carrying the platform's intended cipher order, so deleting
 #       it on sight would strip working configuration off every machine this ran against. Only an
@@ -463,7 +467,7 @@ function Get-AllFinding {
             $portFinding = New-Finding -Cause 'ListenerPortNonStandard' -Item 'PortNumber' -Hive 'SYSTEM' -Repairable $wantResetPort -Data $TerminalServer.Port `
                 -Message "The listener is on port $($TerminalServer.Port.Value) rather than the documented $($script:StandardRdpPort)."
             if ($wantResetPort) { $portFinding.Message += " -resetListenerPort was passed, so it will be reset to $($script:StandardRdpPort)." }
-            else { $portFinding.Message += " A deployed VM may have been moved off $($script:StandardRdpPort) deliberately, with a network security group that followed it, so this was left alone. If the NSG only allows $($script:StandardRdpPort), re-run with -resetListenerPort true." }
+            else { $portFinding.Message += " This was left alone in case the port was moved deliberately. Be aware the built-in 'Remote Desktop - User Mode (TCP-In)' rule only allows $($script:StandardRdpPort), so a moved port needs its own Windows Firewall rule and a matching NSG rule; without both, the listener starts and connections are still refused. Re-run with -resetListenerPort true to move it back." }
             [void]$findings.Add($portFinding)
         }
 
