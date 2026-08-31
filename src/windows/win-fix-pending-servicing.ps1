@@ -778,7 +778,16 @@ try {
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $findings = Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState
+    # Wrapped in @() at the CALL SITE, which is the only place the wrap works. Get-ServicingFinding
+    # already ends in "return @($findings)", but that is not enough: Windows PowerShell 5.1 unrolls a
+    # returned collection, so when it holds exactly ONE finding the caller receives the bare
+    # PSCustomObject rather than an array. A PSCustomObject has no Count, so $findings.Count is $null,
+    # and $null -gt 0 and $null -eq 0 are BOTH false. Every branch below keyed on Count then takes the
+    # wrong path at once: the marker is never printed, "nothing to do" is never printed either, TxR is
+    # not cleared, and the repair block is skipped - so a disk carrying a single marker, which is the
+    # ordinary case when only pending.xml is present, is silently left unrepaired. PowerShell 7 does
+    # not reproduce this, so it cannot be caught by testing locally on pwsh; the rescue VM runs 5.1.
+    $findings = @(Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState)
 
     $txr = Get-TxRState -WindowsPath $offline.WindowsPath
 
@@ -813,10 +822,14 @@ try {
     }
 
     if ($txr.Present) {
-        $why = if ($findings.Count -gt 0) { 'a servicing marker above was found' }
-        elseif ($logFull.Found) { 'CBS reported log exhaustion' }
-        else { 'neither a servicing marker nor log exhaustion was found, so they are left alone' }
-        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only because $why." | Tee-Object -FilePath $logFile -Append
+        # Built as whole sentences rather than by splicing a reason into "cleared only because ...".
+        # That phrasing rendered, in the no-evidence branch, as "are cleared only because neither a
+        # servicing marker nor log exhaustion was found, so they are left alone" - stating both that
+        # the files were cleared and that they were not.
+        $txrNote = if ($findings.Count -gt 0) { 'They are cleared here because a servicing marker above was found.' }
+        elseif ($logFull.Found) { 'They are cleared here because CBS reported log exhaustion.' }
+        else { 'Neither a servicing marker nor CBS log exhaustion was found, so they are left alone.' }
+        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only when a stuck transaction is proven. $txrNote" | Tee-Object -FilePath $logFile -Append
     }
 
     # Name the pending packages. Evidence only; nothing here is removed by this script.
