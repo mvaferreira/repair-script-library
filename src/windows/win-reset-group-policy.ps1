@@ -82,9 +82,11 @@
 #   editing entirely. This script is for the case where that is not available - the VM will not boot
 #   far enough, or Safe Mode cannot be reached.
 #
-#   Not used here: "secedit /configure /cfg %windir%\inf\defltbase.inf". It is widely repeated as a
-#   way to reset security policy, but Microsoft declared it unsupported from Vista onward and warned
-#   it "may even result in the operating system becoming unstable".
+#   Not used here: "secedit /configure /cfg %windir%\inf\defltbase.inf". That resets security policy,
+#   including user rights, which is a different fault from the Group Policy files this script owns.
+#   It is the accepted fix for user rights left tattooed after a GPO is removed - internal TSGs cover
+#   it and it is used in the field for exactly that - but it belongs to win-fix-user-rights, gated
+#   behind detection, not to a blanket policy reset here.
 #
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
