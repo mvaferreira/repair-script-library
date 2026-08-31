@@ -41,7 +41,7 @@
 #   disk repair can or should prevent.
 #
 #   Turning AppLocker off altogether is available with -disableEnforcement true, and is
-#   deliberately not the default. It sets every collection to NotConfigured and disables the
+#   deliberately not the default. It moves every collection to AuditOnly and disables the
 #   Application Identity service. Use it only when the evidence does not name a culprit.
 #
 # .RESOLVES
@@ -63,7 +63,7 @@
 #   "true" to report the evidence and make no writes at all. Defaults to "false".
 #
 # .PARAMETER disableEnforcement
-#   "true" to set every rule collection to NotConfigured and disable the Application Identity
+#   "true" to move every rule collection to AuditOnly and disable the Application Identity
 #   service. Last resort. Defaults to "false".
 #
 # .PARAMETER disableLsaProtection
@@ -97,6 +97,16 @@
 #       matters: clearing only the applied keys leaves Registry.pol intact and the next policy
 #       refresh puts the blocking rule straight back. This script strips the SrpV2 records out of
 #       Registry.pol as well, so a local-policy repair actually holds.
+#     - The registry is not what blocks a process. The AppID PolicyConverter scheduled task
+#       compiles the applied policy into Windows\System32\AppLocker\*.AppLocker, and appid.sys
+#       enforces from those files. Measured: with SrpV2 deleted and Registry.pol back to its
+#       pristine size, a surviving Exe.AppLocker still blocked the test binary after a reboot, and
+#       the converter did not clear the stale file on its own. So the compiled cache is deleted
+#       too; it is rebuilt from the corrected policy at the next converter run.
+#     - EnforcementMode is a three-state value and the absent state is not the harmless one.
+#       Measured by effect: value absent enforces as soon as the collection holds a rule, 0 is
+#       AuditOnly and blocks nothing, 1 enforces. "NotConfigured" means the value is missing, not
+#       zero, so deleting it would make a collection stricter rather than safer.
 #     - A domain GPO leaves a client side cache under
 #       SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Objects and a history entry under
 #       ...\Group Policy\History that carries the GPO's display name and its DSPath. Both are
@@ -157,8 +167,71 @@ $script:SrpAppliedKey = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2'
 # Registry.pol and the per-GPO cache.
 $script:SrpPolicyPath = 'Software\Policies\Microsoft\Windows\SrpV2'
 
-# EnforcementMode values.
-$script:ModeName = @{ 0 = 'NotConfigured'; 1 = 'Enforce'; 2 = 'AuditOnly' }
+# EnforcementMode values, measured by effect on Server 2022 (Datacenter Azure Edition, SKU 407) by
+# running a denied binary as a standard user under each value and reading the AppLocker channel:
+#
+#   value absent - the collection ENFORCES as soon as it holds any rule (event 8004)
+#   0            - AuditOnly: rules are evaluated and logged (8003) but nothing is blocked
+#   1            - Enforce (event 8004)
+#   2            - never written by the product, and untested here
+#
+# The measurement that settles this was ordered deliberately: AuditOnly first (8003, the binary
+# ran), then NotConfigured, which blocked (8004). A stale compiled cache would have kept logging
+# 8003, so the flip to 8004 can only mean the absent value really does enforce.
+#
+# Two consequences for this script. "NotConfigured" is the ABSENCE of the value, not a value of 0,
+# so deleting EnforcementMode to reset a collection would leave it enforcing. And a collection that
+# holds rules with no EnforcementMode value is blocking, so detection must not treat it as healthy.
+$script:ModeName = @{ 0 = 'AuditOnly'; 1 = 'Enforce' }
+
+function Get-EnforcementModeName {
+    <#
+    .SYNOPSIS
+        Names an EnforcementMode value for the log, including the absent case.
+    #>
+    param($Mode)
+
+    if ($null -eq $Mode) { return 'NotConfigured (value absent - enforces while the collection holds rules)' }
+    if ($script:ModeName.ContainsKey([int]$Mode)) { return $script:ModeName[[int]$Mode] }
+    return "Unknown($Mode)"
+}
+
+function Test-CollectionEnforcing {
+    <#
+    .SYNOPSIS
+        Decides whether a rule collection is actually blocking files.
+
+    .DESCRIPTION
+        A collection with no rules blocks nothing, whatever the mode says. Beyond that, only an
+        explicit 0 is known to be safe: absent enforces and 1 enforces, both measured. Any other
+        value is undocumented, so it is reported as blocking rather than assumed harmless - the
+        cost of being wrong in that direction is a wasted look, and the cost of the other is
+        telling an engineer that a bricked VM is healthy.
+    #>
+    param($Mode, [int]$RuleCount)
+
+    if ($RuleCount -eq 0) { return $false }
+    return ($null -eq $Mode -or [int]$Mode -ne 0)
+}
+
+function Get-EnforcementModeUndoCommand {
+    <#
+    .SYNOPSIS
+        The command that puts a collection's EnforcementMode back exactly as it was.
+
+    .DESCRIPTION
+        When the value was absent, restoring it as 0 would not be a restore: 0 is AuditOnly and
+        absent enforces, so the collection would come back weaker than it started. The undo for an
+        absent value is a delete.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Collection
+    )
+
+    $key = "HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2\$($Collection.Name)"
+    if ($null -eq $Collection.Mode) { return "reg delete `"$key`" /v EnforcementMode /f" }
+    return "reg add `"$key`" /v EnforcementMode /t REG_DWORD /d $($Collection.Mode) /f"
+}
 
 # SIDs broad enough that a rule carrying one affects the logon and service paths. Everyone,
 # Authenticated Users, Users, Administrators.
@@ -340,8 +413,11 @@ function Get-AppLockerAppliedPolicy {
         $key = Join-Path $script:SrpAppliedKey $name
         if (-not (Test-Path $key)) { continue }
 
-        $mode = Get-OfflineRegistryValue -Path $key -Name 'EnforcementMode'
-        $mode = if ($null -eq $mode) { 0 } else { [int]$mode }
+        # "absent" and "0" are NOT the same thing and must not be collapsed. Measured on Server
+        # 2022: a collection holding rules with NO EnforcementMode value enforces, while 0 is
+        # AuditOnly. Coercing absent to 0 here would report a blocking disk as healthy.
+        $rawMode = Get-OfflineRegistryValue -Path $key -Name 'EnforcementMode'
+        $mode = if ($null -eq $rawMode) { $null } else { [int]$rawMode }
 
         $rules = [System.Collections.Generic.List[PSCustomObject]]::new()
         $unparsed = 0
@@ -359,8 +435,8 @@ function Get-AppLockerAppliedPolicy {
                 Name         = $name
                 KeyPath      = $key
                 Mode         = $mode
-                ModeName     = $(if ($script:ModeName.ContainsKey($mode)) { $script:ModeName[$mode] } else { "Unknown($mode)" })
-                Enforcing    = ($mode -eq 1)
+                ModeName     = Get-EnforcementModeName -Mode $mode
+                Enforcing    = (Test-CollectionEnforcing -Mode $mode -RuleCount $rules.Count)
                 Rules        = @($rules)
                 UnparsedRule = $unparsed
             })
@@ -875,7 +951,7 @@ function Get-AllFinding {
             $afterDeny = if ($denyRules.Count -gt 0) { " once the $($denyRules.Count) Deny rule(s) above are removed" } else { '' }
             [void]$findings.Add((New-Finding -Cause 'NoSystemAllowRule' -Item $collection.Name `
                         -Message "The $($collection.Name) collection is set to Enforce and is left with $($remainingRules.Count) rule(s)$afterDeny, none of which allows the Windows directory. Once a collection holds any rule it becomes an allowlist, so anything unmatched is denied and Windows' own binaries cannot run in a user session. Moving this collection to AuditOnly stops the blocking, keeps every rule, and keeps logging what it would have denied." `
-                        -Data ([PSCustomObject]@{ Kind = 'Collection'; Collection = $collection; TargetMode = 2 })))
+                        -Data ([PSCustomObject]@{ Kind = 'Collection'; Collection = $collection; TargetMode = 0 })))
         }
     }
 
@@ -899,7 +975,7 @@ function Get-AllFinding {
 
         [void]$findings.Add((New-Finding -Cause 'BlockedSystemBinary' -Item "$collectionName/$(Split-Path $denied.Path -Leaf)" `
                     -Message "AppLocker refused $($denied.Path) $($denied.Count) time(s), last at $($denied.LastSeenUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC (event $($denied.EventIds -join '/')). That is a Windows binary, and no single rule in the enforcing $collectionName collection accounts for it, so the collection as a whole is refusing files it needs to allow. Moving it to AuditOnly stops the blocking and keeps every rule." `
-                    -Data ([PSCustomObject]@{ Kind = 'Collection'; Collection = $collection; TargetMode = 2 })))
+                    -Data ([PSCustomObject]@{ Kind = 'Collection'; Collection = $collection; TargetMode = 0 })))
     }
 
     return @($findings)
@@ -942,8 +1018,9 @@ function Set-CollectionMode {
     if (-not (Test-Path $collection.KeyPath)) { throw "The collection key for $($collection.Name) is no longer present." }
 
     Set-ItemProperty -Path $collection.KeyPath -Name 'EnforcementMode' -Value $target -Type DWord -Force -ErrorAction Stop
-    Add-OfflineRepairLog -Message "$($collection.Name): EnforcementMode $($collection.Mode) ($($collection.ModeName)) -> $target ($($script:ModeName[$target]))."
-    Add-OfflineRepairLog -Message "$($collection.Name): to undo this after the VM boots, run: reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2\$($collection.Name)`" /v EnforcementMode /t REG_DWORD /d $($collection.Mode) /f"
+    $before = if ($null -eq $collection.Mode) { 'absent' } else { $collection.Mode }
+    Add-OfflineRepairLog -Message "$($collection.Name): EnforcementMode $before ($($collection.ModeName)) -> $target ($(Get-EnforcementModeName -Mode $target))."
+    Add-OfflineRepairLog -Message "$($collection.Name): to undo this after the VM boots, run: $(Get-EnforcementModeUndoCommand -Collection $collection)"
     return $true
 }
 
@@ -1018,15 +1095,98 @@ function Clear-LocalPolicyAppLockerPolicy {
     return $dropped
 }
 
+function Get-AppLockerCompiledCacheState {
+    <#
+    .SYNOPSIS
+        Reads the compiled AppLocker policy files from the offline disk.
+
+    .DESCRIPTION
+        The directory itself exists on a clean install, so its presence proves nothing. The file
+        count is the signal: measured on a pristine marketplace Server 2022 the directory holds
+        zero files, and a machine with an applied policy holds Exe.AppLocker at 1,000 bytes.
+
+    .OUTPUTS
+        PSCustomObject with Path, Files and Count.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsPath
+    )
+
+    $path = Join-OfflinePath -Root $WindowsPath -ChildPath 'System32\AppLocker'
+    $files = @()
+    if (Test-Path $path) {
+        $files = @(Get-ChildItem -Path $path -File -Filter '*.AppLocker' -ErrorAction SilentlyContinue)
+    }
+    return [PSCustomObject]@{ Path = $path; Files = $files; Count = $files.Count }
+}
+
+function Clear-AppLockerCompiledCache {
+    <#
+    .SYNOPSIS
+        Removes the compiled policy files that the AppLocker driver actually enforces from.
+
+    .DESCRIPTION
+        The registry is not what blocks a process. The AppID PolicyConverter scheduled task compiles
+        the applied policy into %WINDIR%\System32\AppLocker\*.AppLocker, and appid.sys enforces from
+        those files.
+
+        Measured on Server 2022. With SrpV2 deleted and Registry.pol back to its pristine 114 bytes -
+        no AppLocker policy left anywhere in the registry - a surviving Exe.AppLocker still blocked
+        the denied binary after a reboot, logging event 8004. The converter ran during that boot and
+        did not remove the stale file. So a repair that corrects only the registry reports success
+        and leaves the VM exactly as blocked as it was.
+
+        Deleting these files is safe. They are regenerated from the applied policy the next time the
+        converter runs, so on a healthy policy this costs one recompile, and on a broken one it is
+        the difference between a repair that holds and a repair that does nothing. Each file is
+        copied to a .bak next to itself first.
+
+    .OUTPUTS
+        The number of cache files removed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsPath
+    )
+
+    $cacheDir = Join-OfflinePath -Root $WindowsPath -ChildPath 'System32\AppLocker'
+    if (-not (Test-Path $cacheDir)) { return 0 }
+
+    # The directory itself is present on a clean install; it is the file count that is the signal.
+    $files = @(Get-ChildItem -Path $cacheDir -File -Filter '*.AppLocker' -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        Add-OfflineRepairLog -Message 'The compiled AppLocker cache is already empty, which is how a machine with no policy looks.'
+        return 0
+    }
+
+    $removed = 0
+    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
+    foreach ($file in $files) {
+        try {
+            Copy-Item -Path $file.FullName -Destination "$($file.FullName).$stamp.bak" -Force -ErrorAction Stop
+            Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+            $removed++
+            Add-OfflineRepairLog -Message "Removed the compiled policy $($file.Name) ($($file.Length) bytes). This is the file the driver enforces from; it is rebuilt from the corrected policy at the next AppID PolicyConverter run."
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "Could not remove the compiled policy $($file.Name) ($($_.Exception.Message)). The VM may still be blocked after it boots."
+        }
+    }
+    return $removed
+}
+
 function Disable-AppLockerEnforcement {
     <#
     .SYNOPSIS
-        Sets every rule collection to NotConfigured and disables the Application Identity service.
+        Moves every rule collection to AuditOnly and disables the Application Identity service.
 
     .DESCRIPTION
         Only reached when the operator passes -disableEnforcement true. Rules are preserved, so the
         policy can be re-enabled once it has been corrected. The command to restore each value is
         logged before it is changed.
+
+        The target is 0, which is AuditOnly and was measured to stop blocking while still logging
+        what it would have denied. It is deliberately not a delete: an absent EnforcementMode
+        enforces, so removing the value would make a collection stricter, not looser.
 
     .OUTPUTS
         The number of values that were changed.
@@ -1038,10 +1198,12 @@ function Disable-AppLockerEnforcement {
 
     $changed = 0
 
+    # $null -ne 0 is true, so a collection whose value is absent - which enforces - is included.
     foreach ($collection in @($Policy.Collections | Where-Object { $_.Mode -ne 0 })) {
-        Add-OfflineRepairLog -Level Warning -Message "Restore with: reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2\$($collection.Name)`" /v EnforcementMode /t REG_DWORD /d $($collection.Mode) /f"
+        $before = if ($null -eq $collection.Mode) { 'absent' } else { $collection.Mode }
+        Add-OfflineRepairLog -Level Warning -Message "Restore with: $(Get-EnforcementModeUndoCommand -Collection $collection)"
         Set-ItemProperty -Path $collection.KeyPath -Name 'EnforcementMode' -Value 0 -Type DWord -Force -ErrorAction Stop
-        Add-OfflineRepairLog -Message "$($collection.Name): EnforcementMode $($collection.Mode) -> 0 (NotConfigured). The rules themselves are preserved."
+        Add-OfflineRepairLog -Message "$($collection.Name): EnforcementMode $before -> 0 (AuditOnly). The rules themselves are preserved."
         $changed++
     }
 
@@ -1100,6 +1262,7 @@ try {
     $blockEvidence = Get-AppLockerBlockedFile -WindowsPath $offline.WindowsPath
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     $localPolicy = Get-LocalPolicyAppLockerState -WindowsPath $offline.WindowsPath
+    $compiledCache = Get-AppLockerCompiledCacheState -WindowsPath $offline.WindowsPath
 
     $context = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath
@@ -1146,6 +1309,12 @@ try {
     else { "$($localPolicy.AppLockerRecordCount) AppLocker record(s) of $($localPolicy.RecordCount)" }
     Log-Info "Local Group Policy file: $localPolicySummary." | Tee-Object -FilePath $logFile -Append
 
+    # Reported even when it is empty, because zero files is exactly what a machine with no policy
+    # looks like and the engineer needs to be able to tell those two states apart.
+    $cacheSummary = if ($compiledCache.Count -eq 0) { 'empty, which is how a machine with no AppLocker policy looks' }
+    else { @($compiledCache.Files | ForEach-Object { "$($_.Name) ($($_.Length) bytes)" }) -join ', ' }
+    Log-Info "Compiled AppLocker policy in System32\AppLocker: $cacheSummary." | Tee-Object -FilePath $logFile -Append
+
     # Full per-GPO detail goes to the detail log only. The returned log is capped at 4 KB and
     # truncated from the start, so one line per GPO would push the findings off the top on any
     # real domain member.
@@ -1167,6 +1336,21 @@ try {
     }
 
     $findings = @($context.Findings)
+
+    # A stale compiled policy blocks on its own. Measured: with SrpV2 deleted and Registry.pol back
+    # to its pristine size, a surviving Exe.AppLocker still blocked the test binary after a reboot
+    # and the converter did not clear it. Without this finding the script would look at a registry
+    # with no policy in it and tell the engineer AppLocker is not the problem, on a VM AppLocker is
+    # actively blocking.
+    $enforcingCollection = @($policy.Collections | Where-Object { $_.Enforcing })
+    $staleCacheFinding = $null
+    if ($compiledCache.Count -gt 0 -and $enforcingCollection.Count -eq 0) {
+        $names = @($compiledCache.Files | ForEach-Object { $_.Name }) -join ', '
+        $staleCacheFinding = New-Finding -Cause 'StaleCompiledPolicy' -Item 'CompiledCache' `
+            -Message "The compiled policy $names is present in System32\AppLocker but no rule collection in the registry enforces. The driver loads that file at boot and enforces from it, so this VM is blocked by a policy that no longer exists in the registry. Deleting the compiled copy is the repair; it is rebuilt from the applied policy at the next AppID PolicyConverter run."
+        $findings += $staleCacheFinding
+    }
+
     foreach ($finding in $findings) {
         Log-Output "[$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
     }
@@ -1203,7 +1387,9 @@ try {
             $done = 0
             $errors = [System.Collections.Generic.List[string]]::new()
 
-            foreach ($finding in $repairable) {
+            # The stale compiled policy is a file on disk, not a hive value, so it is repaired
+            # after this block. Sending it through Repair-Finding would only return false.
+            foreach ($finding in @($repairable | Where-Object { $_.Cause -ne 'StaleCompiledPolicy' })) {
                 try {
                     if (Repair-Finding -Finding $finding) {
                         $finding.Repaired = $true
@@ -1245,8 +1431,18 @@ try {
     # The local policy file is outside the hive, so it is handled after the hive work. Without this
     # the next policy refresh would put the blocking rule straight back.
     $localRemoved = 0
-    if ($repairedCount -gt 0 -or $enforcementChanges -gt 0) {
+    $compiledRemoved = 0
+    if ($repairedCount -gt 0 -or $enforcementChanges -gt 0 -or $null -ne $staleCacheFinding) {
         $localRemoved = Clear-LocalPolicyAppLockerPolicy -LocalPolicy $localPolicy
+
+        # The compiled cache is what the driver enforces from, and it outlives both the registry and
+        # Registry.pol. Correcting the policy without clearing it leaves the VM blocked by the old
+        # copy, so this is not optional cleanup.
+        $compiledRemoved = Clear-AppLockerCompiledCache -WindowsPath $offline.WindowsPath
+        if ($null -ne $staleCacheFinding -and $compiledRemoved -gt 0) {
+            $staleCacheFinding.Repaired = $true
+            $repairedCount++
+        }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
 
@@ -1275,6 +1471,7 @@ try {
 
     $summary = "Repaired $repairedCount of $($repairable.Count) issue(s) that could be repaired."
     if ($localRemoved -gt 0) { $summary += " Removed $localRemoved AppLocker record(s) from local policy so a refresh cannot restore them." }
+    if ($compiledRemoved -gt 0) { $summary += " Deleted $compiledRemoved compiled policy file(s); without this the driver keeps enforcing the old policy after the reboot." }
     if ($cacheCleared -gt 0) { $summary += " Cleared $cacheCleared cached GPO copy/copies." }
     if ($enforcementChanges -gt 0) { $summary += " Disabled AppLocker enforcement on request ($enforcementChanges value(s))." }
     if ($lsaChanges -gt 0) { $summary += " Removed $lsaChanges LSA protection value(s) on request." }
