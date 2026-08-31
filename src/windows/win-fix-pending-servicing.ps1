@@ -879,7 +879,13 @@ try {
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $findings = Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState -SetupExecuteState $setupExecute
+    # @() is not decoration. Get-ServicingFinding returns a List[object], and Windows PowerShell 5.1
+    # - which is what runs on the rescue VM - unrolls a returned single-element list into the bare
+    # object it held. A PSCustomObject has no Count, so $findings.Count reads back as $null and both
+    # "-gt 0" and "-eq 0" are false: the script reports the disk clean while simultaneously offering
+    # to repair it. It only shows up when exactly one marker is found, which is why it survived every
+    # earlier test disk. Every other collection in this file is wrapped the same way.
+    $findings = @(Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState -SetupExecuteState $setupExecute)
 
     $txr = Get-TxRState -WindowsPath $offline.WindowsPath
 
