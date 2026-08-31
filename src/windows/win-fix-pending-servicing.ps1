@@ -906,11 +906,27 @@ try {
     # DISM revert, the pending.xml rename and the CBS registry edits. Either the markers or log
     # exhaustion authorise clearing config\TxR. Clearing the logs on log exhaustion alone is the whole
     # point: that is the case where there is no marker to find.
-    $clearTxR = ($findings.Count -gt 0 -or $logFull.Found) -and $txr.Actionable
+    #
+    # A leftover SetupExecute is deliberately not one of those markers. It is evidence that a hook was
+    # left behind, not that a transaction is open: on the disk this was first measured on, pending.xml
+    # was absent, every CBS key was clean and DISM reported nothing pending. Letting it authorise the
+    # DISM revert, the hive backups and a wipe of 14 TxR transaction files would be changing things no
+    # evidence says are broken. It is reported with the rest and authorises only its own repair.
+    $servicingFindings = @($findings | Where-Object { $_.Kind -ne 'SetupExecute' })
+    $clearTxR = ($servicingFindings.Count -gt 0 -or $logFull.Found) -and $txr.Actionable
 
     # Report the state before deciding anything.
     if ($findings.Count -gt 0) {
-        Log-Info "Servicing is mid-transaction. $($findings.Count) marker(s) found:" | Tee-Object -FilePath $logFile -Append
+        # The headline has to match what was actually found. A leftover hook is not an open
+        # transaction, and telling an operator servicing is mid-transaction when DISM, pending.xml
+        # and the CBS keys are all clean sends them looking for a component store problem that is
+        # not there.
+        if ($servicingFindings.Count -gt 0) {
+            Log-Info "Servicing is mid-transaction. $($findings.Count) marker(s) found:" | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Info "No servicing transaction is open - pending.xml is absent, the CBS pending keys do not exist and the COMPONENTS transaction values are clear - but $($findings.Count) leftover marker(s) were found:" | Tee-Object -FilePath $logFile -Append
+        }
         foreach ($finding in $findings) {
             Log-Info "  $($finding.Marker): $($finding.Detail)" | Tee-Object -FilePath $logFile -Append
         }
@@ -924,7 +940,7 @@ try {
     }
 
     if ($txr.Present) {
-        $why = if ($findings.Count -gt 0) { 'a servicing marker above was found' }
+        $why = if ($servicingFindings.Count -gt 0) { 'a servicing marker above was found' }
         elseif ($logFull.Found) { 'CBS reported log exhaustion' }
         else { 'neither a servicing marker nor log exhaustion was found, so they are left alone' }
         Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only because $why." | Tee-Object -FilePath $logFile -Append
@@ -961,9 +977,9 @@ try {
     # Detect only
     # ---------------------------------------------------------------------------------------------
     if ($isDetectOnly) {
-        if ($findings.Count -gt 0) {
-            $clearable = @($findings | Where-Object { $_.Kind -notin @('Session', 'SetupExecute') }).Count
-            $sessions = @($findings | Where-Object { $_.Kind -eq 'Session' }).Count
+        if ($servicingFindings.Count -gt 0) {
+            $clearable = @($servicingFindings | Where-Object { $_.Kind -ne 'Session' }).Count
+            $sessions = @($servicingFindings | Where-Object { $_.Kind -eq 'Session' }).Count
             if ($clearable -gt 0) {
                 Log-Output "$clearable servicing marker(s) would be cleared, and DISM would be asked to revert the pending actions." | Tee-Object -FilePath $logFile -Append
             }
@@ -1010,7 +1026,7 @@ try {
     $txrRemoved = 0
     $script:SystemHiveBackedUp = $false
 
-    if ($findings.Count -gt 0) {
+    if ($servicingFindings.Count -gt 0) {
         $softwareBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
         Log-Info "SOFTWARE hive backed up to $softwareBackup" | Tee-Object -FilePath $logFile -Append
         if ($hasComponentsHive) {
@@ -1293,7 +1309,7 @@ try {
     $markerWork = $changes - $txrRemoved - $serviceChanges - $setupExecuteChanges
 
     $did = [System.Collections.Generic.List[string]]::new()
-    if ($findings.Count -gt 0 -and @($findings | Where-Object { $_.Kind -ne 'SetupExecute' }).Count -gt 0) {
+    if ($findings.Count -gt 0 -and $servicingFindings.Count -gt 0) {
         if ($remaining.Count -eq 0) {
             # Either the edits landed, or the DISM revert consumed pending.xml on its own - that one
             # leaves nothing for this script to count, so trust the re-read rather than the counter.
