@@ -40,27 +40,23 @@
 #>
 
 $script:OfflinePrivilegeReady = $false
+$script:OfflineBackupPrivilegeReady = $false
 
 # Owner, Group and Access. SACL is deliberately not captured or replayed: reading it needs
 # SeSecurityPrivilege and writing it back can fail on its own, and nothing here changes auditing.
 $script:OfflineSecuritySection = 'Owner,Group,Access'
 
-function Enable-OfflineOwnershipPrivilege {
+function Initialize-OfflinePrivilegeType {
     <#
     .SYNOPSIS
-        Enabling the token privileges that taking and returning ownership need.
+        Compiling the token-privilege helper both privilege paths use.
 
     .DESCRIPTION
-        SeTakeOwnershipPrivilege allows taking an object whose DACL denies WRITE_OWNER.
-        SeRestorePrivilege allows setting the owner to somebody other than the caller, which is
-        what putting TrustedInstaller back requires.
-        SeBackupPrivilege and SeSecurityPrivilege allow reading a descriptor the DACL would
-        otherwise hide, so the capture is complete before anything is changed.
+        Separate from the functions that enable privileges so that the ownership path and the
+        backup path share one type rather than each carrying a copy of the same P/Invoke.
     #>
     [CmdletBinding()]
     param()
-
-    if ($script:OfflinePrivilegeReady) { return }
 
     if (-not ('OfflineRepairPrivilege' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -113,6 +109,26 @@ public static class OfflineRepairPrivilege
 }
 '@
     }
+}
+
+function Enable-OfflineOwnershipPrivilege {
+    <#
+    .SYNOPSIS
+        Enabling the token privileges that taking and returning ownership need.
+
+    .DESCRIPTION
+        SeTakeOwnershipPrivilege allows taking an object whose DACL denies WRITE_OWNER.
+        SeRestorePrivilege allows setting the owner to somebody other than the caller, which is
+        what putting TrustedInstaller back requires.
+        SeBackupPrivilege and SeSecurityPrivilege allow reading a descriptor the DACL would
+        otherwise hide, so the capture is complete before anything is changed.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:OfflinePrivilegeReady) { return }
+
+    Initialize-OfflinePrivilegeType
 
     foreach ($privilege in @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege', 'SeSecurityPrivilege')) {
         if (-not [OfflineRepairPrivilege]::Enable($privilege)) {
@@ -121,6 +137,35 @@ public static class OfflineRepairPrivilege
     }
 
     $script:OfflinePrivilegeReady = $true
+}
+
+function Enable-OfflineBackupPrivilege {
+    <#
+    .SYNOPSIS
+        Enabling only the two privileges that reading and writing a key through the backup path needs.
+
+    .DESCRIPTION
+        Deliberately narrower than Enable-OfflineOwnershipPrivilege: it does not enable
+        SeTakeOwnershipPrivilege, so a detection pass that only ever reads cannot accidentally
+        acquire the right to take an object it was only meant to look at.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:OfflineBackupPrivilegeReady) { return $true }
+
+    Initialize-OfflinePrivilegeType
+
+    $ok = $true
+    foreach ($privilege in @('SeBackupPrivilege', 'SeRestorePrivilege')) {
+        if (-not [OfflineRepairPrivilege]::Enable($privilege)) {
+            $ok = $false
+            Add-OfflineRepairLog -Level Info -Message "$privilege could not be enabled. A key whose DACL denies this account will stay unreadable."
+        }
+    }
+
+    $script:OfflineBackupPrivilegeReady = $ok
+    return $ok
 }
 
 function Get-OfflineCurrentUserSid {
@@ -1161,3 +1206,345 @@ function Copy-OfflineProtectedFile {
         Reason        = $reason
     }
 }
+
+#region Privileged registry access
+# The functions above take ownership when a DACL refuses. The functions below never do: they open
+# the key with REG_OPTION_BACKUP_RESTORE while SeBackupPrivilege and SeRestorePrivilege are held,
+# which makes the kernel grant access on the strength of the privilege and skip the DACL check
+# entirely. Nothing about the key changes, so a detection pass cannot dirty a healthy machine.
+#
+# "Privileged" here means "opened by privilege rather than by permission". It has nothing to do
+# with Backup-OfflineHiveFile, which copies a hive file.
+#
+# Use these when a key denies read to everyone including SYSTEM - mpssvc's AppCs key is the known
+# example. Use the *-OfflineProtected* functions when the key is merely owned by TrustedInstaller.
+
+function Initialize-OfflinePrivilegedRegistryType {
+    <#
+    .SYNOPSIS
+        Compiling the registry P/Invoke used by the backup-restore path.
+
+    .DESCRIPTION
+        The .NET registry classes give no way to pass REG_OPTION_BACKUP_RESTORE, and the PowerShell
+        provider gives no way either, so the Win32 API is called directly.
+
+        RegCreateKeyEx is used rather than RegOpenKeyEx because the backup-restore option is only
+        honoured by RegCreateKeyEx. That function creates the key when it is absent, which would be
+        a write to a machine that may be healthy, so every open checks the disposition it returns
+        and removes anything it created before handing the handle back.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('OfflinePrivilegedRegistry' -as [type]) { return }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class OfflinePrivilegedRegistry
+{
+    const int REG_OPTION_BACKUP_RESTORE = 0x00000004;
+    const int REG_CREATED_NEW_KEY = 1;
+    const int KEY_READ = 0x20019;
+    const int KEY_WRITE = 0x20006;
+    const int ERROR_SUCCESS = 0;
+    const int ERROR_NO_MORE_ITEMS = 259;
+    const int ERROR_MORE_DATA = 234;
+    const int ERROR_ALREADY_EXISTS = 183;
+    static readonly IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegCreateKeyExW(IntPtr hKey, string lpSubKey, int Reserved, string lpClass,
+        int dwOptions, int samDesired, IntPtr lpSecurityAttributes, out IntPtr phkResult,
+        out int lpdwDisposition);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegDeleteKeyW(IntPtr hKey, string lpSubKey);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern int RegCloseKey(IntPtr hKey);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegEnumValueW(IntPtr hKey, int dwIndex, StringBuilder lpValueName,
+        ref int lpcchValueName, IntPtr lpReserved, IntPtr lpType, IntPtr lpData, IntPtr lpcbData);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegEnumKeyExW(IntPtr hKey, int dwIndex, StringBuilder lpName, ref int lpcchName,
+        IntPtr lpReserved, IntPtr lpClass, IntPtr lpcchClass, IntPtr lpftLastWriteTime);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegQueryValueExW(IntPtr hKey, string lpValueName, IntPtr lpReserved,
+        out int lpType, byte[] lpData, ref int lpcbData);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegDeleteValueW(IntPtr hKey, string lpValueName);
+
+    // Opens an existing key through the backup path. Never leaves a key behind that it created:
+    // if the disposition says the key was new, it is deleted again and the call reports failure,
+    // so a caller can treat a non-zero result as "not there" without having changed anything.
+    static int Open(string subKey, bool forWrite, out IntPtr handle)
+    {
+        handle = IntPtr.Zero;
+        int disposition;
+        int access = forWrite ? (KEY_READ | KEY_WRITE) : KEY_READ;
+        int rc = RegCreateKeyExW(HKLM, subKey, 0, null, REG_OPTION_BACKUP_RESTORE, access,
+                                 IntPtr.Zero, out handle, out disposition);
+        if (rc != ERROR_SUCCESS) { handle = IntPtr.Zero; return rc; }
+        if (disposition == REG_CREATED_NEW_KEY)
+        {
+            RegCloseKey(handle);
+            RegDeleteKeyW(HKLM, subKey);
+            handle = IntPtr.Zero;
+            return ERROR_ALREADY_EXISTS;
+        }
+        return ERROR_SUCCESS;
+    }
+
+    public static int KeyExists(string subKey, out bool exists)
+    {
+        exists = false;
+        IntPtr h;
+        int rc = Open(subKey, false, out h);
+        if (rc == ERROR_ALREADY_EXISTS) { return ERROR_SUCCESS; }
+        if (rc != ERROR_SUCCESS) { return rc; }
+        RegCloseKey(h);
+        exists = true;
+        return ERROR_SUCCESS;
+    }
+
+    public static int SubKeyNames(string subKey, out string[] names)
+    {
+        names = new string[0];
+        IntPtr h;
+        int rc = Open(subKey, false, out h);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        try
+        {
+            List<string> found = new List<string>();
+            for (int i = 0; ; i++)
+            {
+                StringBuilder sb = new StringBuilder(256);
+                int len = sb.Capacity;
+                int r = RegEnumKeyExW(h, i, sb, ref len, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (r == ERROR_NO_MORE_ITEMS) { break; }
+                if (r != ERROR_SUCCESS) { return r; }
+                found.Add(sb.ToString());
+            }
+            names = found.ToArray();
+            return ERROR_SUCCESS;
+        }
+        finally { RegCloseKey(h); }
+    }
+
+    public static int ValueNames(string subKey, out string[] names)
+    {
+        names = new string[0];
+        IntPtr h;
+        int rc = Open(subKey, false, out h);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        try
+        {
+            List<string> found = new List<string>();
+            for (int i = 0; ; i++)
+            {
+                // 16383 characters is the documented maximum length of a value name.
+                StringBuilder sb = new StringBuilder(16384);
+                int len = sb.Capacity;
+                int r = RegEnumValueW(h, i, sb, ref len, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (r == ERROR_NO_MORE_ITEMS) { break; }
+                if (r != ERROR_SUCCESS) { return r; }
+                found.Add(sb.ToString());
+            }
+            names = found.ToArray();
+            return ERROR_SUCCESS;
+        }
+        finally { RegCloseKey(h); }
+    }
+
+    public static int GetValue(string subKey, string name, out int type, out byte[] data)
+    {
+        type = 0;
+        data = null;
+        IntPtr h;
+        int rc = Open(subKey, false, out h);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        try
+        {
+            int size = 0;
+            int r = RegQueryValueExW(h, name, IntPtr.Zero, out type, null, ref size);
+            if (r != ERROR_SUCCESS && r != ERROR_MORE_DATA) { return r; }
+            byte[] buffer = new byte[size];
+            r = RegQueryValueExW(h, name, IntPtr.Zero, out type, buffer, ref size);
+            if (r != ERROR_SUCCESS) { return r; }
+            data = buffer;
+            return ERROR_SUCCESS;
+        }
+        finally { RegCloseKey(h); }
+    }
+
+    public static int DeleteValue(string subKey, string name)
+    {
+        IntPtr h;
+        int rc = Open(subKey, true, out h);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        try { return RegDeleteValueW(h, name); }
+        finally { RegCloseKey(h); }
+    }
+}
+"@
+}
+
+function Get-OfflinePrivilegedRegistryValueName {
+    <#
+    .SYNOPSIS
+        Listing the value names under a key that may deny read to every account, SYSTEM included.
+
+    .DESCRIPTION
+        Returns an object rather than a bare list, because "the key holds no values" and "the key
+        could not be opened" are different answers and must not be confused. Ok is $false only when
+        something went wrong; a key that is genuinely absent comes back Ok with Exists $false.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Ok = $false; Exists = $false; Names = @(); Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    [void](Enable-OfflineBackupPrivilege)
+    Initialize-OfflinePrivilegedRegistryType
+
+    $exists = $false
+    $rc = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
+    if ($rc -ne 0) {
+        $result.Error = "The key could not be opened (error $rc)."
+        return $result
+    }
+    if (-not $exists) {
+        $result.Ok = $true
+        return $result
+    }
+
+    $names = $null
+    $rc = [OfflinePrivilegedRegistry]::ValueNames($subKey, [ref]$names)
+    if ($rc -ne 0) {
+        $result.Exists = $true
+        $result.Error = "The key opened but its values could not be listed (error $rc)."
+        return $result
+    }
+
+    $result.Ok = $true
+    $result.Exists = $true
+    $result.Names = @($names)
+    return $result
+}
+
+function Get-OfflinePrivilegedRegistryValue {
+    <#
+    .SYNOPSIS
+        Reading one value from a key that may deny read to every account, SYSTEM included.
+
+    .DESCRIPTION
+        Returns the raw bytes and the registry type alongside a decoded value. The type matters as
+        much as the content for a caller deciding whether the value is well formed, and a decoded
+        string array cannot report either the type or the true byte length.
+
+        Strings decodes REG_SZ, REG_EXPAND_SZ and REG_MULTI_SZ. Anything else is left to Bytes.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $result = [PSCustomObject]@{
+        Ok = $false; Found = $false; Type = 0; ByteLength = 0
+        Bytes = $null; Strings = @(); Error = ''
+    }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    [void](Enable-OfflineBackupPrivilege)
+    Initialize-OfflinePrivilegedRegistryType
+
+    $type = 0
+    $bytes = $null
+    $rc = [OfflinePrivilegedRegistry]::GetValue($subKey, $Name, [ref]$type, [ref]$bytes)
+
+    # 2 is ERROR_FILE_NOT_FOUND, which the API returns both for a missing key and a missing value.
+    if ($rc -eq 2) {
+        $result.Ok = $true
+        return $result
+    }
+    if ($rc -ne 0) {
+        $result.Error = "$Name could not be read (error $rc)."
+        return $result
+    }
+
+    $result.Ok = $true
+    $result.Found = $true
+    $result.Type = $type
+    $result.Bytes = $bytes
+    $result.ByteLength = @($bytes).Count
+
+    # 1 REG_SZ, 2 REG_EXPAND_SZ, 7 REG_MULTI_SZ.
+    if ($type -in 1, 2, 7 -and $result.ByteLength -gt 1) {
+        $text = [System.Text.Encoding]::Unicode.GetString($bytes)
+        $result.Strings = @($text.Split([char]0) | Where-Object { $_.Length -gt 0 })
+    }
+
+    return $result
+}
+
+function Remove-OfflinePrivilegedRegistryValue {
+    <#
+    .SYNOPSIS
+        Removing one value from a key that may deny write to every account, SYSTEM included.
+
+    .DESCRIPTION
+        The key's owner and DACL are left exactly as they were found. Only the named value is
+        removed; the key itself and every other value under it survive.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $result = [PSCustomObject]@{ Removed = $false; Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("$Path\$Name", 'Remove registry value')) { return $result }
+
+    if (-not (Enable-OfflineBackupPrivilege)) {
+        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be opened for write.'
+        return $result
+    }
+    Initialize-OfflinePrivilegedRegistryType
+
+    $rc = [OfflinePrivilegedRegistry]::DeleteValue($subKey, $Name)
+    if ($rc -ne 0) {
+        $result.Error = "$Name could not be removed (error $rc)."
+        return $result
+    }
+
+    $result.Removed = $true
+    return $result
+}
+#endregion
