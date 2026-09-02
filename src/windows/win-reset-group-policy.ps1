@@ -42,10 +42,14 @@
 #
 # .PARAMETER scope
 #   How much of local Group Policy to clear. Defaults to "targeted".
-#     "targeted" - the policy folders, plus only the registry key(s) that detection proved can refuse
-#                  a logon: Software Restriction Policies at Disallowed, and AppLocker in enforce
-#                  mode. The rest of SOFTWARE\Policies is left alone. This is the default because it
-#                  repairs the lockout without discarding unrelated policy.
+#     "targeted" - acts only on what detection proved is refusing the logon: Software Restriction
+#                  Policies at Disallowed, AppLocker in enforce mode, or a policy startup/logon
+#                  script. When one of those is found, the policy folders are renamed aside and only
+#                  those key(s) are removed; the rest of SOFTWARE\Policies is left alone. When none
+#                  of them is found, nothing is changed at all, because Windows ships a gpt.ini and
+#                  a Registry.pol and their presence is not evidence of a fault. This is the default
+#                  because it repairs the lockout without discarding unrelated policy, and leaves a
+#                  disk that policy is not breaking exactly as it was.
 #     "files"    - the GroupPolicy, GroupPolicyUsers and AppLocker folders only, and no registry
 #                  change at all. Fully reversible by renaming them back, and it matches the reset
 #                  procedure Microsoft documents, so it is the most conservative option.
@@ -452,6 +456,11 @@ function Remove-OfflineRegistryKeyTree {
     .OUTPUTS
         The display paths of the keys that survived, which is empty when the whole tree went.
     #>
+    # SupportsShouldProcess is deliberately not declared. This runs unattended under the repair
+    # extension, where a confirmation prompt has no console to answer it and wedges the run for as
+    # long as the Run Command allows. Whether to write at all is decided by the caller: detectOnly
+    # returns long before this is reached.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -727,28 +736,44 @@ try {
         foreach ($branch in @($policyRegistry.Keys)) { [void]$targetKeys.Add($branch) }
     }
 
-    $filesToClear = if ($clearFiles) { @($policyFile.Folders).Count } else { 0 }
+    # Targeted scope acts only on what detection proved, on both halves. The registry side is
+    # already gated on Blocking; the file side has to be too, or the default scope renames the
+    # local policy of a disk where nothing is refusing the logon. Windows ships gpt.ini and a
+    # Registry.pol, so "the folder has files in it" is not evidence of a fault. Scopes files and
+    # all stay blanket on purpose, and are the documented way to clear policy that detection
+    # cannot prove is blocking.
+    $filesToClear = if ($clearFiles -and (-not $isTargeted -or $blockers -gt 0)) { @($policyFile.Folders).Count } else { 0 }
     $keysToClear = if ($clearRegistry) { @($targetKeys).Count } else { 0 }
 
     if ($isDetectOnly) {
-        $keyNote = if ($isTargeted) {
-            if ($keysToClear -gt 0) { "remove $keysToClear blocking key(s) ($(@($targetKeys) -join ', '))" }
-            else { 'remove no registry keys, because no policy that can refuse a logon on its own was found' }
+        if ($isTargeted -and $filesToClear -eq 0 -and $keysToClear -eq 0) {
+            $note = if ($policyFile.HasContent -or $policyRegistry.HasContent) {
+                "Local Group Policy is configured ($($policyFile.FileCount) file(s), $(@($policyRegistry.Keys).Count) key(s) holding values), but none of it is a policy that refuses a logon by itself, so nothing would be changed."
+            }
+            else { 'No local Group Policy is configured on this disk, so nothing would be changed.' }
+            Log-Output "Detect only (scope 'targeted'): $note No changes were made." | Tee-Object -FilePath $logFile -Append
         }
         else {
-            "remove $keysToClear SOFTWARE\Policies key(s)"
+            $keyNote = if ($isTargeted) {
+                if ($keysToClear -gt 0) { "remove $keysToClear blocking key(s) ($(@($targetKeys) -join ', '))" }
+                else { 'remove no registry keys' }
+            }
+            else {
+                "remove $keysToClear SOFTWARE\Policies key(s)"
+            }
+            Log-Output "Detect only (scope '$scope'): would rename $filesToClear policy folder(s) holding $($policyFile.FileCount) file(s) and $keyNote. No changes were made." | Tee-Object -FilePath $logFile -Append
         }
-        Log-Output "Detect only (scope '$scope'): would rename $filesToClear policy folder(s) holding $($policyFile.FileCount) file(s) and $keyNote. No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
 
     if ($filesToClear -eq 0 -and $keysToClear -eq 0) {
-        $hint = if ($isTargeted -and $policyRegistry.HasContent) {
-            " SOFTWARE\Policies does hold policy, but none of it is a policy that refuses a logon by itself. If a policy is still suspected, re-run with scope 'all' to clear the branch wholesale, and read the warning that comes with it."
+        if ($isTargeted -and ($policyFile.HasContent -or $policyRegistry.HasContent)) {
+            Log-Output "Nothing to clear in scope 'targeted'. Local Group Policy is configured on this disk, but none of it is a policy that refuses a logon by itself, so a policy is not what is stopping the logon and nothing was changed. If a policy is still suspected, re-run with scope 'files' to set the policy files aside, or scope 'all' to clear SOFTWARE\Policies wholesale, and read the warning that comes with it." | Tee-Object -FilePath $logFile -Append
         }
-        else { '' }
-        Log-Output "Nothing to clear in scope '$scope'. No local Group Policy is configured on this disk, so a policy is not what is stopping the logon. No changes were made.$hint" | Tee-Object -FilePath $logFile -Append
+        else {
+            Log-Output "Nothing to clear in scope '$scope'. No local Group Policy is configured on this disk, so a policy is not what is stopping the logon. No changes were made." | Tee-Object -FilePath $logFile -Append
+        }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
