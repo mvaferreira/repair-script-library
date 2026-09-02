@@ -1,222 +1,227 @@
 [
-	{
-		"id" : "win-dhcp-fix",
-		"path" : "src/windows/win-dhcp-fix.ps1",
-		"description" : "DHCP Service fixer offline from rescue VM"
- 	},
-	{
-		"id" : "win-sac-on",
-		"path" : "src/windows/sac-enabler.ps1",
-		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs"
-	},
-	{
-		"id" : "win-LKGC",
-		"path" : "src/windows/win-LKGC.ps1",
-		"description" : "Last Known Good Configuration enabler offline from rescue VM"
-	},
-	{
-		"id" : "win-GA-fix",
-		"path" : "src/windows/GA_offlinefixer.ps1",
-		"description" : "Fixes integrity of files and registry from windows guest agent offline"
-	},
-	{
-		"id" : "win-hello-world",
-		"path" : "src/windows/win-hello-world.ps1",
-		"description" : "Hello world test script"
-	},
-	{
-		"id" : "linux-hello-world",
-		"path" : "src/linux/linux-hello-world.sh",
-		"description" : "Hello world test script"
-	},
-	{
-		"id" : "win-error-test",
-		"path" : "src/windows/win-error-test.ps1",
-		"description" : "Error test script"
-	},
-	{
-		"id" : "linux-error-test",
-		"path" : "src/linux/linux-error-test.sh",
-		"description" : "Error test script"
-	},
-	{
-		"id" : "win-chkdsk-fs-corruption",
-		"path" : "src/windows/win-chkdsk-fs-corruption.ps1",
-		"description" : "Runs chkdsk to fix file system corruption"
-	},
-	{
-		"id" : "win-sfc-sf-corruption",
-		"path" : "src/windows/win-sfc-sf-corruption.ps1",
-		"description" : "Runs sfc to fix system file corruption"
-	},
-	{
-		"id" : "win-bcdedit-ignoreAllFailure",
-		"path" : "src/windows/win-ignoreAllFailures.ps1",
-		"description" : "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
-	},
-	{
-		"id" : "linux-alar-fki",
-		"path" : "src/linux/linux-alar2.sh",
-		"description" : "This ID is deprectated. Please use 'linux-alar2' instead. For backward compatibility it will use the linux-alar2 ID automatically."
-	},
-    	{
-		"id" : "linux-alar2",
-		"path" : "src/linux/linux-alar2.sh",
-		"description" : "alar2 allows to recover a failed VM. Various ations are available like: fstab, initrd and kernel. NOTE: use option --run-on-repair. See the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar2/README.md. The script takes around 2min to run."
-    	},
-	{
-		"id" : "win-enable-nested-hyperv",
-		"path" : "src/windows/win-enable-nested-hyperv.ps1",
-		"description" : "Enables nested hyperV using attached data disk as OS disk."
-	},
-	{
-		"id" : "win-fix-inaccessible-boot-device",
-		"path" : "src/windows/win-fix-inaccessible-boot-device.ps1",
-		"description" : "Repairs the offline registry causes of stop error 0x7B INACCESSIBLE_BOOT_DEVICE: boot storage driver Start and StartOverride values, missing boot storage service keys, dangling or third-party storage class filters, boot-critical PCI/VMBus device instance filters, missing Hyper-V ACPI enumeration keys, and a SAN policy that keeps the disk offline. Detects all causes and changes only what is actually wrong. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-registry-corruption",
-		"path" : "src/windows/win-fix-registry-corruption.ps1",
-		"description" : "Repairs corrupted, empty or unloadable registry hives behind stop error 0xC0000218 STATUS_CANNOT_LOAD_REGISTRY_FILE and stop error 0x74 BAD_SYSTEM_CONFIG_INFO. Validates every hive by loading a scratch copy, repairs structural damage in place with chkreg.exe, and falls back to a validated RegBack restore only when a hive cannot be repaired. Backs up every file it replaces. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-code-integrity",
-		"path" : "src/windows/win-fix-code-integrity.ps1",
-		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit and a portable executable scan for writable and executable sections as corroboration. The offline Secure Boot state, read from the Measured Boot log, and any testsigning or nointegritychecks override are reported as context only: measurement shows the boot manager drops those overrides and the guest still boots, so they are not treated as a fault. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-applocker-blocking",
-		"path" : "src/windows/win-fix-applocker-blocking.ps1",
-		"description" : "Finds the AppLocker rule that is refusing Windows' own binaries and removes that one rule, instead of turning AppLocker off. Reads the offline AppLocker event logs, which name the exact file that was denied, and the applied policy under SrpV2. Repairs a Deny rule covering the Windows directory by deleting that rule, and an enforcing collection whose allowlist never covered Windows by moving that one collection to AuditOnly so every rule is kept. Local policy is cleaned out of Registry.pol so a policy refresh cannot undo the repair, and the source GPO is named in the output. The compiled policy cache under System32\\AppLocker is removed as well, because a stale compiled file keeps enforcing on its own even after the registry policy is corrected; Windows rebuilds it from the repaired policy on the next refresh. AppLocker being configured or enforcing is never treated as a fault, and an enforcing collection holding no rules is left alone because it allows everything. Pass disableEnforcement=true only as a last resort. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-secure-boot",
-		"path" : "src/windows/win-fix-secure-boot.ps1",
-		"description" : "Repairs the signed EFI boot chain a Generation 2 VM starts through, for a loader failure such as 0xc0430001 that leaves no event log because nothing got far enough to write one. Compares the boot manager and Secure Boot policy on the EFI System Partition against the copies Windows keeps, and every boot chain file against the component store, by hash. Repairs a stale or missing EFI System Partition artifact by copying it from this installation, and a corrupt boot chain file with a targeted sfc against that one file. Never runs a full scan and never takes a file from another build. Gen2 only. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-reset-group-policy",
-		"path" : "src/windows/win-reset-group-policy.ps1",
-		"description" : "Clears local Group Policy on an offline Windows disk when a VM boots but refuses every logon because of its own policy: Software Restriction Policies set to Disallowed, AppLocker enforcing rules that do not permit userinit.exe or explorer.exe, or a machine startup or user logon script that hangs. Reports what is configured and which of those three is set before changing anything. Renames the GroupPolicy and GroupPolicyUsers folders aside instead of deleting them and backs up the SOFTWARE hive, so both halves can be undone. Use parameter scope=files for the reversible half only, or detectOnly=true to report and change nothing. This is a deliberate blanket reset, not a targeted repair. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-logon-subsystem",
-		"path" : "src/windows/win-fix-logon-subsystem.ps1",
-		"description" : "Repairs the offline logon path behind stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI, and \"The User Profile Service service failed the sign-in\". Checks Session Manager BootExecute and SetupExecute, the SYSTEM\\Setup setup-mode command, Winlogon Shell and Userinit, and the ProfileList entries, resolving every command against the binary it actually names on the attached disk. Removes only the entries whose binary is missing, keeps the ones that resolve, and writes a Windows default back only when removing the broken entries would leave the value empty. Backs up each hive before it is written. Pass detectOnly=true to report only. Clearing local Group Policy is a separate job, handled by win-reset-group-policy. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-rdp-certificate",
-		"path" : "src/windows/win-fix-rdp-certificate.ps1",
-		"description" : "Restores the private key permissions behind the Remote Desktop listener certificate on a VM whose RDP service is running and listening but drops every connection at the TLS handshake. TermService runs as NETWORK SERVICE and must read the listener's key container under ProgramData\\Microsoft\\Crypto\\RSA\\MachineKeys; strip that one entry, usually with a hardening pass over MachineKeys, and the service still starts, still listens and still fails every connection. Windows never recovers from it, because the certificate has not expired and so nothing triggers regeneration. Only a NETWORK SERVICE entry that is missing or denied on a Remote Desktop key container triggers a repair, so a healthy VM produces no findings and nothing is written. A missing certificate or key container is deliberately not repaired, because Windows mints a new one itself on the next start. The permissions written are the ones measured on healthy marketplace images of 2012 R2, 2016, 2019, 2022, 2025 and Windows 11, and the build-dependent third entry - Administrators before 17763, NT SERVICE\\SessionEnv from 17763 - is chosen from the offline build number rather than guessed. Existing permissions are added to, never replaced, and ownership is only taken when a write is refused and is handed straight back. Certificate services left disabled are repaired; Remote Desktop's own services are reported with win-fix-rdp-connectivity, which owns them. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-rdp-connectivity",
-		"path" : "src/windows/win-fix-rdp-connectivity.ps1",
-		"description" : "Restores Remote Desktop on a VM that boots and answers on the network but refuses every RDP connection. Repairs fDenyTSConnections on both the Terminal Server key and the Group Policy copy that overrides it, Remote Desktop services left disabled, listener values outside their documented range, a certificate pinned to the listener whose private key no longer resolves, and TLS 1.2 explicitly disabled in SCHANNEL. Every value written is the one specified by \"Prepare a Windows VHD to upload to Azure\", so the VM comes back configured the way Azure supports rather than reset to a Windows default. Only evidence that RDP is actually prevented triggers a repair, so a healthy VM produces no findings and nothing is written. Network and firewall services are reported with the script that owns them rather than changed here. NLA is never turned off, the listener port is never reset and the SSL cipher suite policy is never cleared unless asked for by name; the CredSSP encryption oracle is never weakened at all. Pass detectOnly=true to report only, or applyAzureBaseline=true to also apply the documented keep-alive, reconnect and listener values. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-firewall-service",
-		"path" : "src/windows/win-fix-firewall-service.ps1",
-		"description" : "Restores the Windows Defender Firewall service on a VM that boots, reports Ready and listens on 3389, yet answers nothing from the virtual network - ICMP included - because mpssvc is not running and the boot-time filters Windows installs before it starts are still blocking everything. Repairs a DebugedLoopbackApps loopback exemption value that mpssvc cannot read, under Services\\mpssvc\\Parameters\\AppCs, and MpsSvc or the Base Filtering Engine under it left Disabled. Measured on a live build 20348 VM one reboot at a time: CheckNetIsolation writes that value as REG_SZ, and every value of another type stopped the service on every boot - an empty REG_MULTI_SZ as reliably as one holding 700 SIDs - while an empty REG_SZ and a one-SID REG_SZ are both healthy. There is no size or entry-count threshold, so a wrong registry type is treated as conclusive on its own and a correctly typed value is only removed when the offline System log shows this machine's firewall service failing to start. A healthy VM therefore produces no findings and nothing is written. The AppCs key denies read to every account including SYSTEM; it is opened with SeBackupPrivilege and REG_OPTION_BACKUP_RESTORE rather than by taking ownership, so no security descriptor is altered to look at a machine that may have nothing wrong with it. Only Start=4 is treated as evidence, so a deliberately demand-started service is never corrected. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-fix-ntfs-attribute-list",
-		"path" : "src/windows/win-fix-ntfs-attribute-list.ps1",
-		"description" : "Repairs the NTFS metafile attribute list entries that make a volume fail to mount with stop error 0x24 NTFS_FILE_SYSTEM, typically after a servicing operation. Corrects the single non-canonical name offset byte in place. This is not a chkdsk wrapper and chkdsk is not a substitute: faced with this layout chkdsk discards the whole attribute list, which orphans the child records it referenced and can leave $Secure without its security descriptor stream. Scans the reserved file records of every NTFS volume on the attached disk, writes a byte level restore manifest before the first write, and verifies through the same locked handle. Nothing is written when no correctable entry is found. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-toggle-safe-mode",
-		"path" : "src/windows/win-toggle-safe-mode.ps1",
-		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
-	},
-	{
-		"id" : "win-dumpconfigurator",
-		"path" : "src/windows/win-dumpconfigurator.ps1",
-		"description" : "Changes the dump configuration of a VM while its running without the need to reboot it. Which is to say, you can change the dump configuration from Kernel to Full without a reboot."
-	},
-	{
-		"id" : "win-collect-attached-disk-logs",
-		"path" : "src/windows/win-collect-attached-disk-logs.ps1",
-		"description" : "Collect OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk."
-	},
-	{
-		"id" : "win-create-troubleshooting-user",
-		"path" : "src/windows/win-create-troubleshooting-user.ps1",
-		"description" : "Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account."
-	},
-	{
-		"id" : "win-add-temp-user",
-		"path" : "src/windows/win-add-temp-user.ps1",
-		"description" : "Creates a local administrator account on an attached OS disk by booting it in the nested Hyper-V guest and letting Windows itself create the account, so the SAM database is never edited by hand. Uses the SYSTEM\\Setup CmdLine hook rather than a Group Policy startup script, which is what makes it work on a domain-joined VM where local Group Policy may not apply. Confirms the account exists afterwards by reading the offline SAM and the result the payload left behind, and reports an error if neither confirms it. The file carrying the password deletes itself, and the setup hook is cleared, so nothing is left on the disk. Pass detectOnly=true to report only, or revert=true to undo a run that did not complete. Requires the rescue VM to be created with \"az vm repair create --enable-nested\". NOTE: use option --run-on-repair."
-	},
-	{
-		"id" : "win-get-patches",
-		"path" : "src/windows/win-get-patches.ps1",
-		"description" : "Get installed Windows patches for the nested Hyper-V server on a Rescue VM using DISM."
-	},
-	{
-		"id" : "win-remove-patch",
-		"path" : "src/windows/win-remove-patch.ps1",
-		"description" : "Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates."
-	},
-	{
-		"id" : "win-get-apps",
-		"path" : "src/windows/win-get-apps.ps1",
-		"description" : "Get Windows applications for the nested Hyper-V machine that can be uninstalled from the Rescue VM."
-	},
-	{
-		"id" : "win-remove-app",
-		"path" : "src/windows/win-remove-app.ps1",
-		"description" : "Remove an installed Windows application from the nested Hyper-V machine."
-	},
-	{
-		"id": "win-update-registry",
-		"path": "src/windows/win-update-registry.ps1",
-		"description": "Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk."
-	},
-	{
-		"id": "win-crowdstrike-fix-bootloop",
-		"path": "src/windows/win-crowdstrike-fix-bootloop.ps1",
-		"description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
-	},
-	{
-		"id": "win-crowdstrike-fix-bootloop-v2",
-		"path": "src/windows/win-crowdstrike-fix-bootloop-v2.ps1",
-		"description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
-	},
-	{
-		"id": "win-crowdstrike-fix-bootloop-cvm",
-		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
-		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
-	},
-	{
-		"id": "win-fix-third-party-drivers",
-		"path": "src/windows/win-fix-third-party-drivers.ps1",
-		"description": "Disables third party kernel drivers that stop a VM booting, refusing to touch any driver on the storage, network or boot path"
-	},
-	{
-		"id": "win-fix-pending-servicing",
-		"path": "src/windows/win-fix-pending-servicing.ps1",
-		"description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer"
-	},
-	{
-		"id": "win-fix-transaction-logs",
-		"path": "src/windows/win-fix-transaction-logs.ps1",
-		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again"
-	},
-	{
-		"id": "win-fix-network-connectivity",
-		"path": "src/windows/win-fix-network-connectivity.ps1",
-		"description": "Restores network connectivity on a VM that boots but is unreachable - disabled networking services, a static address Azure did not allocate, an orphaned network provider that hangs logon, or an unreachable machine proxy"
-	},
-	{
-		"id": "win-fix-bcd",
-		"path": "src/windows/win-fix-bcd.ps1",
-		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot"
-	},
-	{
-		"id": "win-fix-boot-partition",
-		"path": "src/windows/win-fix-boot-partition.ps1",
-		"description": "Repairs the system partition itself, the layer below the BCD store - a deleted EFI System Partition or System Reserved partition, an unformatted ESP, a missing 0x55AA boot signature, zeroed or NTLDR era bootstrap code, no Active partition or more than one, and a stale BPB HiddenSectors field that gives 'A disk read error occurred' after a partition move or restore while chkdsk and sfc report nothing"
-	}
+  {
+    "id": "win-dhcp-fix",
+    "path": "src/windows/win-dhcp-fix.ps1",
+    "description": "DHCP Service fixer offline from rescue VM"
+  },
+  {
+    "id": "win-sac-on",
+    "path": "src/windows/sac-enabler.ps1",
+    "description": "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs"
+  },
+  {
+    "id": "win-LKGC",
+    "path": "src/windows/win-LKGC.ps1",
+    "description": "Last Known Good Configuration enabler offline from rescue VM"
+  },
+  {
+    "id": "win-GA-fix",
+    "path": "src/windows/GA_offlinefixer.ps1",
+    "description": "Fixes integrity of files and registry from windows guest agent offline"
+  },
+  {
+    "id": "win-hello-world",
+    "path": "src/windows/win-hello-world.ps1",
+    "description": "Hello world test script"
+  },
+  {
+    "id": "linux-hello-world",
+    "path": "src/linux/linux-hello-world.sh",
+    "description": "Hello world test script"
+  },
+  {
+    "id": "win-error-test",
+    "path": "src/windows/win-error-test.ps1",
+    "description": "Error test script"
+  },
+  {
+    "id": "linux-error-test",
+    "path": "src/linux/linux-error-test.sh",
+    "description": "Error test script"
+  },
+  {
+    "id": "win-chkdsk-fs-corruption",
+    "path": "src/windows/win-chkdsk-fs-corruption.ps1",
+    "description": "Runs chkdsk to fix file system corruption"
+  },
+  {
+    "id": "win-sfc-sf-corruption",
+    "path": "src/windows/win-sfc-sf-corruption.ps1",
+    "description": "Runs sfc to fix system file corruption"
+  },
+  {
+    "id": "win-bcdedit-ignoreAllFailure",
+    "path": "src/windows/win-ignoreAllFailures.ps1",
+    "description": "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
+  },
+  {
+    "id": "linux-alar-fki",
+    "path": "src/linux/linux-alar2.sh",
+    "description": "This ID is deprectated. Please use 'linux-alar2' instead. For backward compatibility it will use the linux-alar2 ID automatically."
+  },
+  {
+    "id": "linux-alar2",
+    "path": "src/linux/linux-alar2.sh",
+    "description": "alar2 allows to recover a failed VM. Various ations are available like: fstab, initrd and kernel. NOTE: use option --run-on-repair. See the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar2/README.md. The script takes around 2min to run."
+  },
+  {
+    "id": "win-enable-nested-hyperv",
+    "path": "src/windows/win-enable-nested-hyperv.ps1",
+    "description": "Enables nested hyperV using attached data disk as OS disk."
+  },
+  {
+    "id": "win-fix-inaccessible-boot-device",
+    "path": "src/windows/win-fix-inaccessible-boot-device.ps1",
+    "description": "Repairs the offline registry causes of stop error 0x7B INACCESSIBLE_BOOT_DEVICE: boot storage driver Start and StartOverride values, missing boot storage service keys, dangling or third-party storage class filters, boot-critical PCI/VMBus device instance filters, missing Hyper-V ACPI enumeration keys, and a SAN policy that keeps the disk offline. Detects all causes and changes only what is actually wrong. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-registry-corruption",
+    "path": "src/windows/win-fix-registry-corruption.ps1",
+    "description": "Repairs corrupted, empty or unloadable registry hives behind stop error 0xC0000218 STATUS_CANNOT_LOAD_REGISTRY_FILE and stop error 0x74 BAD_SYSTEM_CONFIG_INFO. Validates every hive by loading a scratch copy, repairs structural damage in place with chkreg.exe, and falls back to a validated RegBack restore only when a hive cannot be repaired. Backs up every file it replaces. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-code-integrity",
+    "path": "src/windows/win-fix-code-integrity.ps1",
+    "description": "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit and a portable executable scan for writable and executable sections as corroboration. The offline Secure Boot state, read from the Measured Boot log, and any testsigning or nointegritychecks override are reported as context only: measurement shows the boot manager drops those overrides and the guest still boots, so they are not treated as a fault. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-applocker-blocking",
+    "path": "src/windows/win-fix-applocker-blocking.ps1",
+    "description": "Finds the AppLocker rule that is refusing Windows' own binaries and removes that one rule, instead of turning AppLocker off. Reads the offline AppLocker event logs, which name the exact file that was denied, and the applied policy under SrpV2. Repairs a Deny rule covering the Windows directory by deleting that rule, and an enforcing collection whose allowlist never covered Windows by moving that one collection to AuditOnly so every rule is kept. Local policy is cleaned out of Registry.pol so a policy refresh cannot undo the repair, and the source GPO is named in the output. The compiled policy cache under System32\\AppLocker is removed as well, because a stale compiled file keeps enforcing on its own even after the registry policy is corrected; Windows rebuilds it from the repaired policy on the next refresh. AppLocker being configured or enforcing is never treated as a fault, and an enforcing collection holding no rules is left alone because it allows everything. Pass disableEnforcement=true only as a last resort. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-secure-boot",
+    "path": "src/windows/win-fix-secure-boot.ps1",
+    "description": "Repairs the signed EFI boot chain a Generation 2 VM starts through, for a loader failure such as 0xc0430001 that leaves no event log because nothing got far enough to write one. Compares the boot manager and Secure Boot policy on the EFI System Partition against the copies Windows keeps, and every boot chain file against the component store, by hash. Repairs a stale or missing EFI System Partition artifact by copying it from this installation, and a corrupt boot chain file with a targeted sfc against that one file. Never runs a full scan and never takes a file from another build. Gen2 only. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-reset-group-policy",
+    "path": "src/windows/win-reset-group-policy.ps1",
+    "description": "Clears local Group Policy on an offline Windows disk when a VM boots but refuses every logon because of its own policy: Software Restriction Policies set to Disallowed, AppLocker enforcing rules that do not permit userinit.exe or explorer.exe, or a machine startup or user logon script that hangs. Reports what is configured and which of those three is set before changing anything. Renames the GroupPolicy and GroupPolicyUsers folders aside instead of deleting them and backs up the SOFTWARE hive, so both halves can be undone. Use parameter scope=files for the reversible half only, or detectOnly=true to report and change nothing. This is a deliberate blanket reset, not a targeted repair. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-logon-subsystem",
+    "path": "src/windows/win-fix-logon-subsystem.ps1",
+    "description": "Repairs the offline logon path behind stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI, and \"The User Profile Service service failed the sign-in\". Checks Session Manager BootExecute and SetupExecute, the SYSTEM\\Setup setup-mode command, Winlogon Shell and Userinit, and the ProfileList entries, resolving every command against the binary it actually names on the attached disk. Removes only the entries whose binary is missing, keeps the ones that resolve, and writes a Windows default back only when removing the broken entries would leave the value empty. Backs up each hive before it is written. Pass detectOnly=true to report only. Clearing local Group Policy is a separate job, handled by win-reset-group-policy. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-rdp-certificate",
+    "path": "src/windows/win-fix-rdp-certificate.ps1",
+    "description": "Restores the private key permissions behind the Remote Desktop listener certificate on a VM whose RDP service is running and listening but drops every connection at the TLS handshake. TermService runs as NETWORK SERVICE and must read the listener's key container under ProgramData\\Microsoft\\Crypto\\RSA\\MachineKeys; strip that one entry, usually with a hardening pass over MachineKeys, and the service still starts, still listens and still fails every connection. Windows never recovers from it, because the certificate has not expired and so nothing triggers regeneration. Only a NETWORK SERVICE entry that is missing or denied on a Remote Desktop key container triggers a repair, so a healthy VM produces no findings and nothing is written. A missing certificate or key container is deliberately not repaired, because Windows mints a new one itself on the next start. The permissions written are the ones measured on healthy marketplace images of 2012 R2, 2016, 2019, 2022, 2025 and Windows 11, and the build-dependent third entry - Administrators before 17763, NT SERVICE\\SessionEnv from 17763 - is chosen from the offline build number rather than guessed. Existing permissions are added to, never replaced, and ownership is only taken when a write is refused and is handed straight back. Certificate services left disabled are repaired; Remote Desktop's own services are reported with win-fix-rdp-connectivity, which owns them. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-rdp-connectivity",
+    "path": "src/windows/win-fix-rdp-connectivity.ps1",
+    "description": "Restores Remote Desktop on a VM that boots and answers on the network but refuses every RDP connection. Repairs fDenyTSConnections on both the Terminal Server key and the Group Policy copy that overrides it, Remote Desktop services left disabled, listener values outside their documented range, a certificate pinned to the listener whose private key no longer resolves, and TLS 1.2 explicitly disabled in SCHANNEL. Every value written is the one specified by \"Prepare a Windows VHD to upload to Azure\", so the VM comes back configured the way Azure supports rather than reset to a Windows default. Only evidence that RDP is actually prevented triggers a repair, so a healthy VM produces no findings and nothing is written. Network and firewall services are reported with the script that owns them rather than changed here. NLA is never turned off, the listener port is never reset and the SSL cipher suite policy is never cleared unless asked for by name; the CredSSP encryption oracle is never weakened at all. Pass detectOnly=true to report only, or applyAzureBaseline=true to also apply the documented keep-alive, reconnect and listener values. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-firewall-service",
+    "path": "src/windows/win-fix-firewall-service.ps1",
+    "description": "Restores the Windows Defender Firewall service on a VM that boots, reports Ready and listens on 3389, yet answers nothing from the virtual network - ICMP included - because mpssvc is not running and the boot-time filters Windows installs before it starts are still blocking everything. Repairs a DebugedLoopbackApps loopback exemption value that mpssvc cannot read, under Services\\mpssvc\\Parameters\\AppCs, and MpsSvc or the Base Filtering Engine under it left Disabled. Measured on a live build 20348 VM one reboot at a time: CheckNetIsolation writes that value as REG_SZ, and every value of another type stopped the service on every boot - an empty REG_MULTI_SZ as reliably as one holding 700 SIDs - while an empty REG_SZ and a one-SID REG_SZ are both healthy. There is no size or entry-count threshold, so a wrong registry type is treated as conclusive on its own and a correctly typed value is only removed when the offline System log shows this machine's firewall service failing to start. A healthy VM therefore produces no findings and nothing is written. The AppCs key denies read to every account including SYSTEM; it is opened with SeBackupPrivilege and REG_OPTION_BACKUP_RESTORE rather than by taking ownership, so no security descriptor is altered to look at a machine that may have nothing wrong with it. Only Start=4 is treated as evidence, so a deliberately demand-started service is never corrected. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-fix-ntfs-attribute-list",
+    "path": "src/windows/win-fix-ntfs-attribute-list.ps1",
+    "description": "Repairs the NTFS metafile attribute list entries that make a volume fail to mount with stop error 0x24 NTFS_FILE_SYSTEM, typically after a servicing operation. Corrects the single non-canonical name offset byte in place. This is not a chkdsk wrapper and chkdsk is not a substitute: faced with this layout chkdsk discards the whole attribute list, which orphans the child records it referenced and can leave $Secure without its security descriptor stream. Scans the reserved file records of every NTFS volume on the attached disk, writes a byte level restore manifest before the first write, and verifies through the same locked handle. Nothing is written when no correctable entry is found. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-toggle-safe-mode",
+    "path": "src/windows/win-toggle-safe-mode.ps1",
+    "description": "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
+  },
+  {
+    "id": "win-dumpconfigurator",
+    "path": "src/windows/win-dumpconfigurator.ps1",
+    "description": "Changes the dump configuration of a VM while its running without the need to reboot it. Which is to say, you can change the dump configuration from Kernel to Full without a reboot."
+  },
+  {
+    "id": "win-collect-attached-disk-logs",
+    "path": "src/windows/win-collect-attached-disk-logs.ps1",
+    "description": "Collect OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk."
+  },
+  {
+    "id": "win-create-troubleshooting-user",
+    "path": "src/windows/win-create-troubleshooting-user.ps1",
+    "description": "Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account."
+  },
+  {
+    "id": "win-add-temp-user",
+    "path": "src/windows/win-add-temp-user.ps1",
+    "description": "Creates a local administrator account on an attached OS disk by booting it in the nested Hyper-V guest and letting Windows itself create the account, so the SAM database is never edited by hand. Uses the SYSTEM\\Setup CmdLine hook rather than a Group Policy startup script, which is what makes it work on a domain-joined VM where local Group Policy may not apply. Confirms the account exists afterwards by reading the offline SAM and the result the payload left behind, and reports an error if neither confirms it. The file carrying the password deletes itself, and the setup hook is cleared, so nothing is left on the disk. Pass detectOnly=true to report only, or revert=true to undo a run that did not complete. Requires the rescue VM to be created with \"az vm repair create --enable-nested\". NOTE: use option --run-on-repair."
+  },
+  {
+    "id": "win-get-patches",
+    "path": "src/windows/win-get-patches.ps1",
+    "description": "Get installed Windows patches for the nested Hyper-V server on a Rescue VM using DISM."
+  },
+  {
+    "id": "win-remove-patch",
+    "path": "src/windows/win-remove-patch.ps1",
+    "description": "Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates."
+  },
+  {
+    "id": "win-get-apps",
+    "path": "src/windows/win-get-apps.ps1",
+    "description": "Get Windows applications for the nested Hyper-V machine that can be uninstalled from the Rescue VM."
+  },
+  {
+    "id": "win-remove-app",
+    "path": "src/windows/win-remove-app.ps1",
+    "description": "Remove an installed Windows application from the nested Hyper-V machine."
+  },
+  {
+    "id": "win-update-registry",
+    "path": "src/windows/win-update-registry.ps1",
+    "description": "Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk."
+  },
+  {
+    "id": "win-crowdstrike-fix-bootloop",
+    "path": "src/windows/win-crowdstrike-fix-bootloop.ps1",
+    "description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
+  },
+  {
+    "id": "win-crowdstrike-fix-bootloop-v2",
+    "path": "src/windows/win-crowdstrike-fix-bootloop-v2.ps1",
+    "description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
+  },
+  {
+    "id": "win-crowdstrike-fix-bootloop-cvm",
+    "path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
+    "description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
+  },
+  {
+    "id": "win-fix-third-party-drivers",
+    "path": "src/windows/win-fix-third-party-drivers.ps1",
+    "description": "Disables third party kernel drivers that stop a VM booting, refusing to touch any driver on the storage, network or boot path"
+  },
+  {
+    "id": "win-fix-pending-servicing",
+    "path": "src/windows/win-fix-pending-servicing.ps1",
+    "description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer"
+  },
+  {
+    "id": "win-fix-transaction-logs",
+    "path": "src/windows/win-fix-transaction-logs.ps1",
+    "description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again"
+  },
+  {
+    "id": "win-fix-network-connectivity",
+    "path": "src/windows/win-fix-network-connectivity.ps1",
+    "description": "Restores network connectivity on a VM that boots but is unreachable - disabled networking services, a static address Azure did not allocate, an orphaned network provider that hangs logon, or an unreachable machine proxy"
+  },
+  {
+    "id": "win-fix-bcd",
+    "path": "src/windows/win-fix-bcd.ps1",
+    "description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot"
+  },
+  {
+    "id": "win-fix-boot-partition",
+    "path": "src/windows/win-fix-boot-partition.ps1",
+    "description": "Repairs the system partition itself, the layer below the BCD store - a deleted EFI System Partition or System Reserved partition, an unformatted ESP, a missing 0x55AA boot signature, zeroed or NTLDR era bootstrap code, no Active partition or more than one, and a stale BPB HiddenSectors field that gives 'A disk read error occurred' after a partition move or restore while chkdsk and sfc report nothing"
+  },
+  {
+    "id": "win-fix-catalog-store",
+    "path": "src/windows/win-fix-catalog-store.ps1",
+    "description": "Rebuilds a damaged Authenticode catalog store on a VM that will not boot even though every file on it is byte-perfect, bugchecking 0x5A CRITICAL_SERVICE_FAILED or stopping with STATUS_INVALID_IMAGE_HASH (0xC0000428). Boot code integrity trusts a driver because its hash is published in a signed catalog, so a driver carrying no embedded signature cannot load once the catalog that published it is gone. Measured on a live build 20348 VM: of 126 boot-critical drivers, 12 carry no embedded signature and depend entirely on the store, and one of those 12 - FileCrypt - is ErrorControl=3 Critical, which is what turns a damaged store into a bugcheck. Detection asks the question boot code integrity asks rather than counting files: a boot-critical driver whose hash resolves in no catalog is the direct trigger, corroborated by a coverage ratio over eighteen inbox binaries that a healthy machine resolves 18 of 18. Needs no donor disk: every inbox catalog is a payload file of the servicing package that delivered it, and the guest's own copy is still on the broken disk under Windows\\\\servicing\\\\Packages - measured 50 of 50 byte-identical to the store copies, covering 12 of 12 catalog-dependent boot drivers, and the same build and patch level by construction. Merging is additive and never overwrites a catalog that opens; only zero-length or truncated files are replaced, and a same-named catalog with different content is kept alongside rather than discarded. CatRoot2 is a CryptSvc database that is not consulted during boot and is not touched. A healthy VM produces no findings and nothing is written. Pass donorPath to merge from another machine at the same build and patch level instead, and detectOnly=true to report only. NOTE: use option --run-on-repair."
+  }
 ]
