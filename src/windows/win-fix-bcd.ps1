@@ -129,6 +129,38 @@ $isDetectOnly = ($detectOnly -eq 'true')
 $isRebuildForced = ($rebuild -eq 'true')
 $isRevert = ($revert -eq 'true')
 
+function Write-OperatorLog {
+    <#
+    .SYNOPSIS
+        Flushes buffered helper narration, keeping the returned log inside its budget.
+
+    .DESCRIPTION
+        az vm repair run returns at most 4096 characters and keeps the tail, so step by
+        step narration goes to the detail log on disk only. Warnings and errors are still
+        surfaced, because those are the lines that change what the operator does next.
+
+        Call this only at script level, for the same reason Write-OfflineRepairLog carries
+        that restriction: it writes to the output stream.
+    #>
+    $entries = @(Get-OfflineRepairLog)
+    Clear-OfflineRepairLog
+    if ($entries.Count -eq 0) { return }
+
+    foreach ($entry in $entries) {
+        if ([string]::IsNullOrEmpty($entry.Message)) { continue }
+        "[$($entry.Level) $(Get-Date)]$($entry.Message)" | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
+    }
+
+    foreach ($entry in $entries) {
+        if ([string]::IsNullOrEmpty($entry.Message)) { continue }
+        switch ($entry.Level) {
+            'Warning' { Log-Warning $entry.Message }
+            'Error' { Log-Error $entry.Message }
+            'Output' { Log-Output $entry.Message }
+        }
+    }
+}
+
 # A BCD value that reads "unknown" is bcdedit telling us the device it recorded cannot be resolved
 # on this machine. It is the signature of a store written against a different disk layout.
 $script:UnknownDevicePattern = '(?i)\bunknown\b'
@@ -825,7 +857,7 @@ Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly, rebuild
 
 try {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber)), Gen$($offline.Generation) / $($offline.PartitionStyle)." | Tee-Object -FilePath $logFile -Append
 
@@ -839,7 +871,7 @@ try {
 
     if ($isRevert) {
         $reverted = Invoke-Revert -Offline $offline
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Write-OperatorLog
         if ($reverted) {
             Log-Output 'Revert complete. The boot configuration this script changed has been put back.' | Tee-Object -FilePath $logFile -Append
             Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -854,7 +886,7 @@ try {
     Log-Info "Expected loader: device/osdevice $($expected.DevicePartition), path '$($expected.LoaderPath)', systemroot '$($expected.SystemRoot)'." | Tee-Object -FilePath $logFile -Append
 
     $findings = @(Get-AllFinding -Offline $offline -Expected $expected)
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     $repairable = @($findings | Where-Object { $_.Repairable })
     $needsRebuild = @($repairable | Where-Object { $_.Tier -eq 'Rebuild' }).Count -gt 0
@@ -864,13 +896,16 @@ try {
             Log-Output 'Detect only: the boot configuration on this disk is consistent. No changes were made.' | Tee-Object -FilePath $logFile -Append
         }
         else {
-            Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
+            # The returned log keeps only its last 4096 characters, so the count is printed
+            # after the list it counts. Truncation then eats the oldest finding rather than
+            # the summary, and never leaves a bare total with nothing behind it.
             foreach ($finding in $findings) {
                 Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
             }
             if ($needsRebuild -or $isRebuildForced) {
                 Log-Output '  Repair would rebuild the store with bcdboot, because there is no sound entry left to correct.' | Tee-Object -FilePath $logFile -Append
             }
+            Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
         }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -889,9 +924,13 @@ try {
         return $STATUS_ERROR
     }
 
+    # The full list goes to the detail log and is repeated next to the final summary.
+    # Printing it here as well would spend the returned log's 4096 character budget on
+    # text that the repair narration below would then push out of the tail.
     foreach ($finding in $findings) {
-        Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        "[Output $(Get-Date)]  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
     }
+    Log-Output "Found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. Repairing now." | Tee-Object -FilePath $logFile -Append
 
     $backupPath = ''
     $activatedPartition = 0
@@ -905,7 +944,7 @@ try {
         }
 
         $rebuildResult = Invoke-BcdRebuild -Offline $offline
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Write-OperatorLog
 
         if (-not $rebuildResult.Success) {
             Log-Error $rebuildResult.Reason | Tee-Object -FilePath $logFile -Append
@@ -919,7 +958,7 @@ try {
     else {
         $backupPath = Backup-BcdStore -StorePath $offline.BcdStorePath
         Invoke-TargetedBcdRepair -StorePath $offline.BcdStorePath -Findings @($repairable | Where-Object { $_.Cause -ne 'BootPartitionActive' })
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Write-OperatorLog
     }
 
     foreach ($finding in @($repairable | Where-Object { $_.Cause -eq 'BootPartitionActive' })) {
@@ -928,14 +967,14 @@ try {
             $activatedPartition = [int]$finding.Data
         }
     }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     Save-RevertManifest -Offline $offline -BackupPath $backupPath -ActivatedPartition $activatedPartition
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     # Verify by detecting again. The repair is only finished when the disk itself says so.
     $remaining = @(Get-AllFinding -Offline $offline -Expected $expected)
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     $stillBroken = @($remaining | Where-Object { $_.Repairable })
     $manualOnly = @($remaining | Where-Object { -not $_.Repairable })
@@ -949,10 +988,15 @@ try {
     }
 
     $repairedCount = @($findings | Where-Object { $_.Repaired }).Count
-    Log-Output "Boot configuration repaired: $repairedCount issue(s) corrected and verified against the disk." | Tee-Object -FilePath $logFile -Append
+    # Lists first, count last: the returned log keeps only its tail, so a summary printed
+    # ahead of its own evidence is what survives when everything else is truncated away.
+    foreach ($finding in @($findings | Where-Object { $_.Repaired })) {
+        Log-Output "  [REPAIRED] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+    }
     foreach ($finding in $manualOnly) {
         Log-Output "  [MANUAL] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
     }
+    Log-Output "Boot configuration repaired: $repairedCount issue(s) corrected and verified against the disk." | Tee-Object -FilePath $logFile -Append
     if ($backupPath) { Log-Output "The previous BCD store was kept at $backupPath." | Tee-Object -FilePath $logFile -Append }
     Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append

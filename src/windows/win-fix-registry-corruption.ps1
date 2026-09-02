@@ -109,6 +109,39 @@ $isDetectOnly = ($detectOnly -eq 'true')
 $isRegBackAllowed = ($allowRegBack -eq 'true')
 $hiveFilter = if ($hive -eq 'all') { $null } else { $hive.ToUpperInvariant() }
 
+function Write-OperatorLog {
+    <#
+    .SYNOPSIS
+        Flushes buffered helper narration, keeping the returned log inside its budget.
+
+    .DESCRIPTION
+        az vm repair run returns at most 4096 characters and keeps the tail, so step by
+        step narration goes to the detail log on disk only. Warnings and errors are still
+        surfaced, because those are the lines that change what the operator does next:
+        a RegBack restore reverting account passwords is not a detail.
+
+        Call this only at script level, for the same reason Write-OfflineRepairLog carries
+        that restriction: it writes to the output stream.
+    #>
+    $entries = @(Get-OfflineRepairLog)
+    Clear-OfflineRepairLog
+    if ($entries.Count -eq 0) { return }
+
+    foreach ($entry in $entries) {
+        if ([string]::IsNullOrEmpty($entry.Message)) { continue }
+        "[$($entry.Level) $(Get-Date)]$($entry.Message)" | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
+    }
+
+    foreach ($entry in $entries) {
+        if ([string]::IsNullOrEmpty($entry.Message)) { continue }
+        switch ($entry.Level) {
+            'Warning' { Log-Warning $entry.Message }
+            'Error' { Log-Error $entry.Message }
+            'Output' { Log-Output $entry.Message }
+        }
+    }
+}
+
 # SYSTEM and SOFTWARE are required for the OS to start at all, so a problem with either is an
 # error. The rest degrade the installation without stopping the boot, so they are reported as
 # warnings and repaired opportunistically.
@@ -618,7 +651,7 @@ $scratchDir = Join-Path $env:TEMP "rsl-chkreg-$scriptStartTime"
 
 try {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
 
@@ -629,14 +662,17 @@ try {
 
     New-Item -Path $scratchDir -ItemType Directory -Force | Out-Null
     $chkRegPath = Get-ChkRegPath
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
     if ($chkRegPath) { Log-Info "Using chkreg.exe from $chkRegPath" | Tee-Object -FilePath $logFile -Append }
 
     $findings = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
+    # Per finding detail goes to the detail log; the repair narration below would push it
+    # out of the returned log's 4096 character tail anyway. The authoritative list is
+    # printed next to the final summary.
     foreach ($finding in $findings) {
-        Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        "[Info $(Get-Date)]FOUND [$($finding.Cause)] $($finding.Message)" | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
     }
 
     if ($findings.Count -eq 0) {
@@ -646,10 +682,12 @@ try {
     }
 
     if ($isDetectOnly) {
-        Log-Output "Detect only: found $($findings.Count) damaged hive(s). No changes were made." | Tee-Object -FilePath $logFile -Append
+        # Count last: the returned log keeps only its tail, so a summary printed ahead of
+        # its own evidence is what survives when the list behind it is truncated away.
         foreach ($finding in $findings) {
             Log-Output "  [FIXABLE] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
+        Log-Output "Detect only: found $($findings.Count) damaged hive(s). No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -671,11 +709,11 @@ try {
             if ($inPlace) {
                 $finding.Repaired = $true
                 [void]$repairedInPlace.Add($finding.Item)
-                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                Write-OperatorLog
                 continue
             }
         }
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Write-OperatorLog
         [void]$needRegBack.Add($finding.Item)
     }
 
@@ -686,7 +724,7 @@ try {
         }
         else {
             $plan = Get-RegBackPlan -ConfigPath $configPath -ChkRegPath $chkRegPath -ScratchDir $scratchDir
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            Write-OperatorLog
 
             foreach ($item in @($plan.Excluded)) {
                 Log-Info "RegBack excluded $($item.Name): $($item.Reason)" | Tee-Object -FilePath $logFile -Append
@@ -697,7 +735,7 @@ try {
             }
             else {
                 $restored = @(Restore-HiveFromRegBack -Plan $plan -Wanted ([string[]]@($needRegBack)))
-                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                Write-OperatorLog
                 foreach ($finding in $findings) {
                     if ($finding.Item -in $restored) { $finding.Repaired = $true }
                 }
@@ -715,7 +753,7 @@ try {
 
     # Verify against freshly read files rather than trusting the writes above.
     $remaining = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
 
     foreach ($finding in $remaining) {
         Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
@@ -739,13 +777,13 @@ try {
     return $STATUS_SUCCESS
 }
 catch {
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
 }
 finally {
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    Write-OperatorLog
     if ($scratchDir -and (Test-Path -LiteralPath $scratchDir)) {
         Remove-Item -LiteralPath $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
     }
