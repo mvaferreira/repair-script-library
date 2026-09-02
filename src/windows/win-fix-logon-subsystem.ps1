@@ -122,6 +122,9 @@ function New-Finding {
     .SYNOPSIS
         Builds one finding. Repairable=$false means the script reports it and changes nothing.
     #>
+    # This only builds an object in memory and touches nothing on the disk, so ShouldProcess would
+    # add a prompt with no console to answer it. Suppressed rather than implemented on purpose.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     param(
         [Parameter(Mandatory = $true)][string]$Cause,
         [Parameter(Mandatory = $true)][string]$Item,
@@ -808,10 +811,13 @@ try {
     $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
     if ($isDetectOnly) {
-        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
         foreach ($finding in $findings) {
             Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
+        # The count goes after the list on purpose. Run Command returns at most 4096 characters and
+        # keeps the tail, so a summary printed first is the first thing a long detect run loses -
+        # which is how a run once reported every finding truncated away and still looked successful.
+        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
