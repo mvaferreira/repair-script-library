@@ -1192,6 +1192,38 @@ function Restore-OfflineSetupHook {
 }
 
 
+function Get-AttachedWindowsInstallation {
+    <#
+        .SYNOPSIS
+            Returns the drive roots of any Windows installation attached to this machine other than
+            the one it booted from.
+
+        .DESCRIPTION
+            Used only to tell "there is genuinely no offline disk here" apart from "the disk is
+            there and something went wrong looking at it". Those two must not be confused: the
+            first is the normal online case, while the second, if it were treated as online, would
+            repair the rescue VM's own rights and report success while the patient disk was never
+            touched.
+
+            Deliberately independent of Get-OfflineWindowsDisk so it cannot fail the same way for
+            the same reason. It looks for the SECURITY hive rather than just a Windows folder,
+            because the hive is what this repair actually needs.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $systemRoot = "$($env:SystemDrive)".TrimEnd('\')
+    $found = @()
+
+    foreach ($vol in @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter })) {
+        $root = "$($vol.DriveLetter):"
+        if ($root -eq $systemRoot) { continue }
+        if (Test-Path -LiteralPath (Join-Path $root 'Windows\System32\config\SECURITY')) { $found += $root }
+    }
+
+    return $found
+}
+
 function Write-RevertManifest {
     <#
     .SYNOPSIS
@@ -1369,10 +1401,20 @@ try {
     # Getting this wrong is safe in the direction that matters: run online on a rescue VM by
     # mistake and that VM's rights are already the default, so detect returns nothing and nothing
     # is written.
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+    # Get-OfflineWindowsDisk throws when it finds no attached Windows installation. On a rescue VM
+    # that is a genuine failure, but online it is simply the correct answer, so the absence has to
+    # be read rather than allowed to end the run. It is confirmed independently before it is
+    # believed: a helper that failed for some other reason while a patient disk really is attached
+    # must stay loud, or this run would quietly repair the rescue VM's own rights and call it a fix.
+    $offline = $null
+    $offlineProbeError = $null
+    try { $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive }
+    catch { $offlineProbeError = $_ }
     Write-OperatorLog
 
-    $script:OnlineMode = (-not $offline -or -not $offline.WindowsPath)
+    if ($offlineProbeError -and @(Get-AttachedWindowsInstallation).Count -gt 0) { throw $offlineProbeError }
+
+    $script:OnlineMode = ($offlineProbeError -or -not $offline -or -not $offline.WindowsPath)
 
     if ($script:OnlineMode) {
         $windowsPath = $env:windir
