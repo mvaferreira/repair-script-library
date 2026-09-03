@@ -931,7 +931,13 @@ function Get-LogonRightRepairPlan {
             })
     }
 
-    return , @($plan)
+    # Emitted as plain output, not comma-wrapped. The ",@(...)" idiom defeats unrolling, which is
+    # right when a caller assigns the result directly - but every caller here normalises with @(),
+    # and the two together stop cancelling out: an empty plan arrives as one element holding an
+    # empty array, and a multi-entry plan arrives as one element holding all of them, whose .Sid
+    # member-enumerates into a single space-joined string. A one-entry plan is the only shape that
+    # survives, which is why this stayed hidden.
+    return @($plan)
 }
 
 function Set-OfflineLogonRight {
