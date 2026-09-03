@@ -1,11 +1,26 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   Repairs user rights that a removed Group Policy left tattooed on an offline disk, so a VM that
-#   refuses RDP - or refuses every logon - can be signed into again.
+#   Repairs user rights that a removed Group Policy left tattooed, so a VM that refuses RDP - or
+#   refuses every logon - can be signed into again. Works on the running VM or on its disk.
 #
 # .DESCRIPTION
-#   Runs against the broken OS disk attached to a rescue VM by "az vm repair create".
+#   Runs in one of two modes, chosen by how it is launched rather than by a parameter:
+#
+#     az vm repair run ... --run-id win-fix-user-rights                   ONLINE  - repairs this VM
+#     az vm repair run ... --run-id win-fix-user-rights --run-on-repair   OFFLINE - repairs the disk
+#
+#   ONLINE FIRST. A user-rights lockout stops people signing in; it does not stop the machine
+#   running or the guest agent answering. So the usual case needs no rescue VM at all: Run Command
+#   executes as NT AUTHORITY\SYSTEM, and Windows rewrites its own policy through secedit - the
+#   supported writer, which also recreates a deleted account entry itself. Escalate to OFFLINE only
+#   when the VM cannot boot or the agent does not answer.
+#
+#   The mode is discovered, not declared, because the extension gives the script no way to know
+#   which way it was launched: an attached offline Windows installation means OFFLINE, and its
+#   absence means the machine underfoot is the target. Getting that wrong is safe in the direction
+#   that matters - a rescue VM has default rights, so an ONLINE run there finds nothing to repair
+#   and writes nothing.
 #
 #   THE FAULT
 #
@@ -22,8 +37,9 @@
 #
 #   WHAT THIS REPAIR CHANGES, AND WHAT IT REFUSES TO
 #
-#   Logon rights live in the SECURITY hive as one bitmask per account, and the repair rewrites the
-#   bits behind the fault in place, on the disk, while it is attached to the rescue VM.
+#   Logon rights live in the SECURITY hive as one bitmask per account. Offline, the repair rewrites
+#   the bits behind the fault in place, on the disk, while it is attached to the rescue VM. Online,
+#   it never touches the hive at all - secedit does the writing.
 #
 #   The line the script draws is between correcting an entry and inventing policy structure.
 #   Overwriting an existing four-byte ActSysAc value - type preserved, result read back and compared
@@ -50,9 +66,10 @@
 #   written everywhere else. If the descriptor cannot be read, the entry is not created and the gap
 #   is reported with the online command that closes it.
 #
-#   WHY NOT SECEDIT
+#   WHY NOT SECEDIT OFFLINE
 #
-#   secedit is the supported writer for user rights, but it cannot run against an offline disk: it
+#   secedit is the supported writer for user rights, and the ONLINE mode uses it for exactly that
+#   reason. It cannot run against an offline disk: it
 #   talks to a live LSA through the policy API, not to a hive file. Reaching it from here means
 #   arming SYSTEM\Setup\CmdLine and letting the VM repair itself on the next boot - which works,
 #   and was measured working, but cannot clean up after itself. See WHY THIS IS NOT DONE WITH
@@ -138,10 +155,13 @@
 #
 # .PARAMETER revert
 #   Put the logon-right masks recorded by the last repair back as they were, and clear any Setup
-#   hook left behind by an earlier version of this script.
+#   hook left behind by an earlier version of this script. An account entry the repair recreated is
+#   deliberately left in place - deleting one to reimpose a lockout is the riskier write and not a
+#   rollback worth doing automatically - so revert names it and reports itself as partial.
 #
 # .PARAMETER windowsDrive
-#   Drive letter of the offline Windows installation, when it should not be auto-detected.
+#   Drive letter of the offline Windows installation, when it should not be auto-detected. Offline
+#   mode only; it is ignored on a running machine, which has no attached installation to point at.
 #
 # .PARAMETER force
 #   Carry on past a clean detect instead of returning early. The plan is built from the same
@@ -149,10 +169,13 @@
 #   force cannot turn this into a blanket reset of the machine's user rights.
 #
 # .EXAMPLE
-#   az vm repair create -g sourceRG -n sourceVM --verbose
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --parameters detectOnly=true --run-on-repair --verbose
+#   # Online first - no rescue VM. Detect, then repair.
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --parameters detectOnly=true --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --verbose
 #
 # .EXAMPLE
+#   # Offline - only when the VM cannot boot or its agent does not answer.
+#   az vm repair create -g sourceRG -n sourceVM --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --run-on-repair --verbose
 #   az vm repair restore -g sourceRG -n sourceVM --yes
 #
