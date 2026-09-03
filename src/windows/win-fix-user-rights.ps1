@@ -254,9 +254,14 @@ function ConvertTo-LogonRightName {
     #>
     param([Parameter(Mandatory = $true)][uint32]$Mask)
 
+    # Enumerated, not indexed. LogonRightBits is an OrderedDictionary keyed by integers, and an
+    # integer in the indexer binds to the positional overload: $LogonRightBits[0x0400] asks for the
+    # item at index 1024, which is out of range and comes back empty, while $LogonRightBits[0x0004]
+    # quietly returns the fifth entry. Decoding through the indexer reported every healthy disk as
+    # having lost its logon rights - measured on a stock 20348 disk, not theorised.
     $names = @()
-    foreach ($bit in $script:LogonRightBits.Keys) {
-        if ($Mask -band $bit) { $names += $script:LogonRightBits[$bit] }
+    foreach ($entry in $script:LogonRightBits.GetEnumerator()) {
+        if ($Mask -band $entry.Key) { $names += $entry.Value }
     }
     return , $names
 }
@@ -692,7 +697,10 @@ function Get-UserRightsFinding {
         }
     }
 
-    return , @($findings)
+    # Not comma-wrapped. The caller collects this with @(), and a comma wrap plus that @() nest the
+    # array one level deeper: three findings arrive as a single item whose .Cause member-enumerates
+    # to all three names and whose .Item resolves to the IList indexer rather than a value.
+    return @($findings)
 }
 
 #########################################################################################################
