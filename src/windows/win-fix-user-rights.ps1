@@ -1664,6 +1664,14 @@ try {
     # and returned untouched - the plan is legitimately empty in exactly that case.
     $absentTargets = @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
 
+    # Stated before the first write, not after. A repair that reports only what it managed to do
+    # cannot be checked against what it intended to do, and the SID is carried alongside the name
+    # so an entry that resolves to nothing is still identifiable.
+    Log-Output ("Plan: {0} mask change(s), {1} account entry/entries to recreate." -f $plan.Count, $absentTargets.Count) | Tee-Object -FilePath $logFile -Append
+    foreach ($entry in $plan) {
+        Log-Output ("  PLAN [{0}] {1}: 0x{2:X4} -> 0x{3:X4} ({4})" -f $entry.Sid, $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+    }
+
     if ($plan.Count -eq 0 -and $absentTargets.Count -eq 0 -and -not $staleSetupType) {
         Log-Output "Nothing was changed: the logon-right masks on $($script:TargetNoun) already permit sign-in." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -1722,7 +1730,8 @@ try {
             Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
         }
         foreach ($failure in @($write.Failed)) {
-            Log-Error ("  [FAILED] {0}: {1}" -f $failure.Entry.Name, $failure.Error) | Tee-Object -FilePath $logFile -Append
+            $label = if ([string]::IsNullOrWhiteSpace($failure.Entry.Name)) { "SID $($failure.Entry.Sid)" } else { $failure.Entry.Name }
+            Log-Error ("  [FAILED] {0}: {1}" -f $label, $failure.Error) | Tee-Object -FilePath $logFile -Append
         }
     }
 

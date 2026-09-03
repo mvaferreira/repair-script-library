@@ -1743,7 +1743,7 @@ function Set-OfflinePrivilegedRegistryValue {
 
     $rc = [OfflinePrivilegedRegistry]::SetValue($subKey, $Name, $Type, $Bytes)
     if ($rc -ne 0) {
-        $result.Error = "$Name could not be written (error $rc)."
+        $result.Error = "$(if ([string]::IsNullOrEmpty($Name)) { 'the default value' } else { $Name }) could not be written (error $rc)."
         return $result
     }
 
