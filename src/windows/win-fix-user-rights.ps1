@@ -20,31 +20,33 @@
 #   "The connection was denied because the user account is not authorized for remote login."
 #   Nothing in the network path is wrong, so the network path is not where the repair belongs.
 #
-#   WHY THE REPAIR IS A FIRST-BOOT HOOK AND NOT AN OFFLINE WRITE
+#   WHAT THIS REPAIR CHANGES, AND WHAT IT REFUSES TO
 #
-#   The repair is 'secedit /configure', and secedit cannot run against an offline disk: it talks to
-#   a live LSA through the policy API, not to a hive file. So the repair is armed rather than
-#   applied. This script writes a payload to the disk and points SYSTEM\Setup\CmdLine at it with
-#   SetupType 2, which is the hook the session manager runs in a SYSTEM console session before the
-#   logon UI appears. The VM applies its own repair on the next boot, then clears the hook and
-#   deletes the payload.
+#   Logon rights live in the SECURITY hive as one bitmask per account, and the repair rewrites the
+#   bits behind the fault in place, on the disk, while it is attached to the rescue VM.
 #
-#   That hook is used rather than a Group Policy startup script because a domain-joined VM can have
-#   its local Group Policy state replaced by the domain's own, which is exactly the situation this
-#   fault tends to arise in. SYSTEM\Setup is not Group Policy, so domain policy does not affect it.
+#   The line the script draws is between correcting an entry and creating one. Overwriting an
+#   existing four-byte ActSysAc value - type preserved, result read back and compared byte for byte
+#   - cannot change the shape of the database. Creating an account that is not there would mean
+#   synthesising its Sid, Privilgs and SecDesc blobs, and hand-building that structure is how
+#   offline tools corrupt a policy database. An LSA that cannot parse its own policy database stops
+#   the machine with 0xC000021A, and that is not recoverable by dropping in a clean SECURITY hive,
+#   because the same hive holds the machine account password and the DPAPI backup keys. Trading a
+#   refused logon for an unbootable VM is not a repair, so the script never creates an account
+#   entry - it reports the gap and the one online command that closes it.
 #
-#   WHY IT DOES NOT WRITE THE RIGHTS DIRECTLY
+#   WHY NOT SECEDIT
 #
-#   Logon rights live in the SECURITY hive as a bitmask per account, and this script reads them from
-#   there. Writing them back by hand is a different proposition: the LSA policy database also holds
-#   the privilege LUID lists and the security descriptors that reference them, and hand-editing that
-#   structure is how offline tools corrupt a policy database. secedit is the supported writer, so
-#   secedit does the writing.
+#   secedit is the supported writer for user rights, but it cannot run against an offline disk: it
+#   talks to a live LSA through the policy API, not to a hive file. Reaching it from here means
+#   arming SYSTEM\Setup\CmdLine and letting the VM repair itself on the next boot - which works,
+#   and was measured working, but cannot clean up after itself. See WHY THIS IS NOT DONE WITH
+#   SECEDIT below for what that leaves behind.
 #
 #   DETECTION, AND WHY A HEALTHY DISK IS LEFT ALONE
 #
-#   The library rule is that a blanket reset is never armed on a VM whose rights are fine, so the
-#   fault is confirmed from the offline disk first. Logon rights are readable without a live LSA:
+#   The library rule is that nothing is changed on a VM whose rights are fine, so the fault is
+#   confirmed from the offline disk first. Logon rights are readable without a live LSA:
 #
 #     SECURITY\Policy\Accounts\<SID>\ActSysAc
 #
@@ -120,14 +122,16 @@
 #   Report what is on the disk and change nothing.
 #
 # .PARAMETER revert
-#   Undo the Setup hook and remove the payload, restoring SYSTEM\Setup to what was recorded.
+#   Put the logon-right masks recorded by the last repair back as they were, and clear any Setup
+#   hook left behind by an earlier version of this script.
 #
 # .PARAMETER windowsDrive
 #   Drive letter of the offline Windows installation, when it should not be auto-detected.
 #
 # .PARAMETER force
-#   Arm the reset even when detection finds nothing wrong. Off by default on purpose: a blanket
-#   user-rights reset on a VM whose rights are fine is a change with no fault behind it.
+#   Carry on past a clean detect instead of returning early. The plan is built from the same
+#   conditions detect reports, so on a healthy disk it comes out empty and nothing is written -
+#   force cannot turn this into a blanket reset of the machine's user rights.
 #
 # .EXAMPLE
 #   az vm repair create -g sourceRG -n sourceVM --verbose
@@ -142,8 +146,8 @@
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
-#   The repair completes on the next boot of the repaired VM, not on the rescue VM. After
-#   'az vm repair restore', the first boot runs the payload before the logon UI appears.
+#   The repair is finished when 'az vm repair run' returns. Nothing is armed on the disk and the VM
+#   needs no extra boot, so 'az vm repair restore' and starting the VM is all that remains.
 #
 # .VERSION
 #   v1.0: Initial version.
@@ -901,7 +905,7 @@ try {
             Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
         }
 
-        Log-Output 'The user rights themselves are not changed by a revert. Nothing was applied on this disk: the reset runs on the next boot, so undoing the hook before that boot is all there is to undo.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The masks above are back to what they were before this script ran, so the logon rights are once again whatever they were on arrival - including the fault, if the disk arrived with one.' | Tee-Object -FilePath $logFile -Append
         Log-Output "REVERT COMPLETE: restored $restoredCount item(s)." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -928,17 +932,19 @@ try {
 
     $findings = @(Get-UserRightsFinding -Accounts @($rights.Accounts))
 
+    # SYSTEM\Setup is read for reporting only now: the repair writes to the SECURITY hive and never
+    # touches it. An unreadable SYSTEM hive is worth saying out loud, but it is not a reason to
+    # refuse a logon-right repair that does not depend on it.
     $setupState = Get-OfflineSetupState -WindowsPath $windowsPath
     if (-not $setupState.Available) {
-        Log-Error "The Setup hook cannot be used on this disk: $($setupState.Reason)." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
+        Log-Warning "SYSTEM\Setup could not be read on this disk ($($setupState.Reason)), so the boot-time state is unknown. The logon-right repair does not depend on it, so it continues." | Tee-Object -FilePath $logFile -Append
     }
 
     # A setup command already pointing at something real is a servicing or provisioning step. The
     # repair no longer touches SYSTEM\Setup at all, so this does not block anything - it is
     # reported because an operator looking at a machine that will not sign in needs to know the
     # image is part way through something.
-    $hookInUse = ($setupState.SetupType -ne 0 -and
+    $hookInUse = ($setupState.Available -and $setupState.SetupType -ne 0 -and
         -not [string]::IsNullOrWhiteSpace($setupState.CmdLine) -and
         $setupState.CmdLine -notlike '*win-fix-user-rights*')
 
@@ -990,13 +996,13 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
 
     if ($repairable.Count -eq 0 -and -not $isForced) {
-        Log-Output 'Nothing was changed: this disk has no user-rights fault to repair. Re-run with -force true to apply the standard logon rights anyway.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'Nothing was changed: this disk has no user-rights fault to repair.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
 
     if ($repairable.Count -eq 0 -and $isForced) {
-        Log-Warning 'FORCED: no fault was detected, so the standard logon rights are applied anyway. Only the specific bits this script manages are touched; every other right on the disk is left as it is.' | Tee-Object -FilePath $logFile -Append
+        Log-Warning 'FORCED: no fault was detected. The plan is derived from the same conditions detect reports, so on a disk that is already healthy it comes out empty and nothing is written.' | Tee-Object -FilePath $logFile -Append
     }
 
     $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts))
@@ -1058,7 +1064,12 @@ try {
         Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf  then add the SID to SeRemoteInteractiveLogonRight and re-import with secedit /configure /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
     }
 
-    Log-Output "Verified on this disk: SetupType=$($final.SetupType), no boot-time command armed." | Tee-Object -FilePath $logFile -Append
+    if ($final.Available) {
+        Log-Output "Verified on this disk: SetupType=$($final.SetupType), no boot-time command armed." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Output 'SYSTEM\Setup could not be read back, so the boot-time state is unverified. This repair never writes to it.' | Tee-Object -FilePath $logFile -Append
+    }
     Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
     return $STATUS_SUCCESS
