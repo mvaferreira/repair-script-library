@@ -1457,7 +1457,16 @@ try {
                 })
 
             if ($script:OnlineMode) {
-                $backResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($undo) -Absent @()
+                # Read live first. secedit rewrites each named right in full, so the current holder
+                # list is what stops the undo from stripping every other account off the rights it
+                # touches. Detect has not run at this point, so nothing else has read it yet.
+                $liveNow = Get-LiveLogonRight
+                if (-not $liveNow.Ok) {
+                    Log-Error "The current logon rights could not be read, so the undo was not applied: $($liveNow.Reason)." | Tee-Object -FilePath $logFile -Append
+                    return $STATUS_ERROR
+                }
+
+                $backResult = Repair-LiveLogonRight -Accounts @($liveNow.Accounts) -Plan @($undo) -Absent @()
                 if ($backResult.Ok) {
                     $back = [PSCustomObject]@{ Applied = @($undo); Failed = @() }
                 }
@@ -1648,21 +1657,40 @@ try {
         # One secedit call carries both halves: the mask corrections and any account entry the
         # policy deleted outright. Windows recreates the entry itself, so nothing here has to
         # assemble LSA policy structure by hand.
-        $applyResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($plan) `
-            -Absent @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+        $absentTargets = @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+        $applyResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($plan) -Absent $absentTargets
 
         Log-Output '' | Tee-Object -FilePath $logFile -Append
 
         if (-not $applyResult.Ok) {
             Log-Error "  [FAILED] secedit could not apply the repair: $($applyResult.Reason)" | Tee-Object -FilePath $logFile -Append
-            $write = [PSCustomObject]@{ Applied = @(); Failed = @(@{ Entry = @{ Name = 'secedit' }; Error = $applyResult.Reason }) }
+            $write = [PSCustomObject]@{
+                Ok      = $false
+                Reason  = $applyResult.Reason
+                Applied = @()
+                Failed  = @(@{ Entry = @{ Name = 'secedit' }; Error = $applyResult.Reason })
+            }
         }
         else {
             foreach ($entry in @($plan)) {
                 Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
             }
+
+            # Reported separately because these accounts have no mask to move from: the policy
+            # deleted the entry outright, so there is no "0x... -> 0x..." to show. Leaving them out
+            # of the output entirely would under-report the repair - the RDP group most VMs rely on
+            # is usually exactly this case.
+            foreach ($target in $absentTargets) {
+                Log-Output ("  [FIXED] {0}: entry recreated by Windows, granted {1}" -f $target.Name, $target.Right) | Tee-Object -FilePath $logFile -Append
+            }
+
             Log-Output ("  Applied through secedit, rewriting only: {0}" -f (@($applyResult.Applied) -join ', ')) | Tee-Object -FilePath $logFile -Append
-            $write = [PSCustomObject]@{ Applied = @($plan); Failed = @() }
+            $write = [PSCustomObject]@{
+                Ok      = $true
+                Reason  = ''
+                Applied = @(@($plan) + @($absentTargets))
+                Failed  = @()
+            }
         }
     }
     else {
