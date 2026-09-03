@@ -1446,6 +1446,60 @@ function Get-OfflinePrivilegedRegistryValueName {
     return $result
 }
 
+function Get-OfflinePrivilegedRegistrySubKeyName {
+    <#
+    .SYNOPSIS
+        Listing the subkeys of a key that may deny read to every account, SYSTEM included.
+
+    .DESCRIPTION
+        The counterpart of Get-OfflinePrivilegedRegistryValueName, for callers that have to walk a
+        protected tree rather than read one key. The offline SECURITY hive is the case that needs
+        it: Policy\Accounts holds one subkey per account that has been granted a logon right or a
+        privilege, and neither the provider nor the .NET registry classes can enumerate it.
+
+        As with the value-name listing, "the key has no subkeys" and "the key could not be opened"
+        are different answers. Ok is $false only when something went wrong; a key that is genuinely
+        absent comes back Ok with Exists $false.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Ok = $false; Exists = $false; Names = @(); Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    [void](Enable-OfflineBackupPrivilege)
+    Initialize-OfflinePrivilegedRegistryType
+
+    $exists = $false
+    $rc = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
+    if ($rc -ne 0) {
+        $result.Error = "The key could not be opened (error $rc)."
+        return $result
+    }
+    if (-not $exists) {
+        $result.Ok = $true
+        return $result
+    }
+
+    $names = $null
+    $rc = [OfflinePrivilegedRegistry]::SubKeyNames($subKey, [ref]$names)
+    if ($rc -ne 0) {
+        $result.Exists = $true
+        $result.Error = "The key opened but its subkeys could not be listed (error $rc)."
+        return $result
+    }
+
+    $result.Ok = $true
+    $result.Exists = $true
+    $result.Names = @($names)
+    return $result
+}
+
 function Get-OfflinePrivilegedRegistryValue {
     <#
     .SYNOPSIS
@@ -1457,11 +1511,17 @@ function Get-OfflinePrivilegedRegistryValue {
         string array cannot report either the type or the true byte length.
 
         Strings decodes REG_SZ, REG_EXPAND_SZ and REG_MULTI_SZ. Anything else is left to Bytes.
+
+        Name accepts an empty string, which is how the Win32 registry API names a key's default
+        (unnamed) value. Without AllowEmptyString the binder rejects the call before the function
+        runs, which is not a theoretical concern: the offline SECURITY hive keeps the logon-right
+        mask in the default value of Policy\Accounts\<SID>\ActSysAc, so that is the only way to
+        read it.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Name
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name
     )
 
     $result = [PSCustomObject]@{

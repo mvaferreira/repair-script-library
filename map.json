@@ -145,6 +145,11 @@
 		"description" : "Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account."
 	},
 	{
+		"id" : "win-fix-user-rights",
+		"path" : "src/windows/win-fix-user-rights.ps1",
+		"description" : "Repairs user rights left tattooed on an attached OS disk after the Group Policy that set them was removed, which is a common cause of a VM that is running and reachable on 3389 but still answers every RDP attempt with \"the user account is not authorized for remote login\". Confirms the fault first by decoding the logon-right masks in the offline SECURITY hive, so a disk whose rights are healthy is never touched. Because secedit needs a live LSA and cannot run offline, the reset is armed as a SYSTEM\\Setup CmdLine hook that applies defltbase.inf scoped to /areas USER_RIGHTS on the next boot, then clears itself and deletes its payload; before and after exports are left on the disk as the audit trail. Pass detectOnly=true to report only, revert=true to undo an armed run, or force=true to reset rights when no fault was detected. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-add-temp-user",
 		"path" : "src/windows/win-add-temp-user.ps1",
 		"description" : "Creates a local administrator account on an attached OS disk by booting it in the nested Hyper-V guest and letting Windows itself create the account, so the SAM database is never edited by hand. Uses the SYSTEM\\Setup CmdLine hook rather than a Group Policy startup script, which is what makes it work on a domain-joined VM where local Group Policy may not apply. Confirms the account exists afterwards by reading the offline SAM and the result the payload left behind, and reports an error if neither confirms it. The file carrying the password deletes itself, and the setup hook is cleared, so nothing is left on the disk. Pass detectOnly=true to report only, or revert=true to undo a run that did not complete. Requires the rescue VM to be created with \"az vm repair create --enable-nested\". NOTE: use option --run-on-repair."
