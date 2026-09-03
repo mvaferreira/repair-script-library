@@ -1257,13 +1257,22 @@ function Write-RevertManifest {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ManifestPath,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan,
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][array]$Recreated = @()
     )
 
     try {
         $manifest = [PSCustomObject]@{
             Script   = 'win-fix-user-rights'
             Written  = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
+            # Recorded so revert can say what it is deliberately NOT undoing. An entry the fault
+            # deleted is put back by this repair, and revert leaves it: deleting an LSA account
+            # entry to reimpose a lockout is not a rollback anyone wants, and it is the riskier
+            # write of the two. Naming it is the difference between a revert that is partial and
+            # one that is partial without saying so.
+            Recreated = @($Recreated | ForEach-Object {
+                    [PSCustomObject]@{ Sid = [string]$_.Sid; Name = [string]$_.Name; Right = [string]$_.Right }
+                })
             Accounts = @($Plan | ForEach-Object {
                     [PSCustomObject]@{
                         Sid          = $_.Sid
@@ -1539,7 +1548,21 @@ try {
             Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
         }
 
-        Log-Output 'The masks above are back to what they were before this script ran, so the logon rights are once again whatever they were on arrival - including the fault, if the disk arrived with one.' | Tee-Object -FilePath $logFile -Append
+        # Filtered, not just wrapped. A manifest written by an earlier version has no Recreated
+        # property at all, and @($null) is a one-element array holding $null - which would report a
+        # kept entry with no name and turn every revert into a "partial" one.
+        $kept = @($manifest.Recreated | Where-Object { $_ -and $_.Name })
+        foreach ($entry in $kept) {
+            Log-Output ("Kept {0}: the policy entry this repair recreated is left in place." -f $entry.Name) | Tee-Object -FilePath $logFile -Append
+        }
+
+        if ($kept.Count -gt 0) {
+            Log-Output 'The masks above are back to what they were before this script ran. The account entries listed as kept are not put back the way they were found: undoing those means deleting an LSA account entry to reimpose a lockout, which is the riskier of the two writes and not a rollback worth performing automatically.' | Tee-Object -FilePath $logFile -Append
+            Log-Output ("So this is a partial revert: {0} account(s) can still sign in that could not before the repair. To remove one, run 'secedit /export /areas USER_RIGHTS' on the running VM, drop the SID from the right and re-import." -f $kept.Count) | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output 'The masks above are back to what they were before this script ran, so the logon rights are once again whatever they were on arrival - including the fault, if the disk arrived with one.' | Tee-Object -FilePath $logFile -Append
+        }
         Log-Output "REVERT COMPLETE: restored $restoredCount item(s)." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -1686,7 +1709,7 @@ try {
 
     # Written before the first hive write, not after. A run that dies part way still needs an undo
     # record for whatever it managed to change.
-    [void](Write-RevertManifest -ManifestPath $manifestPath -Plan $plan)
+    [void](Write-RevertManifest -ManifestPath $manifestPath -Plan $plan -Recreated $absentTargets)
 
     if ($script:OnlineMode) {
         # One secedit call carries both halves: the mask corrections and any account entry the
