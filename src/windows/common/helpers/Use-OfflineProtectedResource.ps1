@@ -1709,6 +1709,11 @@ function Set-OfflinePrivilegedRegistryValue {
         Name accepts an empty string, which is how the Win32 registry API names a key's default
         (unnamed) value - the only place the ActSysAc mask exists.
 
+        Bytes accepts an empty array for the same reason: a zero-length value is a real thing in
+        this hive. LSA leaves exactly one on each Policy\Accounts\<SID> key, so recreating an
+        account entry that matches what LSA itself writes has to be able to write nothing. A
+        mandatory [byte[]] rejects an empty array outright, which is why it is allowed explicitly.
+
         The value is read back and compared byte for byte before success is reported. A silent
         write failure on a protected hive would otherwise be indistinguishable from a repair.
     #>
@@ -1717,7 +1722,7 @@ function Set-OfflinePrivilegedRegistryValue {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name,
         [Parameter(Mandatory = $true)][int]$Type,
-        [Parameter(Mandatory = $true)][byte[]]$Bytes
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes
     )
 
     $result = [PSCustomObject]@{ Written = $false; Error = '' }
