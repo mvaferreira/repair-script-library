@@ -1767,28 +1767,23 @@ try {
         Log-Warning "SYSTEM\Setup still reads SetupType=$($final.SetupType) CmdLine='$($final.CmdLine)'. That is not this repair, but the VM will run it on the next boot." | Tee-Object -FilePath $logFile -Append
     }
 
-    if ($script:OnlineMode) {
-        Log-Output "REPAIRED $($write.Applied.Count) account(s) through secedit on the running machine." | Tee-Object -FilePath $logFile -Append
-        Log-Output 'Only the rights listed above were rewritten; every other user right on this machine was left as it was.' | Tee-Object -FilePath $logFile -Append
-        Log-Output 'The change is effective immediately - no reboot is needed for a logon right to take effect.' | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Output "REPAIRED $($write.Applied.Count) account(s) in the offline LSA policy database." | Tee-Object -FilePath $logFile -Append
-        Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
-    }
-
     # The shipped default grants RDP to two groups. When the fault deleted one of them outright,
     # repairing only the survivor leaves the group most VMs actually put their RDP users in still
     # locked out - measured: administrators could sign in, Remote Desktop Users could not. So the
     # entry is put back, from values read off this same disk. Gated on the finding, so a healthy
     # disk that simply has no such group is still left alone.
+    #
+    # Done before the closing count, not after it, so a run that recreates an entry cannot report
+    # "REPAIRED 0 account(s)" above the line saying which account it just put back.
+    $recreated = 0
     $rdpFaultFound = @($repairable | Where-Object { $_.Cause -eq 'MissingAccountEntry' }).Count -gt 0
     if ($rdpFaultFound -and -not $script:OnlineMode) {
-        foreach ($absent in (Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)) {
+        foreach ($absent in $absentTargets) {
             $made = New-OfflineLogonRightAccount -WindowsPath $windowsPath -Sid $absent.Sid `
                 -Mask ([uint32]$absent.Mask) -DonorSid $script:SidAdministrators
 
             if ($made.Ok) {
+                $recreated++
                 Log-Output ("  [FIXED] {0}: policy entry recreated holding {1} (0x{2:X4})" -f $absent.Name, $absent.Right, [uint32]$absent.Mask) | Tee-Object -FilePath $logFile -Append
             }
             else {
@@ -1797,6 +1792,18 @@ try {
                 Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf  then add the SID to SeRemoteInteractiveLogonRight and re-import with secedit /configure /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
             }
         }
+    }
+
+    if ($script:OnlineMode) {
+        Log-Output "REPAIRED $($write.Applied.Count) account(s) through secedit on the running machine." | Tee-Object -FilePath $logFile -Append
+        Log-Output 'Only the rights listed above were rewritten; every other user right on this machine was left as it was.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The change is effective immediately - no reboot is needed for a logon right to take effect.' | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        # Two different operations, counted separately: a mask corrected in place is not the same
+        # repair as an account entry rebuilt from nothing, and collapsing them hides which happened.
+        Log-Output ("REPAIRED {0} mask(s) and recreated {1} account entry/entries in the offline LSA policy database." -f $write.Applied.Count, $recreated) | Tee-Object -FilePath $logFile -Append
+        Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
     }
 
     if ($script:OnlineMode) {
