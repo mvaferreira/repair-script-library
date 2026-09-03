@@ -405,6 +405,45 @@ function Get-AdjustedLogonRightMask {
     return [uint32]($cleared -bor $Set)
 }
 
+function Get-AbsentGrantTarget {
+    <#
+    .SYNOPSIS
+        Accounts the shipped default grants a logon right to that have no entry on this disk.
+
+    .DESCRIPTION
+        LSA removes an account's entry from Policy\Accounts once its last right is taken away, so
+        the very fault this script repairs can leave BUILTIN\Remote Desktop Users with no entry at
+        all - measured on Server 2022 20348, where emptying SeRemoteInteractiveLogonRight through
+        secedit deleted S-1-5-32-555 outright because that right was the only one it held.
+
+        The right cannot be granted back to such an account offline. A policy entry is not just the
+        ActSysAc mask: it also carries Sid, Privilgs and SecDesc blobs, and the encoding of an empty
+        privilege set is not something to guess at, because an LSA that cannot parse its own policy
+        database does not fail gracefully - it stops the machine with 0xC000021A. Creating one would
+        risk a no-boot on a VM whose only fault was a refused logon.
+
+        Granting the right to BUILTIN\Administrators is what makes the VM reachable again, so the
+        repair does that and reports this, rather than silently restoring less than it appears to.
+
+    .OUTPUTS
+        Array of PSCustomObject with Sid, Name and Right.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts)
+
+    $present = @{}
+    foreach ($a in $Accounts) { $present[$a.Sid] = $true }
+
+    $absent = New-Object System.Collections.ArrayList
+    if (-not $present.ContainsKey($script:SidRemoteDesktopUsers)) {
+        [void]$absent.Add([PSCustomObject]@{
+                Sid   = $script:SidRemoteDesktopUsers
+                Name  = (Resolve-SidFriendlyName -Sid $script:SidRemoteDesktopUsers)
+                Right = 'SeRemoteInteractiveLogonRight'
+            })
+    }
+    return @($absent)
+}
+
 function Get-LogonRightRepairPlan {
     <#
     .SYNOPSIS
@@ -1010,6 +1049,15 @@ try {
 
     Log-Output "REPAIRED $($write.Applied.Count) account(s) in the offline LSA policy database." | Tee-Object -FilePath $logFile -Append
     Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
+
+    # Reported, not hidden: the shipped default grants RDP to two groups, and if the fault deleted
+    # one of them from the policy database this repair restores fewer accounts than it appears to.
+    foreach ($absent in (Get-AbsentGrantTarget -Accounts @($rights.Accounts))) {
+        Log-Output "  [NOT RESTORED] $($absent.Name) has no entry in this disk's LSA policy database, so $($absent.Right) could not be granted to it offline." | Tee-Object -FilePath $logFile -Append
+        Log-Output "                 Access is restored through BUILTIN\Administrators above. To put the group back on the shipped default once the VM is up, run as administrator:" | Tee-Object -FilePath $logFile -Append
+        Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf  then add the SID to SeRemoteInteractiveLogonRight and re-import with secedit /configure /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
+    }
+
     Log-Output "Verified on this disk: SetupType=$($final.SetupType), no boot-time command armed." | Tee-Object -FilePath $logFile -Append
     Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
