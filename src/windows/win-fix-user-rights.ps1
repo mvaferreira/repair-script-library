@@ -914,6 +914,14 @@ function Get-LogonRightRepairPlan {
     $plan = New-Object System.Collections.ArrayList
     foreach ($sid in $set.Keys) {
         $account = $byName[$sid]
+
+        # An account with no entry cannot have a mask corrected - there is nothing to correct. It
+        # needs its entry recreated instead, which is a different operation with different inputs,
+        # so it is deliberately not smuggled into this plan. Writing ActSysAc on its own would
+        # produce an account key holding a mask but no Sid and no SecDesc, and LSA reading a
+        # malformed policy database is a 0xC000021A that no hive substitution recovers from.
+        if ($null -eq $account) { continue }
+
         $old = [uint32]$account.Mask
         $new = Get-AdjustedLogonRightMask -Mask $old -Set $set[$sid] -Clear $clear[$sid]
         if ($new -eq $old) { continue }
@@ -1651,7 +1659,12 @@ try {
 
     $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
 
-    if ($plan.Count -eq 0 -and -not $staleSetupType) {
+    # Absent accounts carry no mask, so they never appear in the plan. Counting them here as well
+    # is what stops a disk whose only remaining fault is a deleted entry from being declared healthy
+    # and returned untouched - the plan is legitimately empty in exactly that case.
+    $absentTargets = @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+
+    if ($plan.Count -eq 0 -and $absentTargets.Count -eq 0 -and -not $staleSetupType) {
         Log-Output "Nothing was changed: the logon-right masks on $($script:TargetNoun) already permit sign-in." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -1665,7 +1678,7 @@ try {
         # One secedit call carries both halves: the mask corrections and any account entry the
         # policy deleted outright. Windows recreates the entry itself, so nothing here has to
         # assemble LSA policy structure by hand.
-        $absentTargets = @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+        $absentTargets = @($absentTargets)
         $applyResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($plan) -Absent $absentTargets
 
         Log-Output '' | Tee-Object -FilePath $logFile -Append
