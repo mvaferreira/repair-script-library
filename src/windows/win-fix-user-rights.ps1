@@ -559,17 +559,37 @@ function Write-UserRightsPayload {
         'set AFTER=' + $GuestAfterPath
         'set SDB=%WINDIR%\Temp\win-fix-user-rights.sdb'
         'set SECLOG=%WINDIR%\Temp\win-fix-user-rights-secedit.log'
+
+        # Unhook before doing any work, not after. Everything below needs a live LSA, and the boot
+        # is held here until this file exits. If secedit stalls, or the VM loses power part way, a
+        # hook left armed puts the guest back into setup mode on the next boot as well, with nothing
+        # left able to clear it - the guest never reaches a logon prompt again and the only way out
+        # is another offline repair. Clearing it first makes the worst case 'the rights were not
+        # reset', which the next run can retry, instead of 'the VM no longer boots'.
+        # 'started' proves the session manager really did launch this file, which is the one thing
+        # an armed disk cannot otherwise tell us after the fact.
+        '> "%RESULT%" echo started=1'
+        'reg add "HKLM\SYSTEM\Setup" /v SetupType /t REG_DWORD /d 0 /f'
+        'reg delete "HKLM\SYSTEM\Setup" /v CmdLine /f'
+        '>> "%RESULT%" echo unhooked=%ERRORLEVEL%'
+
         'if exist "%SDB%" del /f /q "%SDB%"'
-        'secedit /export /areas USER_RIGHTS /cfg "%BEFORE%" /quiet'
+        # stdin is redirected from nul so a prompt can never block the boot waiting on a console
+        # nobody is attached to.
+        'secedit /export /areas USER_RIGHTS /cfg "%BEFORE%" /quiet < nul'
         'set RC_BEFORE=%ERRORLEVEL%'
-        'secedit /configure /db "%SDB%" /cfg "%WINDIR%\inf\defltbase.inf" /areas USER_RIGHTS /log "%SECLOG%" /quiet'
+        'secedit /configure /db "%SDB%" /cfg "%WINDIR%\inf\defltbase.inf" /areas USER_RIGHTS /log "%SECLOG%" /quiet < nul'
         'set RC_CONFIGURE=%ERRORLEVEL%'
-        'secedit /export /areas USER_RIGHTS /cfg "%AFTER%" /quiet'
+        'secedit /export /areas USER_RIGHTS /cfg "%AFTER%" /quiet < nul'
         'set RC_AFTER=%ERRORLEVEL%'
-        '> "%RESULT%" echo before=%RC_BEFORE%'
+        '>> "%RESULT%" echo before=%RC_BEFORE%'
         '>> "%RESULT%" echo configure=%RC_CONFIGURE%'
         '>> "%RESULT%" echo after=%RC_AFTER%'
         '>> "%RESULT%" echo done=1'
+
+        # Windows owns SetupType while it believes a setup pass is running and re-arms it, so clear
+        # it again on the way out. The early clear is the safety net; this one is what normally
+        # sticks.
         'reg add "HKLM\SYSTEM\Setup" /v SetupType /t REG_DWORD /d 0 /f'
         'reg delete "HKLM\SYSTEM\Setup" /v CmdLine /f'
         'endlocal'
