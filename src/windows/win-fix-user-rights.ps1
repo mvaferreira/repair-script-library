@@ -446,6 +446,85 @@ function Get-AdjustedLogonRightMask {
     return [uint32]($cleared -bor $Set)
 }
 
+function ConvertFrom-SecurityTemplateRights {
+    <#
+    .SYNOPSIS
+        Decodes the [Privilege Rights] section of a security template into per-SID logon masks.
+
+    .DESCRIPTION
+        Used for both halves of this repair, which is deliberate: the shipped defaults and the
+        machine's current state are the same file format, so reading them with one parser means the
+        comparison cannot drift between a template and an export.
+
+        Only the ten logon rights are decoded, because those are the bits that live in ActSysAc and
+        decide whether an account can sign in at all. Privileges are ignored: they are stored
+        separately, they are not what locks anyone out, and this repair does not touch them.
+
+        RID-relative entries such as &-501 are skipped. Resolving them needs the machine SID, they
+        only ever name Guest in the shipped template, and Guest is not how anyone recovers a VM.
+
+    .OUTPUTS
+        PSCustomObject with Ok, Grants (SID -> uint32 mask), RightCount, Skipped and Error.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{
+        Ok = $false; Grants = @{}; RightCount = 0; Skipped = @(); Error = ''
+    }
+
+    try { $lines = Get-Content -LiteralPath $Path -ErrorAction Stop }
+    catch {
+        $result.Error = "$Path could not be read: $($_.Exception.Message)"
+        return $result
+    }
+
+    $byName = @{}
+    foreach ($entry in $script:LogonRightBits.GetEnumerator()) { $byName[$entry.Value] = [uint32]$entry.Key }
+
+    $inSection = $false
+    $grants = @{}
+    $skipped = New-Object System.Collections.ArrayList
+
+    foreach ($line in $lines) {
+        $trimmed = "$line".Trim()
+        if ($trimmed -match '^\[') {
+            if ($inSection) { break }
+            $inSection = ($trimmed -match '^\[Privilege Rights\]$')
+            continue
+        }
+        if (-not $inSection -or $trimmed -eq '' -or $trimmed.StartsWith(';')) { continue }
+
+        $split = $trimmed.IndexOf('=')
+        if ($split -lt 1) { continue }
+
+        $rightName = $trimmed.Substring(0, $split).Trim()
+        if (-not $byName.ContainsKey($rightName)) { continue }
+
+        $bit = [uint32]$byName[$rightName]
+        $result.RightCount++
+
+        foreach ($token in ($trimmed.Substring($split + 1) -split ',')) {
+            $sid = "$token".Trim()
+            if ($sid -eq '') { continue }
+            if ($sid.StartsWith('*')) { $sid = $sid.Substring(1).Trim() }
+            if ($sid -notmatch '^S-1-') { [void]$skipped.Add("$rightName=$sid"); continue }
+
+            if (-not $grants.ContainsKey($sid)) { $grants[$sid] = [uint32]0 }
+            $grants[$sid] = [uint32]($grants[$sid] -bor $bit)
+        }
+    }
+
+    if ($result.RightCount -eq 0) {
+        $result.Error = "$Path has no [Privilege Rights] section this script can read"
+        return $result
+    }
+
+    $result.Grants = $grants
+    $result.Skipped = @($skipped)
+    $result.Ok = $true
+    return $result
+}
+
 function Get-ShippedLogonRightDefault {
     <#
     .SYNOPSIS
@@ -507,55 +586,177 @@ function Get-ShippedLogonRightDefault {
     }
     $result.TemplatePath = $template
 
-    try { $lines = Get-Content -LiteralPath $template -ErrorAction Stop }
+    $parsed = ConvertFrom-SecurityTemplateRights -Path $template
+    if (-not $parsed.Ok) {
+        $result.Error = $parsed.Error
+        return $result
+    }
+
+    $result.Grants = $parsed.Grants
+    $result.RightCount = $parsed.RightCount
+    $result.Skipped = $parsed.Skipped
+    $result.Ok = $true
+    return $result
+}
+
+function Get-LiveLogonRight {
+    <#
+    .SYNOPSIS
+        Reads the running machine's logon rights, in the same shape as the offline reader.
+
+    .DESCRIPTION
+        The online half of this repair. A user-rights lockout does not stop the machine running or
+        the guest agent answering - it stops people signing in - so the VM is usually still up and
+        reachable through Run Command, which executes as SYSTEM and needs no logon right at all.
+        That makes the whole rescue-VM cycle unnecessary for the common case.
+
+        secedit exports the same [Privilege Rights] format the shipped template uses, so the same
+        parser reads both and the comparison cannot drift between the two halves. The result is
+        shaped exactly like Get-OfflineLogonRight's, so detection runs unchanged in either mode.
+
+    .OUTPUTS
+        PSCustomObject with Ok, Accounts (Sid/Name/Mask/Rights/Type), ExportPath and Reason.
+    #>
+    param()
+
+    $result = [PSCustomObject]@{ Ok = $false; Accounts = @(); ExportPath = $null; Reason = $null }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $export = Join-Path $env:TEMP "win-fix-user-rights-export-$stamp.inf"
+
+    try {
+        $null = & secedit.exe /export /areas USER_RIGHTS /cfg $export /quiet 2>&1
+    }
     catch {
-        $result.Error = "$template could not be read: $($_.Exception.Message)"
+        $result.Reason = "secedit could not export the current user rights: $($_.Exception.Message)"
         return $result
     }
 
-    $byName = @{}
-    foreach ($entry in $script:LogonRightBits.GetEnumerator()) { $byName[$entry.Value] = [uint32]$entry.Key }
-
-    $inSection = $false
-    $grants = @{}
-    $skipped = New-Object System.Collections.ArrayList
-
-    foreach ($line in $lines) {
-        $trimmed = "$line".Trim()
-        if ($trimmed -match '^\[') {
-            if ($inSection) { break }
-            $inSection = ($trimmed -match '^\[Privilege Rights\]$')
-            continue
-        }
-        if (-not $inSection -or $trimmed -eq '' -or $trimmed.StartsWith(';')) { continue }
-
-        $split = $trimmed.IndexOf('=')
-        if ($split -lt 1) { continue }
-
-        $rightName = $trimmed.Substring(0, $split).Trim()
-        if (-not $byName.ContainsKey($rightName)) { continue }
-
-        $bit = [uint32]$byName[$rightName]
-        $result.RightCount++
-
-        foreach ($token in ($trimmed.Substring($split + 1) -split ',')) {
-            $sid = "$token".Trim()
-            if ($sid -eq '') { continue }
-            if ($sid.StartsWith('*')) { $sid = $sid.Substring(1).Trim() }
-            if ($sid -notmatch '^S-1-') { [void]$skipped.Add("$rightName=$sid"); continue }
-
-            if (-not $grants.ContainsKey($sid)) { $grants[$sid] = [uint32]0 }
-            $grants[$sid] = [uint32]($grants[$sid] -bor $bit)
-        }
+    if (-not (Test-Path -LiteralPath $export)) {
+        $result.Reason = "secedit did not produce an export at $export, so the current user rights could not be read"
+        return $result
     }
+    $result.ExportPath = $export
 
-    if ($result.RightCount -eq 0) {
-        $result.Error = "$template has no [Privilege Rights] section this script can read"
+    $parsed = ConvertFrom-SecurityTemplateRights -Path $export
+    if (-not $parsed.Ok) {
+        $result.Reason = $parsed.Error
         return $result
     }
 
-    $result.Grants = $grants
-    $result.Skipped = @($skipped)
+    $accounts = New-Object System.Collections.ArrayList
+    foreach ($sid in $parsed.Grants.Keys) {
+        $mask = [uint32]$parsed.Grants[$sid]
+        [void]$accounts.Add([PSCustomObject]@{
+                Sid    = $sid
+                Name   = (Resolve-SidFriendlyName -Sid $sid)
+                Mask   = $mask
+                Type   = $script:RegNone
+                Rights = (ConvertTo-LogonRightName -Mask $mask)
+            })
+    }
+
+    $result.Accounts = @($accounts)
+    $result.Ok = $true
+    return $result
+}
+
+function Repair-LiveLogonRight {
+    <#
+    .SYNOPSIS
+        Applies the planned mask changes to the running machine through secedit.
+
+    .DESCRIPTION
+        Windows writes its own policy here. secedit is the supported writer, so LSA authors every
+        structure the change needs - including recreating an account entry that an over-restrictive
+        policy deleted outright, which is the one thing the offline path has to assemble by hand.
+
+        Only the rights that actually change are named in the template. That matters, because
+        user-rights assignment is replace and not merge: any right named here has its holder list
+        replaced wholesale, and every right left out is untouched. So each line is written as the
+        full intended holder list - the accounts that already hold it, plus the ones being restored
+        - which keeps a deliberate grant to a custom group in place instead of quietly dropping it.
+
+    .OUTPUTS
+        PSCustomObject with Ok, Applied (right names), TemplatePath and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Absent
+    )
+
+    $result = [PSCustomObject]@{ Ok = $false; Applied = @(); TemplatePath = $null; Reason = $null }
+
+    # Where every account ends up: current mask, overridden by the plan, plus the accounts that have
+    # no entry at all and are being put back.
+    $desired = @{}
+    foreach ($account in $Accounts) { $desired[$account.Sid] = [uint32]$account.Mask }
+
+    $changedBits = [uint32]0
+    foreach ($item in $Plan) {
+        $desired[$item.Sid] = [uint32]$item.NewMask
+        $changedBits = [uint32]($changedBits -bor ([uint32]$item.OldMask -bxor [uint32]$item.NewMask))
+    }
+    foreach ($item in $Absent) {
+        $existing = [uint32]0
+        if ($desired.ContainsKey($item.Sid)) { $existing = [uint32]$desired[$item.Sid] }
+        $desired[$item.Sid] = [uint32]($existing -bor [uint32]$item.Mask)
+        $changedBits = [uint32]($changedBits -bor [uint32]$item.Mask)
+    }
+
+    if ($changedBits -eq 0) {
+        $result.Ok = $true
+        $result.Reason = 'nothing to apply'
+        return $result
+    }
+
+    $body = New-Object System.Collections.ArrayList
+    $applied = New-Object System.Collections.ArrayList
+
+    foreach ($entry in $script:LogonRightBits.GetEnumerator()) {
+        $bit = [uint32]$entry.Key
+        if (($changedBits -band $bit) -eq 0) { continue }
+
+        $holders = @($desired.Keys | Where-Object { ([uint32]$desired[$_] -band $bit) -ne 0 } | Sort-Object)
+        $rendered = ($holders | ForEach-Object { "*$_" }) -join ','
+
+        [void]$body.Add("$($entry.Value) = $rendered")
+        [void]$applied.Add($entry.Value)
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $template = Join-Path $env:TEMP "win-fix-user-rights-apply-$stamp.inf"
+    $database = Join-Path $env:TEMP "win-fix-user-rights-apply-$stamp.sdb"
+
+    $content = @(
+        '[Unicode]'
+        'Unicode=yes'
+        '[Version]'
+        'signature="$CHICAGO$"'
+        'Revision=1'
+        '[Privilege Rights]'
+    ) + @($body)
+
+    try {
+        # secedit requires UTF-16 when the template declares Unicode=yes.
+        Set-Content -LiteralPath $template -Value $content -Encoding Unicode -ErrorAction Stop
+    }
+    catch {
+        $result.Reason = "the repair template could not be written to $template : $($_.Exception.Message)"
+        return $result
+    }
+    $result.TemplatePath = $template
+
+    $output = & secedit.exe /configure /db $database /cfg $template /areas USER_RIGHTS /quiet 2>&1
+    $code = $LASTEXITCODE
+
+    if ($code -ne 0) {
+        $result.Reason = "secedit /configure returned $code : $(($output | Out-String).Trim())"
+        return $result
+    }
+
+    $result.Applied = @($applied)
     $result.Ok = $true
     return $result
 }
