@@ -1282,6 +1282,10 @@ public static class OfflinePrivilegedRegistry
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern int RegDeleteValueW(IntPtr hKey, string lpValueName);
 
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegSetValueExW(IntPtr hKey, string lpValueName, int Reserved, int dwType,
+        byte[] lpData, int cbData);
+
     // Opens an existing key through the backup path. Never leaves a key behind that it created:
     // if the disposition says the key was new, it is deleted again and the call reports failure,
     // so a caller can treat a non-zero result as "not there" without having changed anything.
@@ -1312,6 +1316,22 @@ public static class OfflinePrivilegedRegistry
         if (rc != ERROR_SUCCESS) { return rc; }
         RegCloseKey(h);
         exists = true;
+        return ERROR_SUCCESS;
+    }
+
+    // Deliberately creates the key when it is absent, and says which happened. Kept separate from
+    // Open on purpose: Open guarantees that reading or correcting a value never adds anything to a
+    // machine that may be healthy, so the one operation allowed to add has to be asked for by name.
+    public static int CreateKey(string subKey, out bool created)
+    {
+        created = false;
+        IntPtr h;
+        int disposition;
+        int rc = RegCreateKeyExW(HKLM, subKey, 0, null, REG_OPTION_BACKUP_RESTORE,
+                                 KEY_READ | KEY_WRITE, IntPtr.Zero, out h, out disposition);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        created = (disposition == REG_CREATED_NEW_KEY);
+        RegCloseKey(h);
         return ERROR_SUCCESS;
     }
 
@@ -1393,6 +1413,18 @@ public static class OfflinePrivilegedRegistry
         try { return RegDeleteValueW(h, name); }
         finally { RegCloseKey(h); }
     }
+
+    // The caller supplies the type as well as the bytes. The LSA policy database stores the
+    // logon-right mask as REG_NONE, and rewriting it as REG_BINARY or REG_DWORD changes the shape
+    // of the value even when the four bytes are identical, so the type is never inferred here.
+    public static int SetValue(string subKey, string name, int type, byte[] data)
+    {
+        IntPtr h;
+        int rc = Open(subKey, true, out h);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        try { return RegSetValueExW(h, name, 0, type, data, data.Length); }
+        finally { RegCloseKey(h); }
+    }
 }
 "@
 }
@@ -1446,6 +1478,60 @@ function Get-OfflinePrivilegedRegistryValueName {
     return $result
 }
 
+function Get-OfflinePrivilegedRegistrySubKeyName {
+    <#
+    .SYNOPSIS
+        Listing the subkeys of a key that may deny read to every account, SYSTEM included.
+
+    .DESCRIPTION
+        The counterpart of Get-OfflinePrivilegedRegistryValueName, for callers that have to walk a
+        protected tree rather than read one key. The offline SECURITY hive is the case that needs
+        it: Policy\Accounts holds one subkey per account that has been granted a logon right or a
+        privilege, and neither the provider nor the .NET registry classes can enumerate it.
+
+        As with the value-name listing, "the key has no subkeys" and "the key could not be opened"
+        are different answers. Ok is $false only when something went wrong; a key that is genuinely
+        absent comes back Ok with Exists $false.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Ok = $false; Exists = $false; Names = @(); Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    [void](Enable-OfflineBackupPrivilege)
+    Initialize-OfflinePrivilegedRegistryType
+
+    $exists = $false
+    $rc = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
+    if ($rc -ne 0) {
+        $result.Error = "The key could not be opened (error $rc)."
+        return $result
+    }
+    if (-not $exists) {
+        $result.Ok = $true
+        return $result
+    }
+
+    $names = $null
+    $rc = [OfflinePrivilegedRegistry]::SubKeyNames($subKey, [ref]$names)
+    if ($rc -ne 0) {
+        $result.Exists = $true
+        $result.Error = "The key opened but its subkeys could not be listed (error $rc)."
+        return $result
+    }
+
+    $result.Ok = $true
+    $result.Exists = $true
+    $result.Names = @($names)
+    return $result
+}
+
 function Get-OfflinePrivilegedRegistryValue {
     <#
     .SYNOPSIS
@@ -1457,11 +1543,17 @@ function Get-OfflinePrivilegedRegistryValue {
         string array cannot report either the type or the true byte length.
 
         Strings decodes REG_SZ, REG_EXPAND_SZ and REG_MULTI_SZ. Anything else is left to Bytes.
+
+        Name accepts an empty string, which is how the Win32 registry API names a key's default
+        (unnamed) value. Without AllowEmptyString the binder rejects the call before the function
+        runs, which is not a theoretical concern: the offline SECURITY hive keeps the logon-right
+        mask in the default value of Policy\Accounts\<SID>\ActSysAc, so that is the only way to
+        read it.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Name
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name
     )
 
     $result = [PSCustomObject]@{
@@ -1545,6 +1637,137 @@ function Remove-OfflinePrivilegedRegistryValue {
     }
 
     $result.Removed = $true
+    return $result
+}
+
+function New-OfflinePrivilegedRegistryKey {
+    <#
+    .SYNOPSIS
+        Creating a key under a hive that may deny write to every account, SYSTEM included.
+
+    .DESCRIPTION
+        Separate from Set-OfflinePrivilegedRegistryValue because creating a key is a different
+        promise from correcting a value. Everything else in this helper is built so that reading or
+        repairing cannot add anything to a machine that may be healthy; this is the one entry point
+        that adds, so a caller has to ask for it by name.
+
+        Reports whether the key was created or was already there, so a caller can tell a repair from
+        a no-op, and confirms the key is readable afterwards rather than trusting the return code.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Ok = $false; Created = $false; Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Create registry key')) { return $result }
+
+    if (-not (Enable-OfflineBackupPrivilege)) {
+        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be created.'
+        return $result
+    }
+    Initialize-OfflinePrivilegedRegistryType
+
+    $created = $false
+    $rc = [OfflinePrivilegedRegistry]::CreateKey($subKey, [ref]$created)
+    if ($rc -ne 0) {
+        $result.Error = "$Path could not be created (error $rc)."
+        return $result
+    }
+
+    $exists = $false
+    $check = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
+    if ($check -ne 0 -or -not $exists) {
+        $result.Error = "$Path does not read back as an existing key after being created."
+        return $result
+    }
+
+    $result.Created = $created
+    $result.Ok = $true
+    return $result
+}
+
+function Set-OfflinePrivilegedRegistryValue {
+    <#
+    .SYNOPSIS
+        Writing one value to a key that may deny write to every account, SYSTEM included.
+
+    .DESCRIPTION
+        The key's owner and DACL are left exactly as they were found: the write goes through the
+        backup-restore path rather than by granting anyone access, so nothing has to be put back
+        afterwards and a failure part way cannot leave the hive more permissive than it was.
+
+        Type is passed in rather than inferred. The offline SECURITY hive stores the logon-right
+        mask as REG_NONE (type 0), and writing the same four bytes back as REG_BINARY changes the
+        shape of the value even though the content matches.
+
+        Name accepts an empty string, which is how the Win32 registry API names a key's default
+        (unnamed) value - the only place the ActSysAc mask exists.
+
+        Bytes accepts an empty array for the same reason: a zero-length value is a real thing in
+        this hive. LSA leaves exactly one on each Policy\Accounts\<SID> key, so recreating an
+        account entry that matches what LSA itself writes has to be able to write nothing. A
+        mandatory [byte[]] rejects an empty array outright, which is why it is allowed explicitly.
+
+        The value is read back and compared byte for byte before success is reported. A silent
+        write failure on a protected hive would otherwise be indistinguishable from a repair.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name,
+        [Parameter(Mandatory = $true)][int]$Type,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes
+    )
+
+    $result = [PSCustomObject]@{ Written = $false; Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("$Path\$Name", 'Set registry value')) { return $result }
+
+    if (-not (Enable-OfflineBackupPrivilege)) {
+        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be opened for write.'
+        return $result
+    }
+    Initialize-OfflinePrivilegedRegistryType
+
+    $rc = [OfflinePrivilegedRegistry]::SetValue($subKey, $Name, $Type, $Bytes)
+    if ($rc -ne 0) {
+        $result.Error = "$(if ([string]::IsNullOrEmpty($Name)) { 'the default value' } else { $Name }) could not be written (error $rc)."
+        return $result
+    }
+
+    $readBack = Get-OfflinePrivilegedRegistryValue -Path $Path -Name $Name
+    if (-not $readBack.Ok -or -not $readBack.Found) {
+        $result.Error = "$Name was written but could not be read back."
+        return $result
+    }
+    if ($readBack.Type -ne $Type) {
+        $result.Error = "$Name reads back as type $($readBack.Type) instead of $Type."
+        return $result
+    }
+    if (@($readBack.Bytes).Count -ne $Bytes.Count) {
+        $result.Error = "$Name reads back as $($readBack.ByteLength) byte(s) instead of $($Bytes.Count)."
+        return $result
+    }
+    for ($i = 0; $i -lt $Bytes.Count; $i++) {
+        if ($readBack.Bytes[$i] -ne $Bytes[$i]) {
+            $result.Error = "$Name reads back with different content at byte $i."
+            return $result
+        }
+    }
+
+    $result.Written = $true
     return $result
 }
 #endregion
