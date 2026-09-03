@@ -1763,13 +1763,18 @@ try {
         }
     }
 
-    if ($final.Available) {
+    if ($script:OnlineMode) {
+        Log-Output 'Sign-in is possible again now: LSA applies a logon right at the next logon attempt, so nothing further is needed.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'If RDP is still refused, the cause is no longer user rights - check the listener, the firewall and the certificate.' | Tee-Object -FilePath $logFile -Append
+    }
+    elseif ($final.Available) {
         Log-Output "Verified on this disk: SetupType=$($final.SetupType), no boot-time command armed." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
     }
     else {
         Log-Output 'SYSTEM\Setup could not be read back, so the boot-time state is unverified. This repair never writes to it.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
     }
-    Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
     return $STATUS_SUCCESS
 }
