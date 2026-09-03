@@ -1359,16 +1359,30 @@ try {
 
     Clear-OfflineRepairLog
 
+    # Which side of the fault this run is on. Nothing chooses here: the caller already did, by
+    # deciding where to run the script. 'az vm repair run --run-on-repair' puts it on a rescue VM
+    # with the patient disk attached; without that flag the same script id runs on the live VM
+    # through Run Command, as SYSTEM, which needs no logon right and is why it still works when
+    # nobody can sign in. The offline disk is the discriminator, so the script simply reports which
+    # situation it is in rather than being told.
+    #
+    # Getting this wrong is safe in the direction that matters: run online on a rescue VM by
+    # mistake and that VM's rights are already the default, so detect returns nothing and nothing
+    # is written.
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
     Write-OperatorLog
 
-    if (-not $offline -or -not $offline.WindowsPath) {
-        Log-Error 'No offline Windows installation was found on the attached disk.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
+    $script:OnlineMode = (-not $offline -or -not $offline.WindowsPath)
 
-    $windowsPath = $offline.WindowsPath
-    Log-Output "Offline Windows installation: $windowsPath" | Tee-Object -FilePath $logFile -Append
+    if ($script:OnlineMode) {
+        $windowsPath = $env:windir
+        Log-Output "MODE: online. No offline Windows installation is attached, so this is the machine being repaired and Windows writes its own policy through secedit." | Tee-Object -FilePath $logFile -Append
+        Log-Output "      To repair a VM that cannot boot or whose agent does not answer, attach its disk with 'az vm repair create' and re-run with --run-on-repair." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        $windowsPath = $offline.WindowsPath
+        Log-Output "MODE: offline. Repairing the attached installation at $windowsPath." | Tee-Object -FilePath $logFile -Append
+    }
 
     # Files an earlier version of this script left on the disk. Nothing is written to any of them
     # now - they are resolved so the run can clear residue it finds.
@@ -1400,7 +1414,19 @@ try {
                     }
                 })
 
-            $back = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $undo
+            if ($script:OnlineMode) {
+                $backResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($undo) -Absent @()
+                if ($backResult.Ok) {
+                    $back = [PSCustomObject]@{ Applied = @($undo); Failed = @() }
+                }
+                else {
+                    $back = [PSCustomObject]@{ Applied = @(); Failed = @(@{ Entry = @{ Name = 'secedit' }; Error = $backResult.Reason }) }
+                }
+            }
+            else {
+                $back = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $undo
+            }
+
             foreach ($entry in @($back.Applied)) {
                 Log-Output ("Reverted {0} to 0x{1:X4}." -f $entry.Name, $entry.NewMask) | Tee-Object -FilePath $logFile -Append
                 $restoredCount++
@@ -1412,8 +1438,9 @@ try {
 
         # Earlier versions of this script armed a Setup hook instead of writing the hive. A disk
         # repaired by one of those is still carrying it, and SetupType is the half the payload
-        # could never clear from inside its own boot, so clear it here.
-        $legacy = Get-OfflineSetupState -WindowsPath $windowsPath
+        # could never clear from inside its own boot, so clear it here. Offline only: SYSTEM\Setup
+        # on a running machine is the live boot state, not residue for this script to tidy.
+        $legacy = if ($script:OnlineMode) { [PSCustomObject]@{ Available = $false } } else { Get-OfflineSetupState -WindowsPath $windowsPath }
         if ($legacy.Available -and ($legacy.SetupType -ne 0 -or $legacy.CmdLine -like '*win-fix-user-rights*')) {
             $cleared = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType 0 -CmdLine ''
             if ($cleared.Restored) {
@@ -1448,15 +1475,22 @@ try {
     #####################################################################################################
     # Detect
     #####################################################################################################
-    $rights = Get-OfflineLogonRight -WindowsPath $windowsPath
+    if ($script:OnlineMode) {
+        $rights = Get-LiveLogonRight
+        $source = 'the running machine (secedit /export)'
+    }
+    else {
+        $rights = Get-OfflineLogonRight -WindowsPath $windowsPath
+        $source = 'the offline SECURITY hive'
+    }
     Write-OperatorLog
 
     if (-not $rights.Ok) {
-        Log-Error "The offline user rights could not be read, so nothing is armed: $($rights.Reason)." | Tee-Object -FilePath $logFile -Append
+        Log-Error "The current user rights could not be read from $source, so nothing is armed: $($rights.Reason)." | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR
     }
 
-    Log-Output "Read logon rights for $(@($rights.Accounts).Count) account(s) from the offline SECURITY hive." | Tee-Object -FilePath $logFile -Append
+    Log-Output "Read logon rights for $(@($rights.Accounts).Count) account(s) from $source." | Tee-Object -FilePath $logFile -Append
 
     # The full table goes to the detail log; the returned log keeps the findings.
     foreach ($account in @($rights.Accounts)) {
@@ -1484,8 +1518,9 @@ try {
 
     # SYSTEM\Setup is read for reporting only now: the repair writes to the SECURITY hive and never
     # touches it. An unreadable SYSTEM hive is worth saying out loud, but it is not a reason to
-    # refuse a logon-right repair that does not depend on it.
-    $setupState = Get-OfflineSetupState -WindowsPath $windowsPath
+    # refuse a logon-right repair that does not depend on it. Skipped online, where SYSTEM\Setup is
+    # the live machine's own boot state rather than something this script has any business reading.
+    $setupState = if ($script:OnlineMode) { [PSCustomObject]@{ Available = $true; SetupType = 0; CmdLine = '' } } else { Get-OfflineSetupState -WindowsPath $windowsPath }
     if (-not $setupState.Available) {
         Log-Warning "SYSTEM\Setup could not be read on this disk ($($setupState.Reason)), so the boot-time state is unknown. The logon-right repair does not depend on it, so it continues." | Tee-Object -FilePath $logFile -Append
     }
@@ -1567,19 +1602,42 @@ try {
     # record for whatever it managed to change.
     [void](Write-RevertManifest -ManifestPath $manifestPath -Plan $plan)
 
-    $write = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $plan
+    if ($script:OnlineMode) {
+        # One secedit call carries both halves: the mask corrections and any account entry the
+        # policy deleted outright. Windows recreates the entry itself, so nothing here has to
+        # assemble LSA policy structure by hand.
+        $applyResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($plan) `
+            -Absent @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
 
-    Log-Output '' | Tee-Object -FilePath $logFile -Append
-    foreach ($entry in @($write.Applied)) {
-        Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+        Log-Output '' | Tee-Object -FilePath $logFile -Append
+
+        if (-not $applyResult.Ok) {
+            Log-Error "  [FAILED] secedit could not apply the repair: $($applyResult.Reason)" | Tee-Object -FilePath $logFile -Append
+            $write = [PSCustomObject]@{ Applied = @(); Failed = @(@{ Entry = @{ Name = 'secedit' }; Error = $applyResult.Reason }) }
+        }
+        else {
+            foreach ($entry in @($plan)) {
+                Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output ("  Applied through secedit, rewriting only: {0}" -f (@($applyResult.Applied) -join ', ')) | Tee-Object -FilePath $logFile -Append
+            $write = [PSCustomObject]@{ Applied = @($plan); Failed = @() }
+        }
     }
-    foreach ($failure in @($write.Failed)) {
-        Log-Error ("  [FAILED] {0}: {1}" -f $failure.Entry.Name, $failure.Error) | Tee-Object -FilePath $logFile -Append
+    else {
+        $write = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $plan
+
+        Log-Output '' | Tee-Object -FilePath $logFile -Append
+        foreach ($entry in @($write.Applied)) {
+            Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+        }
+        foreach ($failure in @($write.Failed)) {
+            Log-Error ("  [FAILED] {0}: {1}" -f $failure.Entry.Name, $failure.Error) | Tee-Object -FilePath $logFile -Append
+        }
     }
 
     # SetupType is cleared last. It is not part of the logon-rights fault, so a failure to write the
     # policy database must not be masked by a successful tidy-up of somebody else's residue.
-    if ($staleSetupType) {
+    if ($staleSetupType -and -not $script:OnlineMode) {
         $cleared = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType 0 -CmdLine ''
         if ($cleared.Restored) {
             Log-Output '  [FIXED] SYSTEM\Setup\SetupType reset to 0, so the disk no longer re-enters the setup boot path.' | Tee-Object -FilePath $logFile -Append
@@ -1598,13 +1656,20 @@ try {
     # The disk is handed back with no boot-time work outstanding. This is asserted rather than
     # assumed: the previous design armed SYSTEM\Setup and could not clear it again from inside the
     # boot it started, so the one thing worth proving is that nothing here left that state behind.
-    $final = Get-OfflineSetupState -WindowsPath $windowsPath
+    $final = if ($script:OnlineMode) { [PSCustomObject]@{ Available = $false } } else { Get-OfflineSetupState -WindowsPath $windowsPath }
     if ($final.Available -and ($final.SetupType -ne 0 -or -not [string]::IsNullOrWhiteSpace($final.CmdLine))) {
         Log-Warning "SYSTEM\Setup still reads SetupType=$($final.SetupType) CmdLine='$($final.CmdLine)'. That is not this repair, but the VM will run it on the next boot." | Tee-Object -FilePath $logFile -Append
     }
 
-    Log-Output "REPAIRED $($write.Applied.Count) account(s) in the offline LSA policy database." | Tee-Object -FilePath $logFile -Append
-    Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
+    if ($script:OnlineMode) {
+        Log-Output "REPAIRED $($write.Applied.Count) account(s) through secedit on the running machine." | Tee-Object -FilePath $logFile -Append
+        Log-Output 'Only the rights listed above were rewritten; every other user right on this machine was left as it was.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The change is effective immediately - no reboot is needed for a logon right to take effect.' | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Output "REPAIRED $($write.Applied.Count) account(s) in the offline LSA policy database." | Tee-Object -FilePath $logFile -Append
+        Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
+    }
 
     # The shipped default grants RDP to two groups. When the fault deleted one of them outright,
     # repairing only the survivor leaves the group most VMs actually put their RDP users in still
@@ -1612,7 +1677,7 @@ try {
     # entry is put back, from values read off this same disk. Gated on the finding, so a healthy
     # disk that simply has no such group is still left alone.
     $rdpFaultFound = @($repairable | Where-Object { $_.Cause -eq 'MissingAccountEntry' }).Count -gt 0
-    if ($rdpFaultFound) {
+    if ($rdpFaultFound -and -not $script:OnlineMode) {
         foreach ($absent in (Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)) {
             $made = New-OfflineLogonRightAccount -WindowsPath $windowsPath -Sid $absent.Sid `
                 -Mask ([uint32]$absent.Mask) -DonorSid $script:SidAdministrators
