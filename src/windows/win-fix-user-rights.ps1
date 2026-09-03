@@ -80,30 +80,41 @@
 #
 #   On a healthy disk every check passes, no finding is produced, and this script writes nothing.
 #
-#   WHAT THE PAYLOAD APPLIES
+#   WHAT THE REPAIR WRITES
 #
-#     secedit /configure /db <temp>.sdb /cfg %windir%\inf\defltbase.inf /areas USER_RIGHTS
+#   The two mask bits behind the finding, straight into the offline LSA policy database:
 #
-#   defltbase.inf is the shipped default security template. On Server 2022 20348 it carries a
-#   [Privilege Rights] section that sets all five deny rights to empty and restores
-#   SeRemoteInteractiveLogonRight to Administrators and Remote Desktop Users - measured, 39,580
-#   bytes - which is precisely the tattoo this scenario removes.
+#     SECURITY\Policy\Accounts\<SID>\ActSysAc   (default value, REG_NONE, 4 bytes little-endian)
 #
-#   /areas USER_RIGHTS is not optional and is a deliberate departure from the monolithic script this
-#   replaces, which ran defltbase.inf with no /areas at all. Without it secedit applies every area in
-#   the template - account and audit policy, registry and file system ACLs, service configuration -
-#   on a production VM that was only ever refusing a logon. The blast radius is narrowed to the one
-#   area that carries the fault.
+#   The target state matches what the shipped template inf\defltbase.inf would produce for these
+#   rights - SeRemoteInteractiveLogonRight held by Administrators and Remote Desktop Users, and the
+#   deny rights empty - measured against it on Server 2022 20348. The difference is blast radius:
+#   applying the template resets EVERY user right on the machine to the shipped default, discarding
+#   any deliberate customisation on a VM that was only refusing a logon. Writing the mask changes
+#   the bits named in the finding and carries every other bit across untouched.
 #
-#   The before and after exports are kept on the disk as the audit trail, so what changed can be
-#   read afterwards rather than inferred.
+#   WHY THIS IS NOT DONE WITH SECEDIT
+#
+#   secedit needs a running LSA, so an offline repair can only schedule it - the previous design
+#   armed SYSTEM\Setup\CmdLine and set SetupType=2 so the session manager would run it before the
+#   logon UI. That works, and it was measured working. What it cannot do is clean up after itself:
+#   Windows rewrites SetupType when the setup pass completes, which is AFTER the payload has exited,
+#   so no write from inside the payload survives. Measured on Server 2022 20348 - the payload ran to
+#   completion, cleared SetupType twice, and the disk still came back SetupType=2 with an empty
+#   CmdLine, re-entering the setup boot path on every boot thereafter.
+#
+#   Writing the hive directly finishes the repair while the disk is still attached to the rescue VM.
+#   Nothing is armed, nothing is left in Windows\Temp, and the VM needs no extra boot.
+#
+#   A disk still carrying that residue from an earlier version is detected as StaleSetupType and
+#   reset to 0.
 #
 #   Reference: "User Rights Assignment"
 #   https://learn.microsoft.com/windows/security/threat-protection/security-policy-settings/user-rights-assignment
 #
 # .RESOLVES
 #   RDP or console logon refused by a tattooed user right after the GPO that set it was removed.
-#   Not a no-boot repair: the disk has to be able to boot for the payload to run.
+#   The repair completes offline, so the disk does not have to be able to boot for it to apply.
 #
 # .PARAMETER detectOnly
 #   Report what is on the disk and change nothing.
@@ -164,17 +175,11 @@ $isDetectOnly = ($detectOnly -eq 'true')
 $isRevert = ($revert -eq 'true')
 $isForced = ($force -eq 'true')
 
-# Windows\Temp is used rather than a new folder so nothing is left behind that the image did not
-# already have. The exports are deliberately NOT deleted by the payload: they are the audit trail.
+# Residue an earlier version of this script wrote into Windows\Temp. The repair no longer creates
+# any of these - they are still named so a run can recognise and clear what it finds.
 $script:PayloadRelativePath = 'Temp\win-fix-user-rights.cmd'
 $script:ResultRelativePath = 'Temp\win-fix-user-rights.result'
 $script:ManifestRelativePath = 'Temp\win-fix-user-rights-revert.json'
-$script:BeforeRelativePath = 'Temp\win-fix-user-rights-before.inf'
-$script:AfterRelativePath = 'Temp\win-fix-user-rights-after.inf'
-
-# SetupType 2 is 'setup in progress', the state that makes the session manager run CmdLine before
-# the logon UI. 0 is the settled state a healthy installation sits in.
-$script:SetupTypeRunCmdLine = 2
 
 # SECURITY_ACCESS_* from ntsecapi.h. Measured against secedit on Server 2022 20348 - see the header.
 $script:LogonRightBits = [ordered]@{
@@ -188,6 +193,23 @@ $script:LogonRightBits = [ordered]@{
     0x0100 = 'SeDenyBatchLogonRight'
     0x0200 = 'SeDenyServiceLogonRight'
     0x0400 = 'SeRemoteInteractiveLogonRight'
+    0x0800 = 'SeDenyRemoteInteractiveLogonRight'
+}
+
+# Individual bits the repair acts on. Named separately from LogonRightBits because that table is
+# keyed by integer and an OrderedDictionary indexed by an integer binds to the positional overload
+# rather than the key - see ConvertTo-LogonRightName, where the same trap reported every healthy
+# disk as broken.
+$script:BitInteractive = [uint32]0x0001
+$script:BitService = [uint32]0x0010
+$script:BitDenyService = [uint32]0x0200
+$script:BitRemoteInteractive = [uint32]0x0400
+
+# Deny bits that lock out administration when they sit on a broad group. Iterated with
+# GetEnumerator so the name comes from the entry rather than from an integer lookup.
+$script:DenyBitsOnBroadGroups = [ordered]@{
+    0x0040 = 'SeDenyInteractiveLogonRight'
+    0x0080 = 'SeDenyNetworkLogonRight'
     0x0800 = 'SeDenyRemoteInteractiveLogonRight'
 }
 
@@ -340,6 +362,7 @@ function Get-OfflineLogonRight {
                     Sid    = $sid
                     Name   = (Resolve-SidFriendlyName -Sid $sid)
                     Mask   = $mask
+                    Type   = $value.Type
                     Rights = (ConvertTo-LogonRightName -Mask $mask)
                 })
         }
@@ -356,6 +379,191 @@ function Get-OfflineLogonRight {
         # Assigned to $null because Dismount-OfflineHive returns $true, and a finally block still
         # writes to the output stream after the return above has run. Unsuppressed, the caller
         # receives the result object AND a bare True, so $rights becomes a two-element array.
+        try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
+    }
+}
+
+function Get-AdjustedLogonRightMask {
+    <#
+    .SYNOPSIS
+        Applies a set/clear pair to a logon-right mask without leaving uint32 range.
+
+    .DESCRIPTION
+        -bnot on a [uint32] returns a signed Int64 in PowerShell, so 'mask -band (-bnot 0x400)'
+        silently widens the whole expression to 64 bits. BitConverter::GetBytes would then emit
+        eight bytes, and an eight-byte write into a four-byte ActSysAc value corrupts the policy
+        database of a machine that was only missing one right. XOR against the 32-bit all-ones
+        constant keeps every intermediate inside uint32.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][uint32]$Mask,
+        [Parameter(Mandatory = $false)][uint32]$Set = 0,
+        [Parameter(Mandatory = $false)][uint32]$Clear = 0
+    )
+
+    $cleared = [uint32]($Mask -band ([uint32]4294967295 -bxor $Clear))
+    return [uint32]($cleared -bor $Set)
+}
+
+function Get-LogonRightRepairPlan {
+    <#
+    .SYNOPSIS
+        Turns the decoded accounts into the exact per-account mask changes the repair will make.
+
+    .DESCRIPTION
+        The plan is derived from the same conditions Get-UserRightsFinding reports, so the repair
+        can never act on something detect did not report. Only the bits named here are touched:
+        every other bit of the account's mask is carried across untouched, which is the difference
+        between this and applying defltbase.inf, where every user right on the machine returns to
+        the shipped default and any deliberate customisation is lost.
+
+        An account that is absent from Policy\Accounts is skipped rather than created. Creating an
+        account entry in the LSA policy database is a different operation from correcting one, and
+        a disk missing BUILTIN\Administrators entirely has a fault this script does not claim to
+        repair.
+
+    .OUTPUTS
+        Array of PSCustomObject with Sid, Name, OldMask, NewMask, Type and Reason.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts)
+
+    $byName = @{}
+    foreach ($a in $Accounts) { $byName[$a.Sid] = $a }
+
+    $set = @{}
+    $clear = @{}
+    $why = @{}
+
+    function Add-Change {
+        param($Sid, [uint32]$SetBits, [uint32]$ClearBits, $Reason)
+        if (-not $set.ContainsKey($Sid)) { $set[$Sid] = [uint32]0; $clear[$Sid] = [uint32]0; $why[$Sid] = @() }
+        $set[$Sid] = [uint32]($set[$Sid] -bor $SetBits)
+        $clear[$Sid] = [uint32]($clear[$Sid] -bor $ClearBits)
+        $why[$Sid] += $Reason
+    }
+
+    # 1. Deny rights tattooed on a broad group. Deny overrides allow, so these come off first.
+    foreach ($sid in $script:BroadSids.Keys) {
+        $account = $byName[$sid]
+        if ($null -eq $account) { continue }
+        foreach ($entry in $script:DenyBitsOnBroadGroups.GetEnumerator()) {
+            if (($account.Mask -band $entry.Key) -eq 0) { continue }
+            Add-Change -Sid $sid -SetBits 0 -ClearBits ([uint32]$entry.Key) `
+                -Reason "clear $($entry.Value)"
+        }
+    }
+
+    # 2. Nobody can reach the machine over RDP. defltbase.inf grants this right to exactly
+    #    Administrators and Remote Desktop Users, so the repair restores that same pair.
+    $adminMask = if ($byName[$script:SidAdministrators]) { [uint32]$byName[$script:SidAdministrators].Mask } else { [uint32]0 }
+    $rduMask = if ($byName[$script:SidRemoteDesktopUsers]) { [uint32]$byName[$script:SidRemoteDesktopUsers].Mask } else { [uint32]0 }
+
+    if ((($adminMask -band $script:BitRemoteInteractive) -eq 0) -and
+        (($rduMask -band $script:BitRemoteInteractive) -eq 0)) {
+        foreach ($sid in @($script:SidAdministrators, $script:SidRemoteDesktopUsers)) {
+            if ($null -eq $byName[$sid]) { continue }
+            Add-Change -Sid $sid -SetBits $script:BitRemoteInteractive -ClearBits 0 `
+                -Reason 'grant SeRemoteInteractiveLogonRight'
+        }
+    }
+
+    # 3. Console logon, which is the last way in when RDP is gone.
+    if ($null -ne $byName[$script:SidAdministrators] -and
+        (($adminMask -band $script:BitInteractive) -eq 0)) {
+        Add-Change -Sid $script:SidAdministrators -SetBits $script:BitInteractive -ClearBits 0 `
+            -Reason 'grant SeInteractiveLogonRight'
+    }
+
+    # 4. Service logon. Presents as 0xC000021A more often than as a logon failure.
+    $svc = $byName[$script:SidAllServices]
+    if ($null -ne $svc) {
+        if (([uint32]$svc.Mask -band $script:BitService) -eq 0) {
+            Add-Change -Sid $script:SidAllServices -SetBits $script:BitService -ClearBits 0 `
+                -Reason 'grant SeServiceLogonRight'
+        }
+        if (([uint32]$svc.Mask -band $script:BitDenyService) -ne 0) {
+            Add-Change -Sid $script:SidAllServices -SetBits 0 -ClearBits $script:BitDenyService `
+                -Reason 'clear SeDenyServiceLogonRight'
+        }
+    }
+
+    $plan = New-Object System.Collections.ArrayList
+    foreach ($sid in $set.Keys) {
+        $account = $byName[$sid]
+        $old = [uint32]$account.Mask
+        $new = Get-AdjustedLogonRightMask -Mask $old -Set $set[$sid] -Clear $clear[$sid]
+        if ($new -eq $old) { continue }
+        [void]$plan.Add([PSCustomObject]@{
+                Sid = $sid; Name = $account.Name; OldMask = $old; NewMask = $new
+                Type = $account.Type; Reason = ($why[$sid] -join ', ')
+            })
+    }
+
+    return , @($plan)
+}
+
+function Set-OfflineLogonRight {
+    <#
+    .SYNOPSIS
+        Writes the planned masks into the offline LSA policy database.
+
+    .DESCRIPTION
+        Every write is read back and compared by Set-OfflinePrivilegedRegistryValue before it is
+        counted, so a hive that silently refuses the write is reported as a failure rather than as
+        a repair. The registry type is carried from the read: the mask is REG_NONE, and rewriting
+        it as REG_BINARY would change the shape of the value even with identical bytes.
+
+    .OUTPUTS
+        PSCustomObject with Ok, Applied, Failed and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan
+    )
+
+    $result = [PSCustomObject]@{ Ok = $false; Applied = @(); Failed = @(); Reason = $null }
+
+    if ($Plan.Count -eq 0) {
+        $result.Ok = $true
+        return $result
+    }
+
+    try {
+        Mount-OfflineHive -WindowsPath $WindowsPath -Hive 'SECURITY'
+    }
+    catch {
+        $result.Reason = "the SECURITY hive could not be loaded: $($_.Exception.Message)"
+        return $result
+    }
+
+    try {
+        $applied = New-Object System.Collections.ArrayList
+        $failed = New-Object System.Collections.ArrayList
+
+        foreach ($entry in $Plan) {
+            $path = "HKLM\BROKENSECURITY\Policy\Accounts\$($entry.Sid)\ActSysAc"
+            $bytes = [System.BitConverter]::GetBytes([uint32]$entry.NewMask)
+
+            $write = Set-OfflinePrivilegedRegistryValue -Path $path -Name '' `
+                -Type ([int]$entry.Type) -Bytes $bytes -Confirm:$false
+
+            if ($write.Written) { [void]$applied.Add($entry) }
+            else {
+                [void]$failed.Add([PSCustomObject]@{ Entry = $entry; Error = $write.Error })
+            }
+        }
+
+        $result.Applied = @($applied)
+        $result.Failed = @($failed)
+        $result.Ok = ($failed.Count -eq 0)
+        if (-not $result.Ok) { $result.Reason = ($failed | ForEach-Object { $_.Error }) -join '; ' }
+        return $result
+    }
+    catch {
+        $result.Reason = "the logon rights could not be written: $($_.Exception.Message)"
+        return $result
+    }
+    finally {
         try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
     }
 }
@@ -393,68 +601,6 @@ function Get-OfflineSetupState {
     return $state
 }
 
-function Set-OfflineSetupHook {
-    <#
-    .SYNOPSIS
-        Points SYSTEM\Setup\CmdLine at the payload and puts the disk into setup mode.
-
-    .DESCRIPTION
-        Every value is read back after being written. A hive write that silently fails would
-        otherwise be reported as a successful repair, and the guest would boot without the hook.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$WindowsPath,
-        [Parameter(Mandatory = $true)][string]$GuestPayloadPath
-    )
-
-    $result = [PSCustomObject]@{
-        Applied = $false; PreviousSetupType = 0; PreviousCmdLine = ''; Reason = $null
-    }
-
-    $before = Get-OfflineSetupState -WindowsPath $WindowsPath
-    if (-not $before.Available) {
-        $result.Reason = $before.Reason
-        return $result
-    }
-
-    $result.PreviousSetupType = $before.SetupType
-    $result.PreviousCmdLine = $before.CmdLine
-
-    $command = 'cmd.exe /c "{0}"' -f $GuestPayloadPath
-    $setupType = $script:SetupTypeRunCmdLine
-
-    try {
-        # Invoke-WithHive runs the block with '& $ScriptBlock' and passes no arguments, so the block
-        # reads $command and $setupType from this scope rather than taking parameters.
-        $readBack = Invoke-WithHive -WindowsPath $WindowsPath -Hive 'SYSTEM' -ScriptBlock {
-            $key = 'HKLM:\BROKENSYSTEM\Setup'
-            Set-ItemProperty -Path $key -Name 'CmdLine' -Value $command -Type String -Force -ErrorAction Stop
-            Set-ItemProperty -Path $key -Name 'SetupType' -Value $setupType -Type DWord -Force -ErrorAction Stop
-            $props = Get-ItemProperty -Path $key -ErrorAction Stop
-            return [PSCustomObject]@{ CmdLine = "$($props.CmdLine)"; SetupType = [int]$props.SetupType }
-        }
-    }
-    catch {
-        $result.Reason = "the Setup hook could not be written: $($_.Exception.Message)"
-        return $result
-    }
-
-    if ($null -eq $readBack) {
-        $result.Reason = 'the Setup hook was written but could not be read back'
-        return $result
-    }
-    if ($readBack.CmdLine -ne $command) {
-        $result.Reason = "CmdLine reads back as '$($readBack.CmdLine)' instead of '$command'"
-        return $result
-    }
-    if ($readBack.SetupType -ne $script:SetupTypeRunCmdLine) {
-        $result.Reason = "SetupType reads back as $($readBack.SetupType) instead of $($script:SetupTypeRunCmdLine)"
-        return $result
-    }
-
-    $result.Applied = $true
-    return $result
-}
 
 function Restore-OfflineSetupHook {
     <#
@@ -505,136 +651,36 @@ function Restore-OfflineSetupHook {
     return $result
 }
 
-function Write-UserRightsPayload {
-    <#
-    .SYNOPSIS
-        Writes the batch file the guest runs at boot.
-
-    .DESCRIPTION
-        The payload does five things, in this order:
-
-          1. Exports the current user rights, which is the "before" half of the audit trail. It is
-             taken first so it still reflects the fault even if the configure step fails.
-          2. Applies defltbase.inf, scoped to /areas USER_RIGHTS so nothing outside user rights is
-             touched. The monolithic script this replaces omitted /areas and therefore also reset
-             account policy, audit policy and file and registry ACLs.
-          3. Exports again, so before and after can be compared on the disk afterwards.
-          4. Writes a result file carrying the exit code of each step, which is how the rescue VM
-             learns what happened inside a guest it cannot otherwise see.
-          5. Clears the Setup hook and deletes itself, so the VM does not re-enter setup mode and
-             the payload cannot run twice.
-
-        Deleting itself is the last line, which makes it the completion signal: if the file is still
-        there, the payload stopped early.
-
-        secedit's own log is sent to %WINDIR%\Temp rather than the default under the profile, since
-        the payload runs before any profile is loaded.
-
-        The file is written as ASCII with CRLF because cmd.exe will not reliably parse a batch file
-        saved as UTF-8 with a byte order mark.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$PayloadPath,
-        [Parameter(Mandatory = $true)][string]$GuestResultPath,
-        [Parameter(Mandatory = $true)][string]$GuestBeforePath,
-        [Parameter(Mandatory = $true)][string]$GuestAfterPath
-    )
-
-    $result = [PSCustomObject]@{ Written = $false; Reason = $null }
-
-    $parent = Split-Path -Path $PayloadPath -Parent
-    if (-not (Test-Path -LiteralPath $parent)) {
-        try { New-Item -Path $parent -ItemType Directory -Force -ErrorAction Stop | Out-Null }
-        catch {
-            $result.Reason = "the payload folder '$parent' could not be created: $($_.Exception.Message)"
-            return $result
-        }
-    }
-
-    $lines = @(
-        '@echo off'
-        'setlocal'
-        'set RESULT=' + $GuestResultPath
-        'set BEFORE=' + $GuestBeforePath
-        'set AFTER=' + $GuestAfterPath
-        'set SDB=%WINDIR%\Temp\win-fix-user-rights.sdb'
-        'set SECLOG=%WINDIR%\Temp\win-fix-user-rights-secedit.log'
-
-        # Unhook before doing any work, not after. Everything below needs a live LSA, and the boot
-        # is held here until this file exits. If secedit stalls, or the VM loses power part way, a
-        # hook left armed puts the guest back into setup mode on the next boot as well, with nothing
-        # left able to clear it - the guest never reaches a logon prompt again and the only way out
-        # is another offline repair. Clearing it first makes the worst case 'the rights were not
-        # reset', which the next run can retry, instead of 'the VM no longer boots'.
-        # 'started' proves the session manager really did launch this file, which is the one thing
-        # an armed disk cannot otherwise tell us after the fact.
-        '> "%RESULT%" echo started=1'
-        'reg add "HKLM\SYSTEM\Setup" /v SetupType /t REG_DWORD /d 0 /f'
-        'reg delete "HKLM\SYSTEM\Setup" /v CmdLine /f'
-        '>> "%RESULT%" echo unhooked=%ERRORLEVEL%'
-
-        'if exist "%SDB%" del /f /q "%SDB%"'
-        # stdin is redirected from nul so a prompt can never block the boot waiting on a console
-        # nobody is attached to.
-        'secedit /export /areas USER_RIGHTS /cfg "%BEFORE%" /quiet < nul'
-        'set RC_BEFORE=%ERRORLEVEL%'
-        'secedit /configure /db "%SDB%" /cfg "%WINDIR%\inf\defltbase.inf" /areas USER_RIGHTS /log "%SECLOG%" /quiet < nul'
-        'set RC_CONFIGURE=%ERRORLEVEL%'
-        'secedit /export /areas USER_RIGHTS /cfg "%AFTER%" /quiet < nul'
-        'set RC_AFTER=%ERRORLEVEL%'
-        '>> "%RESULT%" echo before=%RC_BEFORE%'
-        '>> "%RESULT%" echo configure=%RC_CONFIGURE%'
-        '>> "%RESULT%" echo after=%RC_AFTER%'
-        '>> "%RESULT%" echo done=1'
-
-        # Windows owns SetupType while it believes a setup pass is running and re-arms it, so clear
-        # it again on the way out. The early clear is the safety net; this one is what normally
-        # sticks.
-        'reg add "HKLM\SYSTEM\Setup" /v SetupType /t REG_DWORD /d 0 /f'
-        'reg delete "HKLM\SYSTEM\Setup" /v CmdLine /f'
-        'endlocal'
-        'del /f /q "%~f0"'
-    )
-
-    try {
-        $text = ($lines -join "`r`n") + "`r`n"
-        [System.IO.File]::WriteAllText($PayloadPath, $text, [System.Text.Encoding]::ASCII)
-    }
-    catch {
-        $result.Reason = "the payload could not be written to '$PayloadPath': $($_.Exception.Message)"
-        return $result
-    }
-
-    if (-not (Test-Path -LiteralPath $PayloadPath)) {
-        $result.Reason = "the payload was written to '$PayloadPath' but the file is not there"
-        return $result
-    }
-    if ((Get-Item -LiteralPath $PayloadPath).Length -le 0) {
-        $result.Reason = "the payload at '$PayloadPath' is empty"
-        return $result
-    }
-
-    $result.Written = $true
-    return $result
-}
 
 function Write-RevertManifest {
     <#
     .SYNOPSIS
         Records what this run changed, so -revert has something to undo rather than a guess.
+
+    .DESCRIPTION
+        The mask each account held before the repair is what gets recorded. Reverting to a
+        remembered value is the only honest undo: recomputing a 'healthy' mask would put the disk
+        into a state it was never in, and on a machine whose rights were deliberately customised
+        that is a second fault rather than a rollback.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ManifestPath,
-        [Parameter(Mandatory = $true)][int]$PreviousSetupType,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$PreviousCmdLine
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan
     )
 
     try {
         $manifest = [PSCustomObject]@{
-            Script            = 'win-fix-user-rights'
-            Written           = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
-            PreviousSetupType = $PreviousSetupType
-            PreviousCmdLine   = $PreviousCmdLine
+            Script   = 'win-fix-user-rights'
+            Written  = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
+            Accounts = @($Plan | ForEach-Object {
+                    [PSCustomObject]@{
+                        Sid          = $_.Sid
+                        Name         = $_.Name
+                        PreviousMask = [uint32]$_.OldMask
+                        AppliedMask  = [uint32]$_.NewMask
+                        Type         = [int]$_.Type
+                    }
+                })
         }
         $manifest | ConvertTo-Json -Depth 4 | Out-File -FilePath $ManifestPath -Encoding ascii -Force
         return $true
@@ -747,22 +793,17 @@ try {
     $windowsPath = $offline.WindowsPath
     Log-Output "Offline Windows installation: $windowsPath" | Tee-Object -FilePath $logFile -Append
 
+    # Files an earlier version of this script left on the disk. Nothing is written to any of them
+    # now - they are resolved so the run can clear residue it finds.
     $payloadPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:PayloadRelativePath
     $resultPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ResultRelativePath
     $manifestPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ManifestRelativePath
-
-    # The guest sees its own Windows directory, which is not the drive letter it has here.
-    $guestWindows = 'C:\Windows'
-    $guestPayloadPath = "$guestWindows\$($script:PayloadRelativePath)"
-    $guestResultPath = "$guestWindows\$($script:ResultRelativePath)"
-    $guestBeforePath = "$guestWindows\$($script:BeforeRelativePath)"
-    $guestAfterPath = "$guestWindows\$($script:AfterRelativePath)"
 
     #####################################################################################################
     # Revert
     #####################################################################################################
     if ($isRevert) {
-        Log-Output 'REVERT: undoing the Setup hook and removing the payload.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'REVERT: putting the recorded logon-right masks back.' | Tee-Object -FilePath $logFile -Append
 
         $manifest = Read-RevertManifest -ManifestPath $manifestPath
         if ($null -eq $manifest) {
@@ -771,16 +812,36 @@ try {
 
         $restoredCount = 0
 
-        if ($null -ne $manifest -and $null -ne $manifest.PreviousSetupType) {
-            $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath `
-                -SetupType ([int]$manifest.PreviousSetupType) -CmdLine "$($manifest.PreviousCmdLine)"
+        if ($null -ne $manifest -and $null -ne $manifest.Accounts) {
+            # NewMask carries PreviousMask on purpose: reverting is the same write in the other
+            # direction, so it goes through the same verified path rather than a second one.
+            $undo = @(@($manifest.Accounts) | ForEach-Object {
+                    [PSCustomObject]@{
+                        Sid = "$($_.Sid)"; Name = "$($_.Name)"
+                        OldMask = [uint32]$_.AppliedMask; NewMask = [uint32]$_.PreviousMask
+                        Type = [int]$_.Type; Reason = 'revert'
+                    }
+                })
 
-            if ($restore.Restored) {
-                Log-Output "Setup hook restored to SetupType=$([int]$manifest.PreviousSetupType)." | Tee-Object -FilePath $logFile -Append
+            $back = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $undo
+            foreach ($entry in @($back.Applied)) {
+                Log-Output ("Reverted {0} to 0x{1:X4}." -f $entry.Name, $entry.NewMask) | Tee-Object -FilePath $logFile -Append
                 $restoredCount++
             }
-            else {
-                Log-Warning "The Setup hook could not be restored: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append
+            foreach ($failure in @($back.Failed)) {
+                Log-Warning "$($failure.Entry.Name) could not be reverted: $($failure.Error)" | Tee-Object -FilePath $logFile -Append
+            }
+        }
+
+        # Earlier versions of this script armed a Setup hook instead of writing the hive. A disk
+        # repaired by one of those is still carrying it, and SetupType is the half the payload
+        # could never clear from inside its own boot, so clear it here.
+        $legacy = Get-OfflineSetupState -WindowsPath $windowsPath
+        if ($legacy.Available -and ($legacy.SetupType -ne 0 -or $legacy.CmdLine -like '*win-fix-user-rights*')) {
+            $cleared = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType 0 -CmdLine ''
+            if ($cleared.Restored) {
+                Log-Output 'Cleared a Setup hook left by an earlier version of this script.' | Tee-Object -FilePath $logFile -Append
+                $restoredCount++
             }
         }
 
@@ -834,23 +895,30 @@ try {
         return $STATUS_ERROR
     }
 
-    # A setup command already pointing at something real is a servicing or provisioning step.
-    # Overwriting it would discard work the image is part way through.
+    # A setup command already pointing at something real is a servicing or provisioning step. The
+    # repair no longer touches SYSTEM\Setup at all, so this does not block anything - it is
+    # reported because an operator looking at a machine that will not sign in needs to know the
+    # image is part way through something.
     $hookInUse = ($setupState.SetupType -ne 0 -and
         -not [string]::IsNullOrWhiteSpace($setupState.CmdLine) -and
         $setupState.CmdLine -notlike '*win-fix-user-rights*')
 
     if ($hookInUse) {
         $findings += New-Finding -Cause 'SetupHookInUse' -Item 'CmdLine' -Repairable $false `
-            -Message "SYSTEM\Setup is already in setup mode running '$($setupState.CmdLine)'. That is left alone, because overwriting it would discard a servicing or provisioning step this image is part way through."
+            -Message "SYSTEM\Setup is already in setup mode running '$($setupState.CmdLine)'. That is left alone: this script repairs the LSA policy database directly and never arms a boot-time command."
     }
 
-    # defltbase.inf is what the payload applies. If it is not on the disk there is nothing to arm.
-    $defltbase = Join-OfflinePath -Root $windowsPath -ChildPath 'inf\defltbase.inf'
-    $haveTemplate = Test-OfflinePath $defltbase
-    if (-not $haveTemplate) {
-        $findings += New-Finding -Cause 'TemplateMissing' -Item 'inf\defltbase.inf' -Repairable $false `
-            -Message 'The default security template inf\defltbase.inf is not on this disk, so there is nothing for secedit to apply. Copy it from a machine at the same build, or reset the rights by hand from a console session.'
+    # A SetupType left armed with nothing to run is residue from an earlier version of this script,
+    # which cleared CmdLine from inside its own payload but could never make SetupType stick -
+    # Windows rewrites it when the setup pass completes, after the payload has exited. Measured on
+    # Server 2022 20348: the payload's write succeeded and was overwritten, leaving SetupType=2 with
+    # an empty CmdLine on every boot thereafter.
+    $staleSetupType = ($setupState.Available -and $setupState.SetupType -ne 0 -and
+        [string]::IsNullOrWhiteSpace($setupState.CmdLine))
+
+    if ($staleSetupType) {
+        $findings += New-Finding -Cause 'StaleSetupType' -Item 'SetupType' `
+            -Message "SYSTEM\Setup\SetupType is $($setupState.SetupType) with no CmdLine to run. The machine re-enters the setup boot path on every boot for nothing, and this is left behind by an earlier version of this repair. It is reset to 0."
     }
 
     #####################################################################################################
@@ -882,52 +950,68 @@ try {
     #####################################################################################################
     $repairable = @($findings | Where-Object { $_.Repairable })
 
-    if ($hookInUse -or -not $haveTemplate) {
-        Log-Error 'Nothing is armed, because a blocking condition above has to be resolved first.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
     if ($repairable.Count -eq 0 -and -not $isForced) {
-        Log-Output 'Nothing was armed: this disk has no user-rights fault to repair. Re-run with -force true to reset user rights anyway.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'Nothing was changed: this disk has no user-rights fault to repair. Re-run with -force true to apply the standard logon rights anyway.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
 
     if ($repairable.Count -eq 0 -and $isForced) {
-        Log-Warning 'FORCED: no fault was detected, but -force true was passed, so the reset is armed anyway. Every user right on this VM returns to the shipped default on its next boot, and any deliberate customisation is lost.' | Tee-Object -FilePath $logFile -Append
+        Log-Warning 'FORCED: no fault was detected, so the standard logon rights are applied anyway. Only the specific bits this script manages are touched; every other right on the disk is left as it is.' | Tee-Object -FilePath $logFile -Append
     }
 
-    $payload = Write-UserRightsPayload -PayloadPath $payloadPath -GuestResultPath $guestResultPath `
-        -GuestBeforePath $guestBeforePath -GuestAfterPath $guestAfterPath
+    $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts))
 
-    if (-not $payload.Written) {
-        Log-Error "The payload could not be written: $($payload.Reason)." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
+    if ($plan.Count -eq 0 -and -not $staleSetupType) {
+        Log-Output 'Nothing was changed: the logon-right masks on this disk already permit sign-in.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_SUCCESS
     }
 
-    # Stale results from an earlier run would be read as this run's outcome.
-    if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue }
+    # Written before the first hive write, not after. A run that dies part way still needs an undo
+    # record for whatever it managed to change.
+    [void](Write-RevertManifest -ManifestPath $manifestPath -Plan $plan)
 
-    $hook = Set-OfflineSetupHook -WindowsPath $windowsPath -GuestPayloadPath $guestPayloadPath
-    if (-not $hook.Applied) {
-        Log-Error "The Setup hook could not be armed: $($hook.Reason)." | Tee-Object -FilePath $logFile -Append
-        Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
-        return $STATUS_ERROR
-    }
-
-    [void](Write-RevertManifest -ManifestPath $manifestPath `
-            -PreviousSetupType $hook.PreviousSetupType -PreviousCmdLine $hook.PreviousCmdLine)
+    $write = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $plan
 
     Log-Output '' | Tee-Object -FilePath $logFile -Append
-    foreach ($finding in $repairable) {
-        Log-Output "  [ARMED] $($finding.Cause) - $($finding.Item)" | Tee-Object -FilePath $logFile -Append
+    foreach ($entry in @($write.Applied)) {
+        Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+    }
+    foreach ($failure in @($write.Failed)) {
+        Log-Error ("  [FAILED] {0}: {1}" -f $failure.Entry.Name, $failure.Error) | Tee-Object -FilePath $logFile -Append
     }
 
-    Log-Output "ARMED $($repairable.Count) of $($repairable.Count) repairable finding(s): user rights reset to the shipped default on the next boot." | Tee-Object -FilePath $logFile -Append
-    Log-Output "The payload applies defltbase.inf scoped to /areas USER_RIGHTS, so nothing outside user rights is changed." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Audit trail written on the repaired VM: $guestBeforePath and $guestAfterPath." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Run 'az vm repair restore' and let the VM boot once; the reset runs before the logon UI appears." | Tee-Object -FilePath $logFile -Append
+    # SetupType is cleared last. It is not part of the logon-rights fault, so a failure to write the
+    # policy database must not be masked by a successful tidy-up of somebody else's residue.
+    if ($staleSetupType) {
+        $cleared = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType 0 -CmdLine ''
+        if ($cleared.Restored) {
+            Log-Output '  [FIXED] SYSTEM\Setup\SetupType reset to 0, so the disk no longer re-enters the setup boot path.' | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Warning "SetupType could not be reset: $($cleared.Reason)" | Tee-Object -FilePath $logFile -Append
+        }
+    }
+
+    if (-not $write.Ok) {
+        Log-Error "The logon rights could not be fully repaired: $($write.Reason)." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_ERROR
+    }
+
+    # The disk is handed back with no boot-time work outstanding. This is asserted rather than
+    # assumed: the previous design armed SYSTEM\Setup and could not clear it again from inside the
+    # boot it started, so the one thing worth proving is that nothing here left that state behind.
+    $final = Get-OfflineSetupState -WindowsPath $windowsPath
+    if ($final.Available -and ($final.SetupType -ne 0 -or -not [string]::IsNullOrWhiteSpace($final.CmdLine))) {
+        Log-Warning "SYSTEM\Setup still reads SetupType=$($final.SetupType) CmdLine='$($final.CmdLine)'. That is not this repair, but the VM will run it on the next boot." | Tee-Object -FilePath $logFile -Append
+    }
+
+    Log-Output "REPAIRED $($write.Applied.Count) account(s) in the offline LSA policy database." | Tee-Object -FilePath $logFile -Append
+    Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
+    Log-Output "Verified on this disk: SetupType=$($final.SetupType), no boot-time command armed." | Tee-Object -FilePath $logFile -Append
+    Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
     return $STATUS_SUCCESS
 }

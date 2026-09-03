@@ -1282,6 +1282,10 @@ public static class OfflinePrivilegedRegistry
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern int RegDeleteValueW(IntPtr hKey, string lpValueName);
 
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern int RegSetValueExW(IntPtr hKey, string lpValueName, int Reserved, int dwType,
+        byte[] lpData, int cbData);
+
     // Opens an existing key through the backup path. Never leaves a key behind that it created:
     // if the disposition says the key was new, it is deleted again and the call reports failure,
     // so a caller can treat a non-zero result as "not there" without having changed anything.
@@ -1391,6 +1395,18 @@ public static class OfflinePrivilegedRegistry
         int rc = Open(subKey, true, out h);
         if (rc != ERROR_SUCCESS) { return rc; }
         try { return RegDeleteValueW(h, name); }
+        finally { RegCloseKey(h); }
+    }
+
+    // The caller supplies the type as well as the bytes. The LSA policy database stores the
+    // logon-right mask as REG_NONE, and rewriting it as REG_BINARY or REG_DWORD changes the shape
+    // of the value even when the four bytes are identical, so the type is never inferred here.
+    public static int SetValue(string subKey, string name, int type, byte[] data)
+    {
+        IntPtr h;
+        int rc = Open(subKey, true, out h);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        try { return RegSetValueExW(h, name, 0, type, data, data.Length); }
         finally { RegCloseKey(h); }
     }
 }
@@ -1605,6 +1621,80 @@ function Remove-OfflinePrivilegedRegistryValue {
     }
 
     $result.Removed = $true
+    return $result
+}
+
+function Set-OfflinePrivilegedRegistryValue {
+    <#
+    .SYNOPSIS
+        Writing one value to a key that may deny write to every account, SYSTEM included.
+
+    .DESCRIPTION
+        The key's owner and DACL are left exactly as they were found: the write goes through the
+        backup-restore path rather than by granting anyone access, so nothing has to be put back
+        afterwards and a failure part way cannot leave the hive more permissive than it was.
+
+        Type is passed in rather than inferred. The offline SECURITY hive stores the logon-right
+        mask as REG_NONE (type 0), and writing the same four bytes back as REG_BINARY changes the
+        shape of the value even though the content matches.
+
+        Name accepts an empty string, which is how the Win32 registry API names a key's default
+        (unnamed) value - the only place the ActSysAc mask exists.
+
+        The value is read back and compared byte for byte before success is reported. A silent
+        write failure on a protected hive would otherwise be indistinguishable from a repair.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name,
+        [Parameter(Mandatory = $true)][int]$Type,
+        [Parameter(Mandatory = $true)][byte[]]$Bytes
+    )
+
+    $result = [PSCustomObject]@{ Written = $false; Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("$Path\$Name", 'Set registry value')) { return $result }
+
+    if (-not (Enable-OfflineBackupPrivilege)) {
+        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be opened for write.'
+        return $result
+    }
+    Initialize-OfflinePrivilegedRegistryType
+
+    $rc = [OfflinePrivilegedRegistry]::SetValue($subKey, $Name, $Type, $Bytes)
+    if ($rc -ne 0) {
+        $result.Error = "$Name could not be written (error $rc)."
+        return $result
+    }
+
+    $readBack = Get-OfflinePrivilegedRegistryValue -Path $Path -Name $Name
+    if (-not $readBack.Ok -or -not $readBack.Found) {
+        $result.Error = "$Name was written but could not be read back."
+        return $result
+    }
+    if ($readBack.Type -ne $Type) {
+        $result.Error = "$Name reads back as type $($readBack.Type) instead of $Type."
+        return $result
+    }
+    if (@($readBack.Bytes).Count -ne $Bytes.Count) {
+        $result.Error = "$Name reads back as $($readBack.ByteLength) byte(s) instead of $($Bytes.Count)."
+        return $result
+    }
+    for ($i = 0; $i -lt $Bytes.Count; $i++) {
+        if ($readBack.Bytes[$i] -ne $Bytes[$i]) {
+            $result.Error = "$Name reads back with different content at byte $i."
+            return $result
+        }
+    }
+
+    $result.Written = $true
     return $result
 }
 #endregion
