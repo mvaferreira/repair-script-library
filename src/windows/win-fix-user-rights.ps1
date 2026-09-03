@@ -205,6 +205,12 @@ $script:ManifestRelativePath = 'Temp\win-fix-user-rights-revert.json'
 $script:RegNone = 0
 $script:RegBinary = 3
 
+# What this run is repairing, in words, for the operator-facing messages. Both modes share the same
+# detect and repair code, so the messages are shared too - but "no account on this disk holds ..."
+# is wrong and confusing when the thing being repaired is the running machine. Set at mode
+# detection; defaulted here so a message can never render an empty noun.
+$script:TargetNoun = 'this disk'
+
 # SECURITY_ACCESS_* from ntsecapi.h. Measured against secedit on Server 2022 20348 - see the header.
 $script:LogonRightBits = [ordered]@{
     0x0001 = 'SeInteractiveLogonRight'
@@ -1308,7 +1314,7 @@ function Get-UserRightsFinding {
 
         if ($null -eq $account) {
             [void]$findings.Add((New-Finding -Cause 'MissingAccountEntry' -Item "$friendly / $wantedNames" `
-                        -Message "$friendly has no entry in this disk's LSA policy database, so it holds no logon right at all. Windows grants it $wantedNames by default on this build, and LSA removes an account outright once its last right is taken away - which is what an over-restrictive user-rights policy does."))
+                        -Message "$friendly has no entry in $($script:TargetNoun)'s LSA policy database, so it holds no logon right at all. Windows grants it $wantedNames by default on this build, and LSA removes an account outright once its last right is taken away - which is what an over-restrictive user-rights policy does."))
             continue
         }
 
@@ -1353,13 +1359,13 @@ function Get-UserRightsFinding {
 
     if (-not $holders.ContainsKey('SeRemoteInteractiveLogonRight')) {
         [void]$findings.Add((New-Finding -Cause 'MissingRemoteInteractiveLogon' -Item 'SeRemoteInteractiveLogonRight' `
-                    -Message "No account on this disk holds 'Allow log on through Remote Desktop Services', so nobody can sign in over RDP however healthy the listener, the certificate and the firewall are."))
+                    -Message "No account on $($script:TargetNoun) holds 'Allow log on through Remote Desktop Services', so nobody can sign in over RDP however healthy the listener, the certificate and the firewall are."))
     }
 
     # 3. Console logon is gone too, which is what removes the last way in.
     if (-not $holders.ContainsKey('SeInteractiveLogonRight')) {
         [void]$findings.Add((New-Finding -Cause 'MissingInteractiveLogon' -Item 'SeInteractiveLogonRight' `
-                    -Message "No account on this disk holds 'Allow log on locally', so nobody can sign in at the console either - which is what turns a refused RDP session into a VM with no way in at all."))
+                    -Message "No account on $($script:TargetNoun) holds 'Allow log on locally', so nobody can sign in at the console either - which is what turns a refused RDP session into a VM with no way in at all."))
     }
 
     # 4. Services cannot start. This presents as 0xC000021A far more often than as a logon failure.
@@ -1418,11 +1424,13 @@ try {
 
     if ($script:OnlineMode) {
         $windowsPath = $env:windir
+        $script:TargetNoun = 'this machine'
         Log-Output "MODE: online. No offline Windows installation is attached, so this is the machine being repaired and Windows writes its own policy through secedit." | Tee-Object -FilePath $logFile -Append
         Log-Output "      To repair a VM that cannot boot or whose agent does not answer, attach its disk with 'az vm repair create' and re-run with --run-on-repair." | Tee-Object -FilePath $logFile -Append
     }
     else {
         $windowsPath = $offline.WindowsPath
+        $script:TargetNoun = 'this disk'
         Log-Output "MODE: offline. Repairing the attached installation at $windowsPath." | Tee-Object -FilePath $logFile -Append
     }
 
@@ -1557,7 +1565,7 @@ try {
         Log-Output "Shipped defaults read from $($shipped.TemplatePath): $($shipped.RightCount) logon right(s) across $($shipped.Grants.Count) account(s)." | Tee-Object -FilePath $logFile -Append
     }
     else {
-        Log-Warning "The shipped defaults could not be read from this disk ($($shipped.Error)). Falling back to the built-in defaults for the two groups Windows grants RDP to." | Tee-Object -FilePath $logFile -Append
+        Log-Warning "The shipped defaults could not be read from $($script:TargetNoun) ($($shipped.Error)). Falling back to the built-in defaults for the two groups Windows grants RDP to." | Tee-Object -FilePath $logFile -Append
         $shipped.Grants = @{
             $script:SidAdministrators     = [uint32]($script:BitInteractive -bor $script:BitRemoteInteractive)
             $script:SidRemoteDesktopUsers = [uint32]$script:BitRemoteInteractive
@@ -1621,7 +1629,7 @@ try {
     }
 
     if ($isDetectOnly) {
-        Log-Output 'DETECT ONLY: nothing was changed on this disk.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "DETECT ONLY: nothing was changed on $($script:TargetNoun)." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -1632,7 +1640,7 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
 
     if ($repairable.Count -eq 0 -and -not $isForced) {
-        Log-Output 'Nothing was changed: this disk has no user-rights fault to repair.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Nothing was changed: $($script:TargetNoun) has no user-rights fault to repair." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -1644,7 +1652,7 @@ try {
     $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
 
     if ($plan.Count -eq 0 -and -not $staleSetupType) {
-        Log-Output 'Nothing was changed: the logon-right masks on this disk already permit sign-in.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Nothing was changed: the logon-right masks on $($script:TargetNoun) already permit sign-in." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
