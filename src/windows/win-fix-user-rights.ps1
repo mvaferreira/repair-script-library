@@ -25,15 +25,30 @@
 #   Logon rights live in the SECURITY hive as one bitmask per account, and the repair rewrites the
 #   bits behind the fault in place, on the disk, while it is attached to the rescue VM.
 #
-#   The line the script draws is between correcting an entry and creating one. Overwriting an
-#   existing four-byte ActSysAc value - type preserved, result read back and compared byte for byte
-#   - cannot change the shape of the database. Creating an account that is not there would mean
-#   synthesising its Sid, Privilgs and SecDesc blobs, and hand-building that structure is how
-#   offline tools corrupt a policy database. An LSA that cannot parse its own policy database stops
+#   The line the script draws is between correcting an entry and inventing policy structure.
+#   Overwriting an existing four-byte ActSysAc value - type preserved, result read back and compared
+#   byte for byte - cannot change the shape of the database.
+#
+#   The fault can also delete an account outright: LSA drops an entry from Policy\Accounts when its
+#   last right is taken away, so emptying SeRemoteInteractiveLogonRight removes Remote Desktop Users
+#   entirely. That entry is recreated, because repairing only the surviving group leaves the group
+#   most VMs actually put their RDP users in locked out - measured on Server 2022 20348, where after
+#   such a repair an administrator could sign in over RDP and a member of Remote Desktop Users could
+#   not.
+#
+#   What an entry contains was measured, not assumed. LSA was asked to create one through secedit
+#   and the result read back: exactly three subkeys - ActSysAc, SecDesc and Sid - and no Privilgs at
+#   all, because LSA omits it when the account holds no privileges. That removed the one field whose
+#   encoding would have had to be invented, and inventing LSA policy structure is how offline tools
+#   produce a database that cannot be parsed. An LSA that cannot read its own policy database stops
 #   the machine with 0xC000021A, and that is not recoverable by dropping in a clean SECURITY hive,
-#   because the same hive holds the machine account password and the DPAPI backup keys. Trading a
-#   refused logon for an unbootable VM is not a repair, so the script never creates an account
-#   entry - it reports the gap and the one online command that closes it.
+#   because the same hive holds the machine account password and the DPAPI backup keys.
+#
+#   So nothing in a recreated entry is authored here: the security descriptor is copied from an
+#   account already present in the same hive, the SID comes from SecurityIdentifier.GetBinaryForm
+#   and was compared byte for byte with what LSA wrote for that SID, and the mask is the same value
+#   written everywhere else. If the descriptor cannot be read, the entry is not created and the gap
+#   is reported with the online command that closes it.
 #
 #   WHY NOT SECEDIT
 #
@@ -185,6 +200,11 @@ $script:PayloadRelativePath = 'Temp\win-fix-user-rights.cmd'
 $script:ResultRelativePath = 'Temp\win-fix-user-rights.result'
 $script:ManifestRelativePath = 'Temp\win-fix-user-rights-revert.json'
 
+# Registry value types. Passed explicitly on every write because the LSA policy database stores its
+# values as REG_NONE, and rewriting the same bytes as REG_BINARY changes the shape of the value.
+$script:RegNone = 0
+$script:RegBinary = 3
+
 # SECURITY_ACCESS_* from ntsecapi.h. Measured against secedit on Server 2022 20348 - see the header.
 $script:LogonRightBits = [ordered]@{
     0x0001 = 'SeInteractiveLogonRight'
@@ -226,6 +246,23 @@ $script:BroadSids = [ordered]@{
     'S-1-5-32-545'  = 'BUILTIN\Users'
     'S-1-5-32-555'  = 'BUILTIN\Remote Desktop Users'
 }
+
+# Each grant bit and the deny bit that overrides it. Deny wins in LSA, so restoring a grant without
+# clearing its partner leaves the account exactly as locked out as before.
+$script:GrantToDenyBit = [ordered]@{
+    0x0001 = 0x0040  # Interactive        -> DenyInteractive
+    0x0002 = 0x0080  # Network            -> DenyNetwork
+    0x0004 = 0x0100  # Batch              -> DenyBatch
+    0x0010 = 0x0200  # Service            -> DenyService
+    0x0400 = 0x0800  # RemoteInteractive  -> DenyRemoteInteractive
+}
+
+# The rights a human signs in with, and the only ones this repair restores from the template. The
+# other grants in defltbase.inf are deliberately left alone: SeNetworkLogonRight ships with Everyone
+# on it and hardening baselines remove that on purpose, so "resetting it to default" would undo a
+# deliberate decision to fix a fault that has nothing to do with signing in. Those still get
+# reported, so an operator can see the deviation and act on it.
+$script:SignInGrantBits = [uint32](0x0001 -bor 0x0400)
 
 $script:SidAdministrators = 'S-1-5-32-544'
 $script:SidRemoteDesktopUsers = 'S-1-5-32-555'
@@ -409,6 +446,120 @@ function Get-AdjustedLogonRightMask {
     return [uint32]($cleared -bor $Set)
 }
 
+function Get-ShippedLogonRightDefault {
+    <#
+    .SYNOPSIS
+        The logon rights Windows itself ships as the default, read from the disk being repaired.
+
+    .DESCRIPTION
+        A user-rights lockout is rarely one of the two examples this script was built against. It is
+        usually a Group Policy that assigned user rights too narrowly and replaced the shipped list,
+        because user-rights assignment is replace and not merge - one over-restrictive policy strips
+        every principal the setting does not name. So the repair needs to know what the default
+        actually is, for any right, rather than carrying an opinion about two SIDs.
+
+        Windows ships that answer on the disk. %windir%\inf\defltbase.inf is the same template
+        'secedit /configure /cfg %windir%\inf\defltbase.inf /areas USER_RIGHTS' applies, and its
+        [Privilege Rights] section names every right and the SIDs that hold it. Reading it off the
+        disk being repaired means the answer is correct for that build and that SKU, rather than for
+        the build this script was written on. A domain controller has its own defaults, so
+        defltdc.inf is preferred when the disk is one - detected by ntds.dit rather than by mounting
+        another hive.
+
+        Only the ten logon rights are decoded, because those are the bits that live in ActSysAc and
+        decide whether an account can sign in at all. Privileges are left entirely alone: they are
+        stored in a separate variable-length Privilgs value, they are not what locks anyone out, and
+        rewriting them would mean authoring a structure LSA normally owns.
+
+        RID-relative entries such as &-501 are skipped. Resolving them needs the machine SID, they
+        only ever name Guest in the shipped template, and Guest is not how anyone recovers a VM.
+
+    .OUTPUTS
+        PSCustomObject with Ok, TemplatePath, Grants (SID -> uint32 mask), RightCount and Error.
+    #>
+    param([Parameter(Mandatory = $true)][string]$WindowsPath)
+
+    $result = [PSCustomObject]@{
+        Ok           = $false
+        TemplatePath = $null
+        Grants       = @{}
+        RightCount   = 0
+        Skipped      = @()
+        Error        = ''
+    }
+
+    $candidates = New-Object System.Collections.ArrayList
+    if (Test-Path -LiteralPath (Join-Path $WindowsPath 'NTDS\ntds.dit')) {
+        [void]$candidates.Add('defltdc.inf')
+    }
+    [void]$candidates.Add('defltbase.inf')
+    [void]$candidates.Add('defltsv.inf')
+
+    $template = $null
+    foreach ($candidate in $candidates) {
+        $path = Join-Path $WindowsPath "inf\$candidate"
+        if (Test-Path -LiteralPath $path) { $template = $path; break }
+    }
+
+    if (-not $template) {
+        $result.Error = "no security template was found under $WindowsPath\inf, so the shipped defaults could not be read from this disk"
+        return $result
+    }
+    $result.TemplatePath = $template
+
+    try { $lines = Get-Content -LiteralPath $template -ErrorAction Stop }
+    catch {
+        $result.Error = "$template could not be read: $($_.Exception.Message)"
+        return $result
+    }
+
+    $byName = @{}
+    foreach ($entry in $script:LogonRightBits.GetEnumerator()) { $byName[$entry.Value] = [uint32]$entry.Key }
+
+    $inSection = $false
+    $grants = @{}
+    $skipped = New-Object System.Collections.ArrayList
+
+    foreach ($line in $lines) {
+        $trimmed = "$line".Trim()
+        if ($trimmed -match '^\[') {
+            if ($inSection) { break }
+            $inSection = ($trimmed -match '^\[Privilege Rights\]$')
+            continue
+        }
+        if (-not $inSection -or $trimmed -eq '' -or $trimmed.StartsWith(';')) { continue }
+
+        $split = $trimmed.IndexOf('=')
+        if ($split -lt 1) { continue }
+
+        $rightName = $trimmed.Substring(0, $split).Trim()
+        if (-not $byName.ContainsKey($rightName)) { continue }
+
+        $bit = [uint32]$byName[$rightName]
+        $result.RightCount++
+
+        foreach ($token in ($trimmed.Substring($split + 1) -split ',')) {
+            $sid = "$token".Trim()
+            if ($sid -eq '') { continue }
+            if ($sid.StartsWith('*')) { $sid = $sid.Substring(1).Trim() }
+            if ($sid -notmatch '^S-1-') { [void]$skipped.Add("$rightName=$sid"); continue }
+
+            if (-not $grants.ContainsKey($sid)) { $grants[$sid] = [uint32]0 }
+            $grants[$sid] = [uint32]($grants[$sid] -bor $bit)
+        }
+    }
+
+    if ($result.RightCount -eq 0) {
+        $result.Error = "$template has no [Privilege Rights] section this script can read"
+        return $result
+    }
+
+    $result.Grants = $grants
+    $result.Skipped = @($skipped)
+    $result.Ok = $true
+    return $result
+}
+
 function Get-AbsentGrantTarget {
     <#
     .SYNOPSIS
@@ -416,33 +567,39 @@ function Get-AbsentGrantTarget {
 
     .DESCRIPTION
         LSA removes an account's entry from Policy\Accounts once its last right is taken away, so
-        the very fault this script repairs can leave BUILTIN\Remote Desktop Users with no entry at
-        all - measured on Server 2022 20348, where emptying SeRemoteInteractiveLogonRight through
-        secedit deleted S-1-5-32-555 outright because that right was the only one it held.
+        an over-restrictive policy can leave a group with no entry at all rather than an empty one -
+        measured on Server 2022 20348, where emptying SeRemoteInteractiveLogonRight through secedit
+        deleted S-1-5-32-555 outright, because that right was the only one it held. Any group that
+        holds a single right by default is one policy away from disappearing the same way.
 
-        The right cannot be granted back to such an account offline. A policy entry is not just the
-        ActSysAc mask: it also carries Sid, Privilgs and SecDesc blobs, and the encoding of an empty
-        privilege set is not something to guess at, because an LSA that cannot parse its own policy
-        database does not fail gracefully - it stops the machine with 0xC000021A. Creating one would
-        risk a no-boot on a VM whose only fault was a refused logon.
-
-        Granting the right to BUILTIN\Administrators is what makes the VM reachable again, so the
-        repair does that and reports this, rather than silently restoring less than it appears to.
+        These are the accounts the shipped template grants a sign-in right to that have no entry on
+        this disk. New-OfflineLogonRightAccount puts them back; this exists so the repair can tell
+        the difference between an account it corrected and one it had to recreate, and so the gap is
+        still reported when recreating it is not possible.
 
     .OUTPUTS
-        Array of PSCustomObject with Sid, Name and Right.
+        Array of PSCustomObject with Sid, Name, Right and Mask.
     #>
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
+        [Parameter(Mandatory = $true)][hashtable]$DefaultGrants
+    )
 
     $present = @{}
     foreach ($a in $Accounts) { $present[$a.Sid] = $true }
 
     $absent = New-Object System.Collections.ArrayList
-    if (-not $present.ContainsKey($script:SidRemoteDesktopUsers)) {
+    foreach ($sid in $DefaultGrants.Keys) {
+        if ($present.ContainsKey($sid)) { continue }
+
+        $wanted = [uint32]([uint32]$DefaultGrants[$sid] -band $script:SignInGrantBits)
+        if ($wanted -eq 0) { continue }
+
         [void]$absent.Add([PSCustomObject]@{
-                Sid   = $script:SidRemoteDesktopUsers
-                Name  = (Resolve-SidFriendlyName -Sid $script:SidRemoteDesktopUsers)
-                Right = 'SeRemoteInteractiveLogonRight'
+                Sid   = $sid
+                Name  = (Resolve-SidFriendlyName -Sid $sid)
+                Right = ((ConvertTo-LogonRightName -Mask $wanted) -join ', ')
+                Mask  = $wanted
             })
     }
     return @($absent)
@@ -460,15 +617,22 @@ function Get-LogonRightRepairPlan {
         between this and applying defltbase.inf, where every user right on the machine returns to
         the shipped default and any deliberate customisation is lost.
 
-        An account that is absent from Policy\Accounts is skipped rather than created. Creating an
-        account entry in the LSA policy database is a different operation from correcting one, and
-        a disk missing BUILTIN\Administrators entirely has a fault this script does not claim to
-        repair.
+        Only the bits named here are touched: every other bit of the account's mask is carried
+        across untouched, which is the difference between this and applying defltbase.inf wholesale
+        with secedit, where every user right on the machine returns to the shipped default and any
+        deliberate customisation is lost. The template is read for what the default *is*, not
+        applied as a whole.
+
+        An account that is absent from Policy\Accounts is not planned here, because there is no mask
+        to adjust. Get-AbsentGrantTarget reports those and the repair recreates them separately.
 
     .OUTPUTS
         Array of PSCustomObject with Sid, Name, OldMask, NewMask, Type and Reason.
     #>
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
+        [Parameter(Mandatory = $true)][hashtable]$DefaultGrants
+    )
 
     $byName = @{}
     foreach ($a in $Accounts) { $byName[$a.Sid] = $a }
@@ -496,28 +660,38 @@ function Get-LogonRightRepairPlan {
         }
     }
 
-    # 2. Nobody can reach the machine over RDP. defltbase.inf grants this right to exactly
-    #    Administrators and Remote Desktop Users, so the repair restores that same pair.
-    $adminMask = if ($byName[$script:SidAdministrators]) { [uint32]$byName[$script:SidAdministrators].Mask } else { [uint32]0 }
-    $rduMask = if ($byName[$script:SidRemoteDesktopUsers]) { [uint32]$byName[$script:SidRemoteDesktopUsers].Mask } else { [uint32]0 }
+    # 2. Every account the shipped template grants a sign-in right to, that is missing it here. This
+    #    is the general case of the fault: a policy replaced the shipped list and dropped principals
+    #    from it. Restoring is additive - a grant this disk has that the template does not is left
+    #    alone, because a deliberate grant to a custom group is not a fault to be repaired.
+    foreach ($sid in $DefaultGrants.Keys) {
+        $account = $byName[$sid]
+        if ($null -eq $account) { continue }
 
-    if ((($adminMask -band $script:BitRemoteInteractive) -eq 0) -and
-        (($rduMask -band $script:BitRemoteInteractive) -eq 0)) {
-        foreach ($sid in @($script:SidAdministrators, $script:SidRemoteDesktopUsers)) {
-            if ($null -eq $byName[$sid]) { continue }
-            Add-Change -Sid $sid -SetBits $script:BitRemoteInteractive -ClearBits 0 `
-                -Reason 'grant SeRemoteInteractiveLogonRight'
+        $wanted = [uint32]([uint32]$DefaultGrants[$sid] -band $script:SignInGrantBits)
+        if ($wanted -eq 0) { continue }
+
+        $mask = [uint32]$account.Mask
+        $missing = [uint32]($wanted -band (-bnot $mask))
+        if ($missing -ne 0) {
+            $reason = (ConvertTo-LogonRightName -Mask $missing | ForEach-Object { "grant $_" }) -join ', '
+            Add-Change -Sid $sid -SetBits $missing -ClearBits 0 -Reason $reason
+        }
+
+        # Deny overrides allow, so a grant restored while its partner deny is still tattooed changes
+        # nothing the account can actually do. The shipped template leaves all five deny rights
+        # empty, so a deny sitting on a default grantee is by definition not the default.
+        $denies = [uint32]0
+        foreach ($pair in $script:GrantToDenyBit.GetEnumerator()) {
+            if (([uint32]$pair.Key -band $wanted) -eq 0) { continue }
+            if (($mask -band [uint32]$pair.Value) -eq 0) { continue }
+            $denies = [uint32]($denies -bor [uint32]$pair.Value)
+        }
+        if ($denies -ne 0) {
+            $reason = (ConvertTo-LogonRightName -Mask $denies | ForEach-Object { "clear $_" }) -join ', '
+            Add-Change -Sid $sid -SetBits 0 -ClearBits $denies -Reason $reason
         }
     }
-
-    # 3. Console logon, which is the last way in when RDP is gone.
-    if ($null -ne $byName[$script:SidAdministrators] -and
-        (($adminMask -band $script:BitInteractive) -eq 0)) {
-        Add-Change -Sid $script:SidAdministrators -SetBits $script:BitInteractive -ClearBits 0 `
-            -Reason 'grant SeInteractiveLogonRight'
-    }
-
-    # 4. Service logon. Presents as 0xC000021A more often than as a logon failure.
     $svc = $byName[$script:SidAllServices]
     if ($null -ne $svc) {
         if (([uint32]$svc.Mask -band $script:BitService) -eq 0) {
@@ -604,6 +778,128 @@ function Set-OfflineLogonRight {
     }
     catch {
         $result.Reason = "the logon rights could not be written: $($_.Exception.Message)"
+        return $result
+    }
+    finally {
+        try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
+    }
+}
+
+function New-OfflineLogonRightAccount {
+    <#
+    .SYNOPSIS
+        Recreates a Policy\Accounts entry that the fault deleted, holding one logon right.
+
+    .DESCRIPTION
+        LSA removes an account from Policy\Accounts when its last right is taken away, so the fault
+        this script repairs can delete BUILTIN\Remote Desktop Users outright. Restoring only the
+        surviving group would leave the population most VMs actually put RDP users in locked out.
+
+        What an entry contains was not guessed at. It was measured by letting LSA create one through
+        secedit on Server 2022 20348 and reading back what it wrote, which is exactly three subkeys:
+
+          ActSysAc  REG_NONE  the logon-right mask, four bytes little-endian
+          SecDesc   REG_NONE  the account security descriptor
+          Sid       REG_NONE  the binary SID
+
+        There is no Privilgs subkey. LSA omits it entirely when the account holds no privileges,
+        which removes the one field whose encoding would otherwise have had to be invented - and
+        inventing LSA policy structure is how offline tools produce a database that cannot be parsed.
+
+        None of the three is authored here either. SecDesc is copied from an account already present
+        in this same hive rather than carried as a constant, so it matches the disk being repaired;
+        it was byte-identical across every account sampled. The SID is produced by
+        SecurityIdentifier.GetBinaryForm and was compared byte for byte with the entry LSA wrote for
+        the same SID. The mask is the same value written anywhere else in this repair.
+
+    .OUTPUTS
+        PSCustomObject with Ok, Created and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [Parameter(Mandatory = $true)][string]$Sid,
+        [Parameter(Mandatory = $true)][uint32]$Mask,
+        [Parameter(Mandatory = $true)][string]$DonorSid
+    )
+
+    $result = [PSCustomObject]@{ Ok = $false; Created = $false; Reason = $null }
+
+    try {
+        $sidObject = New-Object System.Security.Principal.SecurityIdentifier($Sid)
+        $sidBytes = New-Object byte[] $sidObject.BinaryLength
+        $sidObject.GetBinaryForm($sidBytes, 0)
+    }
+    catch {
+        $result.Reason = "$Sid is not a SID this script can encode: $($_.Exception.Message)"
+        return $result
+    }
+
+    try {
+        Mount-OfflineHive -WindowsPath $WindowsPath -Hive 'SECURITY'
+    }
+    catch {
+        $result.Reason = "the SECURITY hive could not be loaded: $($_.Exception.Message)"
+        return $result
+    }
+
+    try {
+        $root = "HKLM\BROKENSECURITY\Policy\Accounts"
+
+        $donor = Get-OfflinePrivilegedRegistryValue -Path "$root\$DonorSid\SecDesc" -Name ''
+        if (-not $donor.Ok -or -not $donor.Found -or $null -eq $donor.Bytes -or $donor.Bytes.Count -eq 0) {
+            $result.Reason = "no security descriptor could be read from $DonorSid on this disk to copy, and this script will not author one"
+            return $result
+        }
+
+        $newKey = New-OfflinePrivilegedRegistryKey -Path "$root\$Sid" -Confirm:$false
+        if (-not $newKey.Ok) {
+            $result.Reason = $newKey.Error
+            return $result
+        }
+
+        # The account key itself carries an empty default value, which is what LSA leaves there.
+        $null = Set-OfflinePrivilegedRegistryValue -Path "$root\$Sid" -Name '' `
+            -Type $script:RegBinary -Bytes ([byte[]]@()) -Confirm:$false
+
+        $values = @(
+            @{ Key = 'ActSysAc'; Bytes = [System.BitConverter]::GetBytes([uint32]$Mask) }
+            @{ Key = 'SecDesc'; Bytes = [byte[]]$donor.Bytes }
+            @{ Key = 'Sid'; Bytes = $sidBytes }
+        )
+
+        foreach ($value in $values) {
+            $path = "$root\$Sid\$($value.Key)"
+            $made = New-OfflinePrivilegedRegistryKey -Path $path -Confirm:$false
+            if (-not $made.Ok) {
+                $result.Reason = $made.Error
+                return $result
+            }
+            $write = Set-OfflinePrivilegedRegistryValue -Path $path -Name '' `
+                -Type $script:RegNone -Bytes $value.Bytes -Confirm:$false
+            if (-not $write.Written) {
+                $result.Reason = "$($value.Key) could not be written: $($write.Error)"
+                return $result
+            }
+        }
+
+        # Read the mask back through the same decoder used everywhere else, so the entry is proven
+        # to be readable as an account rather than merely written.
+        $check = Get-OfflinePrivilegedRegistryValue -Path "$root\$Sid\ActSysAc" -Name ''
+        if (-not $check.Ok -or -not $check.Found -or $check.Bytes.Count -ne 4) {
+            $result.Reason = 'the entry was created but its mask does not read back as four bytes'
+            return $result
+        }
+        if ([System.BitConverter]::ToUInt32([byte[]]$check.Bytes, 0) -ne $Mask) {
+            $result.Reason = 'the entry was created but its mask does not read back as the value written'
+            return $result
+        }
+
+        $result.Created = $newKey.Created
+        $result.Ok = $true
+        return $result
+    }
+    catch {
+        $result.Reason = "the account entry could not be created: $($_.Exception.Message)"
         return $result
     }
     finally {
@@ -756,11 +1052,40 @@ function Get-UserRightsFinding {
         lesson directly: a setting being present is not a fault, and reporting it as one produces a
         script that rewrites healthy machines.
     #>
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
+        [Parameter(Mandatory = $true)][hashtable]$DefaultGrants
+    )
 
     $findings = New-Object System.Collections.ArrayList
     $byName = @{}
     foreach ($a in $Accounts) { $byName[$a.Sid] = $a }
+
+    # 0. The general fault: an account the shipped template grants a sign-in right to that no longer
+    #    holds it here. User-rights assignment is replace and not merge, so one over-restrictive
+    #    policy strips every principal it does not name - and LSA deletes the account from
+    #    Policy\Accounts altogether when that right was the only one it held.
+    foreach ($sid in $DefaultGrants.Keys) {
+        $wanted = [uint32]([uint32]$DefaultGrants[$sid] -band $script:SignInGrantBits)
+        if ($wanted -eq 0) { continue }
+
+        $friendly = Resolve-SidFriendlyName -Sid $sid
+        $wantedNames = (ConvertTo-LogonRightName -Mask $wanted) -join ', '
+        $account = $byName[$sid]
+
+        if ($null -eq $account) {
+            [void]$findings.Add((New-Finding -Cause 'MissingAccountEntry' -Item "$friendly / $wantedNames" `
+                        -Message "$friendly has no entry in this disk's LSA policy database, so it holds no logon right at all. Windows grants it $wantedNames by default on this build, and LSA removes an account outright once its last right is taken away - which is what an over-restrictive user-rights policy does."))
+            continue
+        }
+
+        $missing = [uint32]($wanted -band (-bnot [uint32]$account.Mask))
+        if ($missing -ne 0) {
+            $missingNames = (ConvertTo-LogonRightName -Mask $missing) -join ', '
+            [void]$findings.Add((New-Finding -Cause 'MissingDefaultLogonRight' -Item "$friendly / $missingNames" `
+                        -Message "$friendly does not hold $missingNames, which Windows grants it by default on this build. Its mask is 0x$('{0:X4}' -f [uint32]$account.Mask)."))
+        }
+    }
 
     # 1. A deny right tattooed on a broad group. This is the fault the scenario is named for.
     $denyMap = [ordered]@{
@@ -780,20 +1105,28 @@ function Get-UserRightsFinding {
         }
     }
 
-    # 2. Nobody can reach the machine over RDP.
-    $adminRights = if ($byName[$script:SidAdministrators]) { $byName[$script:SidAdministrators].Rights } else { @() }
-    $rduRights = if ($byName[$script:SidRemoteDesktopUsers]) { $byName[$script:SidRemoteDesktopUsers].Rights } else { @() }
+    # 2. Nobody at all can reach the machine. This is deliberately not a per-account check - a
+    #    custom group holding RDP instead of the shipped pair is somebody's decision, not a fault,
+    #    and finding 0 above already reports each default grantee that is missing its right. What
+    #    matters here is the state where the right is held by nobody whatsoever, because that is a
+    #    lockout no matter how the policy got there.
+    $holders = @{}
+    foreach ($account in $Accounts) {
+        foreach ($right in @($account.Rights)) {
+            if (-not $holders.ContainsKey($right)) { $holders[$right] = New-Object System.Collections.ArrayList }
+            [void]$holders[$right].Add($account.Name)
+        }
+    }
 
-    if (($adminRights -notcontains 'SeRemoteInteractiveLogonRight') -and
-        ($rduRights -notcontains 'SeRemoteInteractiveLogonRight')) {
+    if (-not $holders.ContainsKey('SeRemoteInteractiveLogonRight')) {
         [void]$findings.Add((New-Finding -Cause 'MissingRemoteInteractiveLogon' -Item 'SeRemoteInteractiveLogonRight' `
-                    -Message "Neither BUILTIN\Administrators nor BUILTIN\Remote Desktop Users holds 'Allow log on through Remote Desktop Services', so no account can sign in over RDP however healthy the listener and firewall are."))
+                    -Message "No account on this disk holds 'Allow log on through Remote Desktop Services', so nobody can sign in over RDP however healthy the listener, the certificate and the firewall are."))
     }
 
     # 3. Console logon is gone too, which is what removes the last way in.
-    if ($null -ne $byName[$script:SidAdministrators] -and $adminRights -notcontains 'SeInteractiveLogonRight') {
+    if (-not $holders.ContainsKey('SeInteractiveLogonRight')) {
         [void]$findings.Add((New-Finding -Cause 'MissingInteractiveLogon' -Item 'SeInteractiveLogonRight' `
-                    -Message "BUILTIN\Administrators does not hold 'Allow log on locally', so administrators cannot sign in at the console either."))
+                    -Message "No account on this disk holds 'Allow log on locally', so nobody can sign in at the console either - which is what turns a refused RDP session into a VM with no way in at all."))
     }
 
     # 4. Services cannot start. This presents as 0xC000021A far more often than as a logon failure.
@@ -930,7 +1263,23 @@ try {
             Out-File -FilePath $logFile -Append
     }
 
-    $findings = @(Get-UserRightsFinding -Accounts @($rights.Accounts))
+    # What the defaults actually are is read from the disk being repaired rather than carried as an
+    # opinion, so the answer is right for this build and this SKU. A lockout is usually a policy
+    # that replaced the shipped list, and it is rarely one of the two examples this was built on.
+    $shipped = Get-ShippedLogonRightDefault -WindowsPath $windowsPath
+    if ($shipped.Ok) {
+        Log-Output "Shipped defaults read from $($shipped.TemplatePath): $($shipped.RightCount) logon right(s) across $($shipped.Grants.Count) account(s)." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Warning "The shipped defaults could not be read from this disk ($($shipped.Error)). Falling back to the built-in defaults for the two groups Windows grants RDP to." | Tee-Object -FilePath $logFile -Append
+        $shipped.Grants = @{
+            $script:SidAdministrators     = [uint32]($script:BitInteractive -bor $script:BitRemoteInteractive)
+            $script:SidRemoteDesktopUsers = [uint32]$script:BitRemoteInteractive
+            $script:SidAllServices        = [uint32]$script:BitService
+        }
+    }
+
+    $findings = @(Get-UserRightsFinding -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
 
     # SYSTEM\Setup is read for reporting only now: the repair writes to the SECURITY hive and never
     # touches it. An unreadable SYSTEM hive is worth saying out loud, but it is not a reason to
@@ -1005,7 +1354,7 @@ try {
         Log-Warning 'FORCED: no fault was detected. The plan is derived from the same conditions detect reports, so on a disk that is already healthy it comes out empty and nothing is written.' | Tee-Object -FilePath $logFile -Append
     }
 
-    $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts))
+    $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
 
     if ($plan.Count -eq 0 -and -not $staleSetupType) {
         Log-Output 'Nothing was changed: the logon-right masks on this disk already permit sign-in.' | Tee-Object -FilePath $logFile -Append
@@ -1056,12 +1405,26 @@ try {
     Log-Output "REPAIRED $($write.Applied.Count) account(s) in the offline LSA policy database." | Tee-Object -FilePath $logFile -Append
     Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
 
-    # Reported, not hidden: the shipped default grants RDP to two groups, and if the fault deleted
-    # one of them from the policy database this repair restores fewer accounts than it appears to.
-    foreach ($absent in (Get-AbsentGrantTarget -Accounts @($rights.Accounts))) {
-        Log-Output "  [NOT RESTORED] $($absent.Name) has no entry in this disk's LSA policy database, so $($absent.Right) could not be granted to it offline." | Tee-Object -FilePath $logFile -Append
-        Log-Output "                 Access is restored through BUILTIN\Administrators above. To put the group back on the shipped default once the VM is up, run as administrator:" | Tee-Object -FilePath $logFile -Append
-        Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf  then add the SID to SeRemoteInteractiveLogonRight and re-import with secedit /configure /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
+    # The shipped default grants RDP to two groups. When the fault deleted one of them outright,
+    # repairing only the survivor leaves the group most VMs actually put their RDP users in still
+    # locked out - measured: administrators could sign in, Remote Desktop Users could not. So the
+    # entry is put back, from values read off this same disk. Gated on the finding, so a healthy
+    # disk that simply has no such group is still left alone.
+    $rdpFaultFound = @($repairable | Where-Object { $_.Cause -eq 'MissingAccountEntry' }).Count -gt 0
+    if ($rdpFaultFound) {
+        foreach ($absent in (Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)) {
+            $made = New-OfflineLogonRightAccount -WindowsPath $windowsPath -Sid $absent.Sid `
+                -Mask ([uint32]$absent.Mask) -DonorSid $script:SidAdministrators
+
+            if ($made.Ok) {
+                Log-Output ("  [FIXED] {0}: policy entry recreated holding {1} (0x{2:X4})" -f $absent.Name, $absent.Right, [uint32]$absent.Mask) | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Warning "  [NOT RESTORED] $($absent.Name) has no entry in this disk's LSA policy database and one could not be created: $($made.Reason)" | Tee-Object -FilePath $logFile -Append
+                Log-Output "                 Access is still restored through BUILTIN\Administrators above. To put the group back once the VM is up, run as administrator:" | Tee-Object -FilePath $logFile -Append
+                Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf  then add the SID to SeRemoteInteractiveLogonRight and re-import with secedit /configure /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
+            }
+        }
     }
 
     if ($final.Available) {

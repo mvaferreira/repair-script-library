@@ -1319,6 +1319,22 @@ public static class OfflinePrivilegedRegistry
         return ERROR_SUCCESS;
     }
 
+    // Deliberately creates the key when it is absent, and says which happened. Kept separate from
+    // Open on purpose: Open guarantees that reading or correcting a value never adds anything to a
+    // machine that may be healthy, so the one operation allowed to add has to be asked for by name.
+    public static int CreateKey(string subKey, out bool created)
+    {
+        created = false;
+        IntPtr h;
+        int disposition;
+        int rc = RegCreateKeyExW(HKLM, subKey, 0, null, REG_OPTION_BACKUP_RESTORE,
+                                 KEY_READ | KEY_WRITE, IntPtr.Zero, out h, out disposition);
+        if (rc != ERROR_SUCCESS) { return rc; }
+        created = (disposition == REG_CREATED_NEW_KEY);
+        RegCloseKey(h);
+        return ERROR_SUCCESS;
+    }
+
     public static int SubKeyNames(string subKey, out string[] names)
     {
         names = new string[0];
@@ -1621,6 +1637,58 @@ function Remove-OfflinePrivilegedRegistryValue {
     }
 
     $result.Removed = $true
+    return $result
+}
+
+function New-OfflinePrivilegedRegistryKey {
+    <#
+    .SYNOPSIS
+        Creating a key under a hive that may deny write to every account, SYSTEM included.
+
+    .DESCRIPTION
+        Separate from Set-OfflinePrivilegedRegistryValue because creating a key is a different
+        promise from correcting a value. Everything else in this helper is built so that reading or
+        repairing cannot add anything to a machine that may be healthy; this is the one entry point
+        that adds, so a caller has to ask for it by name.
+
+        Reports whether the key was created or was already there, so a caller can tell a repair from
+        a no-op, and confirms the key is readable afterwards rather than trusting the return code.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Ok = $false; Created = $false; Error = '' }
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) {
+        $result.Error = "$Path is not a path under HKLM."
+        return $result
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Create registry key')) { return $result }
+
+    if (-not (Enable-OfflineBackupPrivilege)) {
+        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be created.'
+        return $result
+    }
+    Initialize-OfflinePrivilegedRegistryType
+
+    $created = $false
+    $rc = [OfflinePrivilegedRegistry]::CreateKey($subKey, [ref]$created)
+    if ($rc -ne 0) {
+        $result.Error = "$Path could not be created (error $rc)."
+        return $result
+    }
+
+    $exists = $false
+    $check = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
+    if ($check -ne 0 -or -not $exists) {
+        $result.Error = "$Path does not read back as an existing key after being created."
+        return $result
+    }
+
+    $result.Created = $created
+    $result.Ok = $true
     return $result
 }
 
