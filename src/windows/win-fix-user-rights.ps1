@@ -353,7 +353,10 @@ function Get-OfflineLogonRight {
         return $result
     }
     finally {
-        try { Dismount-OfflineHive -Hive 'SECURITY' } catch { }
+        # Assigned to $null because Dismount-OfflineHive returns $true, and a finally block still
+        # writes to the output stream after the return above has run. Unsuppressed, the caller
+        # receives the result object AND a bare True, so $rights becomes a two-element array.
+        try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
     }
 }
 
