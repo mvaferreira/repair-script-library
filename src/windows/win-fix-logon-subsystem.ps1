@@ -10,25 +10,34 @@
 #   are provably broken are changed, and the result is re-checked. A healthy disk produces no writes.
 #
 #   Detection, in boot order:
-#     1. Session Manager BootExecute. Smss.exe runs these native images before Win32 starts. An
+#     1. Session Manager SubSystems\Windows. Smss.exe starts the Windows subsystem from the first
+#        executable in this value. A missing, zero-byte or untrusted image terminates the initial
+#        session process with 0xC000021A. When LastKnownGood names a different, valid Microsoft
+#        image, its exact REG_EXPAND_SZ value is copied to the active control set.
+#     2. Session Manager BootExecute. Smss.exe runs these native images before Win32 starts. An
 #        entry whose binary is missing hangs the VM at a black screen with no error, because there
 #        is no subsystem loaded yet to report one. The Windows default "autocheck autochk *" is
 #        always kept, and its absence is itself reported.
-#     2. Session Manager SetupExecute. Same execution context, normally empty.
-#     3. Setup mode. A non-zero SYSTEM\Setup\SetupType makes the session manager run
+#     3. Session Manager SetupExecute. Same execution context, normally empty.
+#     4. Setup mode. A non-zero SYSTEM\Setup\SetupType makes the session manager run
 #        SYSTEM\Setup\CmdLine before the logon UI appears. A dangling command there stalls the boot,
 #        and it is a common leftover from an earlier repair attempt, because that key is the hook
 #        password-reset and user-rights tools use.
-#     4. Winlogon Shell and Userinit. Both are comma separated lists of commands. An entry whose
+#     5. Winlogon Shell and Userinit. Both are comma separated lists of commands. An entry whose
 #        binary is missing produces 0xC000021A, because Winlogon treats the failure to start
 #        userinit.exe as a critical system process failure.
-#     5. ProfileList. A SID carrying a .bak twin, or the temporary-profile bit in State, is the
+#     6. ProfileList. A SID carrying a .bak twin, or the temporary-profile bit in State, is the
 #        "We can't sign in to your account" / "User Profile Service failed the logon" pattern.
 #
 #   Repair changes only what detection found. Dangling list entries are dropped individually, the
 #   surviving entries are preserved in order, and the Windows default is written back only when
 #   removing the broken entries would otherwise leave the value empty. A customised shell or an
 #   extra Userinit command whose binary is present is reported and deliberately left alone.
+#
+#   Every executable named by these values is checked for existence, non-zero length, SHA-256
+#   readability and signature state. Required Windows binaries must resolve to a trusted Microsoft
+#   image. Optional third-party commands are never deleted merely because they are unsigned; they
+#   are reported for operator review.
 #
 # .RESOLVES
 #   Stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI,
@@ -62,6 +71,10 @@
 #   win-fix-registry-corruption. This script needs SYSTEM and SOFTWARE to mount before it can read
 #   anything, so run that one first if either hive is damaged.
 #
+#   SubSystems\Windows is restored only from Select\LastKnownGood, and only when that control set is
+#   different from Current, carries a REG_EXPAND_SZ value, and its first executable is a non-zero,
+#   hash-readable Microsoft image. No default command line is invented.
+#
 #   ExcludeFromKnownDlls entries are reported and never removed. Legitimate application compatibility
 #   shims use them, so removing them blindly can break working software, but they are also a DLL
 #   preloading vector and worth an operator's attention.
@@ -75,6 +88,7 @@
 #   VM affected by one is still reachable online where it can be fixed without a disk swap.
 #
 # .VERSION
+#   v1.1: Validate every resolved executable and repair SubSystems\Windows from LastKnownGood.
 #   v1.0: Initial version.
 #
 #########################################################################################################
@@ -169,11 +183,17 @@ function Resolve-LogonCommand {
     )
 
     $result = [PSCustomObject]@{
-        Command  = $Command
-        Binary   = $null
-        Resolved = $null
-        Exists   = $false
-        Reason   = $null
+        Command         = $Command
+        Binary          = $null
+        Resolved        = $null
+        Present         = $false
+        Exists          = $false
+        Length          = [int64]0
+        SHA256          = ''
+        SignatureStatus = 'FileNotFound'
+        IsSigned        = $false
+        IsMicrosoft     = $false
+        Reason          = $null
     }
 
     $text = "$Command".Trim()
@@ -206,7 +226,17 @@ function Resolve-LogonCommand {
 
     $candidates = [System.Collections.Generic.List[string]]::new()
     if ($binary -match '[\\/]' -or $binary -match '^[A-Za-z]:' -or $binary -match '^%') {
-        [void]$candidates.Add((Resolve-OfflineImagePath -ImagePath $binary -WindowsDrive $WindowsDrive))
+        $imagePath = $binary
+        if ($imagePath -match '(?i)^%SystemRoot%(?:\\|$)') {
+            $imagePath = $WindowsPath + $imagePath.Substring(('%SystemRoot%').Length)
+        }
+        elseif ($imagePath -match '(?i)^\\SystemRoot(?:\\|$)') {
+            $imagePath = $WindowsPath + $imagePath.Substring(('\SystemRoot').Length)
+        }
+        elseif ($imagePath -match '(?i)^%windir%(?:\\|$)') {
+            $imagePath = $WindowsPath + $imagePath.Substring(('%windir%').Length)
+        }
+        [void]$candidates.Add((Resolve-OfflineImagePath -ImagePath $imagePath -WindowsDrive $WindowsDrive))
     }
     else {
         $names = if ([System.IO.Path]::GetExtension($binary)) { @($binary) } else { @("$binary.exe", "$binary.com") }
@@ -218,24 +248,114 @@ function Resolve-LogonCommand {
 
     foreach ($candidate in $candidates) {
         if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-        if (Test-OfflinePath $candidate) {
-            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
-            if ($null -ne $item -and -not $item.PSIsContainer -and $item.Length -gt 0) {
-                $result.Resolved = $candidate
-                $result.Exists = $true
-                return $result
-            }
-            if ($null -ne $item -and $item.Length -eq 0) {
-                $result.Resolved = $candidate
-                $result.Reason = "the binary is 0 bytes: $candidate"
-                return $result
-            }
+        $signature = Test-OfflineFileSignature -FilePath $candidate
+        if ($signature.Status -eq 'FileNotFound') { continue }
+
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+        $result.Resolved = $candidate
+        $result.Present = ($null -ne $item -and -not $item.PSIsContainer)
+        $result.Length = if ($result.Present) { [int64]$item.Length } else { [int64]0 }
+        $result.SignatureStatus = $signature.Status
+        $result.IsSigned = $signature.IsSigned
+        $result.IsMicrosoft = $signature.IsMicrosoft
+
+        if (-not $result.Present) {
+            $result.Reason = "the path is not a file: $candidate"
+            return $result
         }
+        if ($signature.Status -eq 'ZeroByte' -or $result.Length -eq 0) {
+            $result.Reason = "the binary is 0 bytes: $candidate"
+            return $result
+        }
+
+        try {
+            $result.SHA256 = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+        catch {
+            $result.Reason = "the binary exists but its SHA-256 could not be read: $candidate"
+        }
+
+        # Exists means the command can at least be started. Signature and hash trust are tracked
+        # separately so an unsigned third-party command is reported rather than silently removed.
+        $result.Exists = $true
+        return $result
     }
 
     $result.Resolved = $candidates[0]
     $result.Reason = "the binary was not found on the offline disk (looked for $($candidates -join ', '))"
     return $result
+}
+
+function Test-ResolutionIntegrity {
+    <#
+    .SYNOPSIS
+        Tests the evidence gathered for one resolved executable.
+
+    .DESCRIPTION
+        All commands need a non-zero file and a readable SHA-256. Required Windows executables also
+        have to be identified as Microsoft by Test-OfflineFileSignature. Optional third-party
+        commands need a valid signature to pass this check, but a failed check is report-only.
+    #>
+    param(
+        [Parameter(Mandatory = $false)]$Resolution,
+        [Parameter(Mandatory = $false)][switch]$RequireMicrosoft
+    )
+
+    if ($null -eq $Resolution -or -not $Resolution.Exists) { return $false }
+    if ($Resolution.Length -le 0 -or "$($Resolution.SHA256)" -notmatch '^[A-Fa-f0-9]{64}$') { return $false }
+    if ($Resolution.SignatureStatus -notin @('Valid', 'CatalogSigned')) { return $false }
+    if ($RequireMicrosoft) { return [bool]$Resolution.IsMicrosoft }
+    return [bool]$Resolution.IsSigned
+}
+
+function Get-WindowsSubsystemValueState {
+    <#
+    .SYNOPSIS
+        Reads SubSystems\Windows without expanding REG_EXPAND_SZ and validates its first executable.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ControlSet,
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
+    )
+
+    $subKeyPath = "BROKENSYSTEM\$ControlSet\Control\Session Manager\SubSystems"
+    $state = [PSCustomObject]@{
+        ControlSet = $ControlSet
+        KeyPath    = "HKLM:\$subKeyPath"
+        KeyPresent = $false
+        Present    = $false
+        ValueKind  = ''
+        Raw         = ''
+        Resolution  = $null
+    }
+
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath)
+    if ($null -eq $key) { return $state }
+
+    try {
+        $state.KeyPresent = $true
+        if ($key.GetValueNames() -notcontains 'Windows') { return $state }
+
+        $state.Present = $true
+        $state.ValueKind = $key.GetValueKind('Windows').ToString()
+        $raw = $key.GetValue(
+            'Windows',
+            $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($raw -is [string]) {
+            $state.Raw = [string]$raw
+            $state.Resolution = Resolve-LogonCommand `
+                -Command $state.Raw `
+                -WindowsPath $WindowsPath `
+                -WindowsDrive $WindowsDrive
+        }
+    }
+    finally {
+        $key.Close()
+    }
+
+    return $state
 }
 
 function Get-GuestSystemRoot {
@@ -294,6 +414,16 @@ function Get-WinlogonState {
                 Resolve-LogonCommand -Command $_ -WindowsPath $WindowsPath -WindowsDrive $WindowsDrive
             })
 
+        $requiredResolution = @($resolutions | Where-Object {
+                $_.Exists -and (Split-Path -Path $_.Resolved -Leaf) -ieq $spec.Required
+            } | Select-Object -First 1)
+
+        $default = if ($spec.Name -eq 'Userinit') { "$($state.GuestSystemRoot)\system32\userinit.exe" } else { 'explorer.exe' }
+        $defaultResolution = Resolve-LogonCommand `
+            -Command $default `
+            -WindowsPath $WindowsPath `
+            -WindowsDrive $WindowsDrive
+
         [void]$values.Add([PSCustomObject]@{
                 Name          = $spec.Name
                 Purpose       = $spec.Purpose
@@ -304,8 +434,17 @@ function Get-WinlogonState {
                 Resolutions   = $resolutions
                 Dangling      = @($resolutions | Where-Object { -not $_.Exists })
                 Good          = @($resolutions | Where-Object { $_.Exists })
-                HasRequired   = (@($resolutions | Where-Object { $_.Exists -and (Split-Path -Path $_.Resolved -Leaf) -ieq $spec.Required }).Count -gt 0)
-                Default       = if ($spec.Name -eq 'Userinit') { "$($state.GuestSystemRoot)\system32\userinit.exe" } else { 'explorer.exe' }
+                HasRequired   = ($requiredResolution.Count -gt 0)
+                RequiredResolution = if ($requiredResolution.Count -gt 0) { $requiredResolution[0] } else { $null }
+                RequiredIntegrityOk = if ($requiredResolution.Count -gt 0) {
+                    Test-ResolutionIntegrity -Resolution $requiredResolution[0] -RequireMicrosoft
+                }
+                else {
+                    $false
+                }
+                Default       = $default
+                DefaultResolution = $defaultResolution
+                DefaultIntegrityOk = Test-ResolutionIntegrity -Resolution $defaultResolution -RequireMicrosoft
             })
     }
 
@@ -325,14 +464,45 @@ function Get-SessionManagerState {
     )
 
     $keyPath = "$SystemRoot\Control\Session Manager"
+    $controlSet = Split-Path -Path $SystemRoot -Leaf
+    $select = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
+    $lastKnownGoodControlSet = if ($null -ne $select.LastKnownGood -and [int]$select.LastKnownGood -gt 0) {
+        'ControlSet{0:d3}' -f [int]$select.LastKnownGood
+    }
+    else {
+        ''
+    }
+
     $state = [PSCustomObject]@{
         KeyPath              = $keyPath
+        ControlSet           = $controlSet
         Available            = $false
         Reason               = $null
+        WindowsSubsystem     = Get-WindowsSubsystemValueState `
+            -ControlSet $controlSet `
+            -WindowsPath $WindowsPath `
+            -WindowsDrive $WindowsDrive
+        LastKnownGoodControlSet = $lastKnownGoodControlSet
+        LastKnownGoodIsDistinct = (
+            -not [string]::IsNullOrWhiteSpace($lastKnownGoodControlSet) -and
+            $lastKnownGoodControlSet -ne $controlSet)
+        LastKnownGoodWindowsSubsystem = $null
         BootExecute          = @()
         BootExecutePresent   = $false
+        DefaultBootExecuteResolution = Resolve-LogonCommand `
+            -Command 'autochk.exe' `
+            -WindowsPath $WindowsPath `
+            -WindowsDrive $WindowsDrive
         SetupExecute         = @()
         ExcludeFromKnownDlls = @()
+    }
+
+    if ($state.LastKnownGoodIsDistinct -and
+        (Test-Path "HKLM:\BROKENSYSTEM\$lastKnownGoodControlSet")) {
+        $state.LastKnownGoodWindowsSubsystem = Get-WindowsSubsystemValueState `
+            -ControlSet $lastKnownGoodControlSet `
+            -WindowsPath $WindowsPath `
+            -WindowsDrive $WindowsDrive
     }
 
     if (-not (Test-Path $keyPath)) {
@@ -505,12 +675,121 @@ function Get-AllFinding {
 
     # -- Session Manager, runs first at boot ------------------------------------------------------
     if ($SessionManager.Available) {
+        $subsystem = $SessionManager.WindowsSubsystem
+        $subsystemKindUsable = (
+            $subsystem.ValueKind -eq 'ExpandString' -or
+            (
+                $subsystem.ValueKind -eq 'String' -and
+                $subsystem.Raw -notmatch '%[^%]+%'
+            ))
+        $subsystemUsable = (
+            $subsystem.KeyPresent -and
+            $subsystem.Present -and
+            $subsystemKindUsable -and
+            (Test-ResolutionIntegrity -Resolution $subsystem.Resolution -RequireMicrosoft))
+
+        if (-not $subsystemUsable) {
+            $lastKnownGood = $SessionManager.LastKnownGoodWindowsSubsystem
+            $lastKnownGoodUsable = (
+                $SessionManager.LastKnownGoodIsDistinct -and
+                $null -ne $lastKnownGood -and
+                $lastKnownGood.KeyPresent -and
+                $lastKnownGood.Present -and
+                $lastKnownGood.ValueKind -eq 'ExpandString' -and
+                (Test-ResolutionIntegrity -Resolution $lastKnownGood.Resolution -RequireMicrosoft))
+
+            $activeReason = if (-not $subsystem.KeyPresent) {
+                "the key $($subsystem.KeyPath) is missing"
+            }
+            elseif (-not $subsystem.Present) {
+                'the Windows value is missing'
+            }
+            elseif ($subsystem.ValueKind -notin @('String', 'ExpandString')) {
+                "the Windows value has registry type $($subsystem.ValueKind), not a string type"
+            }
+            elseif ($subsystem.ValueKind -eq 'String' -and $subsystem.Raw -match '%[^%]+%') {
+                'the Windows value is REG_SZ but contains an environment-variable token that Session Manager will not expand'
+            }
+            elseif ($null -eq $subsystem.Resolution) {
+                'the Windows value does not contain a readable executable'
+            }
+            elseif (-not $subsystem.Resolution.Exists) {
+                $subsystem.Resolution.Reason
+            }
+            elseif ("$($subsystem.Resolution.SHA256)" -notmatch '^[A-Fa-f0-9]{64}$') {
+                "the executable could not be SHA-256 verified: $($subsystem.Resolution.Resolved)"
+            }
+            else {
+                "the executable is not a trusted Microsoft image (signature status $($subsystem.Resolution.SignatureStatus)): $($subsystem.Resolution.Resolved)"
+            }
+
+            $replacementDiffers = (
+                $lastKnownGoodUsable -and
+                (
+                    -not $subsystem.Present -or
+                    $subsystem.ValueKind -ne 'ExpandString' -or
+                    -not [string]::Equals(
+                        $subsystem.Raw,
+                        $lastKnownGood.Raw,
+                        [System.StringComparison]::Ordinal)
+                ))
+
+            if ($subsystem.KeyPresent -and $replacementDiffers) {
+                [void]$findings.Add((New-Finding -Cause 'WindowsSubsystemBroken' -Item 'SubSystems\Windows' -Hive 'SYSTEM' `
+                            -Message "Session Manager SubSystems\Windows cannot start the Windows subsystem because $activeReason. LastKnownGood $($lastKnownGood.ControlSet) carries a REG_EXPAND_SZ value whose first executable is a non-zero, hash-readable Microsoft image at $($lastKnownGood.Resolution.Resolved). Its exact value will be copied to the active control set." `
+                            -Data ([PSCustomObject]@{
+                                    Replacement = $lastKnownGood.Raw
+                                    SourceControlSet = $lastKnownGood.ControlSet
+                                })))
+            }
+            else {
+                $fallbackReason = if (-not $subsystem.KeyPresent) {
+                    "the active $($subsystem.KeyPath) key does not exist, so there is nowhere to write the value"
+                }
+                elseif (-not $SessionManager.LastKnownGoodIsDistinct) {
+                    'Select\LastKnownGood does not name a different control set'
+                }
+                elseif ($null -eq $lastKnownGood -or -not $lastKnownGood.KeyPresent) {
+                    "the LastKnownGood SubSystems key is unavailable in $($SessionManager.LastKnownGoodControlSet)"
+                }
+                elseif (-not $lastKnownGood.Present) {
+                    "LastKnownGood $($lastKnownGood.ControlSet) has no Windows value"
+                }
+                elseif ($lastKnownGood.ValueKind -ne 'ExpandString') {
+                    "LastKnownGood $($lastKnownGood.ControlSet) stores Windows as $($lastKnownGood.ValueKind), not REG_EXPAND_SZ"
+                }
+                elseif ($null -eq $lastKnownGood.Resolution -or -not $lastKnownGood.Resolution.Exists) {
+                    "the LastKnownGood executable is unavailable"
+                }
+                elseif (-not (Test-ResolutionIntegrity -Resolution $lastKnownGood.Resolution -RequireMicrosoft)) {
+                    "the LastKnownGood executable is not a hash-readable trusted Microsoft image"
+                }
+                else {
+                    'the LastKnownGood value is identical to the active value, so copying it would not repair the fault'
+                }
+
+                [void]$findings.Add((New-Finding -Cause 'WindowsSubsystemNoSafeFallback' -Item 'SubSystems\Windows' -Hive 'SYSTEM' -Repairable $false `
+                            -Message "Session Manager SubSystems\Windows cannot start the Windows subsystem because $activeReason. It was not changed because $fallbackReason. If the value is correct but its binary is damaged, repair the Windows files with win-sfc-sf-corruption." `
+                            -Data $subsystem))
+            }
+        }
+
         foreach ($valueName in @('BootExecute', 'SetupExecute')) {
             $entries = @($SessionManager.$valueName)
-            $dangling = @($entries | Where-Object { -not $_.Exists })
+            $dangling = if ($valueName -eq 'BootExecute') {
+                @($entries | Where-Object { -not $_.IsDefault -and -not $_.Exists })
+            }
+            else {
+                @($entries | Where-Object { -not $_.Exists })
+            }
             if ($dangling.Count -eq 0) { continue }
 
-            $keep = @($entries | Where-Object { $_.Exists } | ForEach-Object { $_.Entry })
+            $keep = if ($valueName -eq 'BootExecute') {
+                @($entries | Where-Object { $_.IsDefault -or $_.Exists } | ForEach-Object { $_.Entry })
+            }
+            else {
+                @($entries | Where-Object { $_.Exists } | ForEach-Object { $_.Entry })
+            }
             foreach ($bad in $dangling) {
                 [void]$findings.Add((New-Finding -Cause "${valueName}Dangling" -Item $bad.Entry -Hive 'SYSTEM' `
                             -Message "Session Manager $valueName runs '$($bad.Entry)' before Win32 starts, but $($bad.Resolution.Reason). Smss.exe waits on an image it cannot start, so the VM stops at a black screen with no error text. The entry will be removed and the remaining $($keep.Count) entry(s) kept." `
@@ -519,18 +798,53 @@ function Get-AllFinding {
         }
 
         $bootEntries = @($SessionManager.BootExecute)
-        $hasDefault = (@($bootEntries | Where-Object { $_.IsDefault -and $_.Exists }).Count -gt 0)
+        $defaultEntries = @($bootEntries | Where-Object { $_.IsDefault })
+        $hasDefault = ($defaultEntries.Count -gt 0)
+
+        foreach ($defaultEntry in $defaultEntries) {
+            if (Test-ResolutionIntegrity -Resolution $defaultEntry.Resolution -RequireMicrosoft) { continue }
+            $detail = if (-not $defaultEntry.Resolution.Exists) {
+                $defaultEntry.Resolution.Reason
+            }
+            elseif ("$($defaultEntry.Resolution.SHA256)" -notmatch '^[A-Fa-f0-9]{64}$') {
+                "its SHA-256 could not be read from $($defaultEntry.Resolution.Resolved)"
+            }
+            else {
+                "its image is not trusted as Microsoft (signature status $($defaultEntry.Resolution.SignatureStatus))"
+            }
+            [void]$findings.Add((New-Finding -Cause 'BootExecuteDefaultBinaryInvalid' -Item $defaultEntry.Entry -Hive 'SYSTEM' -Repairable $false `
+                        -Message "Session Manager BootExecute carries the Windows default '$($defaultEntry.Entry)', but $detail. Rewriting the registry entry would still point at the same damaged file; use win-sfc-sf-corruption." `
+                        -Data $defaultEntry))
+        }
+
+        foreach ($valueName in @('BootExecute', 'SetupExecute')) {
+            foreach ($entry in @($SessionManager.$valueName | Where-Object { $_.Exists })) {
+                if ($entry.IsDefault) { continue }
+                if (Test-ResolutionIntegrity -Resolution $entry.Resolution) { continue }
+                [void]$findings.Add((New-Finding -Cause 'SessionManagerCommandIntegrity' -Item "$valueName $($entry.Entry)" -Hive 'SYSTEM' -Repairable $false `
+                            -Message "Session Manager $valueName runs '$($entry.Entry)' from $($entry.Resolution.Resolved), but its integrity could not be established (signature $($entry.Resolution.SignatureStatus), SHA-256 '$($entry.Resolution.SHA256)'). It exists and was not removed because third-party boot commands can be legitimate." `
+                            -Data $entry))
+            }
+        }
 
         # When every BootExecute entry is dangling, removing them would leave the value empty, so the
         # dangling repair writes the default back itself. Raising a separate finding here as well
         # would describe one write as two, and the second would find nothing left to do.
-        $bootSurvives = (@($bootEntries | Where-Object { $_.Exists }).Count -gt 0)
-        $defaultRestoredByDanglingRepair = ((@($bootEntries | Where-Object { -not $_.Exists }).Count -gt 0) -and -not $bootSurvives)
+        $repairableBootDangling = @($bootEntries | Where-Object { -not $_.IsDefault -and -not $_.Exists })
+        $bootSurvives = (@($bootEntries | Where-Object { $_.IsDefault -or $_.Exists }).Count -gt 0)
+        $defaultRestoredByDanglingRepair = ($repairableBootDangling.Count -gt 0 -and -not $bootSurvives)
 
         if (-not $hasDefault -and $SessionManager.BootExecutePresent -and -not $defaultRestoredByDanglingRepair) {
-            [void]$findings.Add((New-Finding -Cause 'BootExecuteDefaultMissing' -Item 'BootExecute' -Hive 'SYSTEM' `
-                        -Message "Session Manager BootExecute does not run the Windows default '$($script:DefaultBootExecute)', so autochk never runs and a volume left dirty by the failure is mounted without being checked. The default will be restored alongside any entry that resolves." `
-                        -Data ([PSCustomObject]@{ ValueName = 'BootExecute'; Keep = @($bootEntries | Where-Object { $_.Exists } | ForEach-Object { $_.Entry }) })))
+            if (Test-ResolutionIntegrity -Resolution $SessionManager.DefaultBootExecuteResolution -RequireMicrosoft) {
+                [void]$findings.Add((New-Finding -Cause 'BootExecuteDefaultMissing' -Item 'BootExecute' -Hive 'SYSTEM' `
+                            -Message "Session Manager BootExecute does not run the Windows default '$($script:DefaultBootExecute)', so autochk never runs and a volume left dirty by the failure is mounted without being checked. The default will be restored; autochk.exe is a non-zero, hash-readable Microsoft image." `
+                            -Data ([PSCustomObject]@{ ValueName = 'BootExecute'; Keep = @($bootEntries | Where-Object { $_.Exists } | ForEach-Object { $_.Entry }) })))
+            }
+            else {
+                [void]$findings.Add((New-Finding -Cause 'BootExecuteDefaultUnavailable' -Item 'BootExecute' -Hive 'SYSTEM' -Repairable $false `
+                            -Message "Session Manager BootExecute does not run the Windows default '$($script:DefaultBootExecute)', but it was not restored because autochk.exe is missing, zero length, hash-unreadable or not a trusted Microsoft image. Repair the Windows files with win-sfc-sf-corruption first." `
+                            -Data $SessionManager.DefaultBootExecuteResolution))
+            }
         }
 
         foreach ($dll in @($SessionManager.ExcludeFromKnownDlls)) {
@@ -556,8 +870,14 @@ function Get-AllFinding {
                         -Data $SetupMode))
         }
         else {
+            $integrity = if (Test-ResolutionIntegrity -Resolution $SetupMode.Resolution) {
+                "signature $($SetupMode.Resolution.SignatureStatus), SHA-256 $($SetupMode.Resolution.SHA256)"
+            }
+            else {
+                "integrity not established: signature $($SetupMode.Resolution.SignatureStatus), SHA-256 '$($SetupMode.Resolution.SHA256)'"
+            }
             [void]$findings.Add((New-Finding -Cause 'SetupModeActive' -Item 'CmdLine' -Hive 'SYSTEM' -Repairable $false `
-                        -Message "SYSTEM\Setup\SetupType is $($SetupMode.SetupType) and CmdLine runs '$($SetupMode.CmdLine)' before the logon UI. The command exists on the disk, so this may be a servicing or provisioning step that is genuinely meant to run and it has been left alone. If the VM hangs before the logon screen, clear SetupType and CmdLine by hand." `
+                        -Message "SYSTEM\Setup\SetupType is $($SetupMode.SetupType) and CmdLine runs '$($SetupMode.CmdLine)' before the logon UI ($integrity). The command exists on the disk, so this may be a servicing or provisioning step that is genuinely meant to run and it has been left alone. If the VM hangs before the logon screen, clear SetupType and CmdLine by hand." `
                         -Data $SetupMode))
         }
     }
@@ -565,6 +885,34 @@ function Get-AllFinding {
     # -- Winlogon ---------------------------------------------------------------------------------
     if ($Winlogon.Available) {
         foreach ($value in @($Winlogon.Values)) {
+            if ($value.HasRequired -and -not $value.RequiredIntegrityOk) {
+                $required = $value.RequiredResolution
+                [void]$findings.Add((New-Finding -Cause 'WinlogonRequiredBinaryInvalid' -Item $value.Required -Hive 'SOFTWARE' -Repairable $false `
+                            -Message "Winlogon $($value.Name) names the required Windows binary $($required.Resolved), but it is not a hash-readable trusted Microsoft image (signature $($required.SignatureStatus), SHA-256 '$($required.SHA256)'). The value was left unchanged because rewriting it around an untrusted required image is unsafe; use win-sfc-sf-corruption." `
+                            -Data $required))
+                continue
+            }
+
+            if (-not $value.HasRequired -and -not $value.DefaultIntegrityOk) {
+                $required = $value.DefaultResolution
+                $detail = if ($null -eq $required) {
+                    'the default path could not be resolved'
+                }
+                elseif (-not $required.Exists) {
+                    $required.Reason
+                }
+                elseif ("$($required.SHA256)" -notmatch '^[A-Fa-f0-9]{64}$') {
+                    $required.Reason
+                }
+                else {
+                    "the image is not trusted as Microsoft (signature status $($required.SignatureStatus))"
+                }
+                [void]$findings.Add((New-Finding -Cause 'WinlogonRequiredBinaryUnavailable' -Item $value.Required -Hive 'SOFTWARE' -Repairable $false `
+                            -Message "Winlogon $($value.Name) does not have a usable $($value.Required), and its Windows default at $($required.Resolved) cannot be restored because $detail. The value was left unchanged because rewriting it would still leave logon without its required image; use win-sfc-sf-corruption." `
+                            -Data $required))
+                continue
+            }
+
             if (-not $value.Present -or $value.Resolutions.Count -eq 0) {
                 [void]$findings.Add((New-Finding -Cause 'WinlogonValueMissing' -Item $value.Name -Hive 'SOFTWARE' `
                             -Message "Winlogon has no usable $($value.Name) value, which $($value.Purpose). Winlogon treats that as a critical system process failure and bugchecks with 0xC000021A. It will be set to the Windows default '$($value.Default)'." `
@@ -591,11 +939,15 @@ function Get-AllFinding {
                             -Message "Winlogon $($value.Name) is set to '$($value.Raw)' and cannot complete a logon: $($reasons -join '; '). Winlogon treats this as a critical system process failure and bugchecks with 0xC000021A. $plan." `
                             -Data $value))
             }
-            elseif ($value.Good.Count -gt 1) {
-                $extra = @($value.Good | Where-Object { (Split-Path -Path $_.Resolved -Leaf) -ine $value.Required } | ForEach-Object { $_.Command })
+            else {
+                $extraResolutions = @($value.Good | Where-Object { (Split-Path -Path $_.Resolved -Leaf) -ine $value.Required })
+                $extra = @($extraResolutions | ForEach-Object { $_.Command })
                 if ($extra.Count -gt 0) {
+                    $details = @($extraResolutions | ForEach-Object {
+                            "'$($_.Command)' (signature $($_.SignatureStatus), SHA-256 '$($_.SHA256)')"
+                        })
                     [void]$findings.Add((New-Finding -Cause 'WinlogonExtraCommand' -Item $value.Name -Hive 'SOFTWARE' -Repairable $false `
-                                -Message "Winlogon $($value.Name) also runs $($extra -join ', ') at every logon. Each one exists on the disk so none was removed, but anything started from this value runs before the desktop appears and is worth confirming as expected." `
+                                -Message "Winlogon $($value.Name) also runs $($details -join ', ') at every logon. Each file exists and none was removed, but anything started from this value runs before the desktop appears and is worth confirming as expected." `
                                 -Data $value))
                 }
             }
@@ -643,6 +995,47 @@ function Repair-Finding {
     )
 
     switch -Regex ($Finding.Cause) {
+        '^WindowsSubsystemBroken$' {
+            $data = $Finding.Data
+            $controlSet = Split-Path -Path $SystemRoot -Leaf
+            $subKeyPath = "BROKENSYSTEM\$controlSet\Control\Session Manager\SubSystems"
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath, $true)
+            if ($null -eq $key) {
+                throw "The active SubSystems key is no longer available: HKLM:\$subKeyPath"
+            }
+
+            try {
+                $present = ($key.GetValueNames() -contains 'Windows')
+                $existing = if ($present) {
+                    [string]$key.GetValue(
+                        'Windows',
+                        $null,
+                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                }
+                else {
+                    ''
+                }
+                $kind = if ($present) { $key.GetValueKind('Windows') } else { $null }
+
+                if ($present -and
+                    $kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString -and
+                    [string]::Equals($existing, $data.Replacement, [System.StringComparison]::Ordinal)) {
+                    return $false
+                }
+
+                $key.SetValue(
+                    'Windows',
+                    [string]$data.Replacement,
+                    [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            }
+            finally {
+                $key.Close()
+            }
+
+            Add-OfflineRepairLog -Message "SubSystems\Windows: copied the exact REG_EXPAND_SZ value from $($data.SourceControlSet) to $controlSet."
+            return $true
+        }
+
         '^(BootExecute|SetupExecute)Dangling$' {
             $data = $Finding.Data
             $keyPath = "$SystemRoot\Control\Session Manager"
@@ -789,12 +1182,29 @@ try {
     Log-Info "Control set $($context.ControlSet): guest Windows directory $($context.Winlogon.GuestSystemRoot)." | Tee-Object -FilePath $logFile -Append
     foreach ($value in @($context.Winlogon.Values)) {
         Log-Info "Winlogon $($value.Name) = '$($value.Raw)' ($($value.Good.Count) of $($value.Resolutions.Count) entry(s) resolve to a file on the disk)." | Tee-Object -FilePath $logFile -Append
+        foreach ($resolution in @($value.Resolutions)) {
+            Log-Info "  $($resolution.Binary): path='$($resolution.Resolved)', bytes=$($resolution.Length), signature=$($resolution.SignatureStatus), sha256='$($resolution.SHA256)'." | Tee-Object -FilePath $logFile -Append
+        }
     }
     if ($context.SessionManager.Available) {
+        $subsystem = $context.SessionManager.WindowsSubsystem
+        Log-Info "SubSystems\Windows $($subsystem.ControlSet): type=$($subsystem.ValueKind), executable='$($subsystem.Resolution.Resolved)', bytes=$($subsystem.Resolution.Length), signature=$($subsystem.Resolution.SignatureStatus), sha256='$($subsystem.Resolution.SHA256)'." | Tee-Object -FilePath $logFile -Append
+        if ($context.SessionManager.LastKnownGoodIsDistinct -and
+            $null -ne $context.SessionManager.LastKnownGoodWindowsSubsystem) {
+            $lastKnownGood = $context.SessionManager.LastKnownGoodWindowsSubsystem
+            Log-Info "SubSystems\Windows $($lastKnownGood.ControlSet) (LastKnownGood): type=$($lastKnownGood.ValueKind), executable='$($lastKnownGood.Resolution.Resolved)', bytes=$($lastKnownGood.Resolution.Length), signature=$($lastKnownGood.Resolution.SignatureStatus), sha256='$($lastKnownGood.Resolution.SHA256)'." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Info "SubSystems\Windows: Select\LastKnownGood does not provide a distinct readable fallback control set." | Tee-Object -FilePath $logFile -Append
+        }
+
         Log-Info "Session Manager: $(@($context.SessionManager.BootExecute).Count) BootExecute entry(s), $(@($context.SessionManager.SetupExecute).Count) SetupExecute entry(s), $(@($context.SessionManager.ExcludeFromKnownDlls).Count) ExcludeFromKnownDlls entry(s)." | Tee-Object -FilePath $logFile -Append
         foreach ($entry in @($context.SessionManager.BootExecute)) {
             $who = if ($entry.IsDefault) { 'Windows default' } elseif ($entry.Vendor) { "from '$($entry.Vendor)'" } else { 'no version information' }
-            Log-Info "  BootExecute '$($entry.Entry)': $(if ($entry.Exists) { "resolves to $($entry.Resolution.Resolved), $who" } else { $entry.Resolution.Reason })" | Tee-Object -FilePath $logFile -Append
+            Log-Info "  BootExecute '$($entry.Entry)': $(if ($entry.Exists) { "resolves to $($entry.Resolution.Resolved), bytes=$($entry.Resolution.Length), signature=$($entry.Resolution.SignatureStatus), sha256='$($entry.Resolution.SHA256)', $who" } else { $entry.Resolution.Reason })" | Tee-Object -FilePath $logFile -Append
+        }
+        foreach ($entry in @($context.SessionManager.SetupExecute)) {
+            Log-Info "  SetupExecute '$($entry.Entry)': $(if ($entry.Exists) { "resolves to $($entry.Resolution.Resolved), bytes=$($entry.Resolution.Length), signature=$($entry.Resolution.SignatureStatus), sha256='$($entry.Resolution.SHA256)'" } else { $entry.Resolution.Reason })" | Tee-Object -FilePath $logFile -Append
         }
     }
     if ($context.SetupMode.SystemSetupInProgress -eq 1) {
@@ -823,7 +1233,7 @@ try {
     }
 
     if ($findings.Count -eq 0) {
-        Log-Output 'No logon subsystem fault was found. Every Session Manager, Winlogon and profile entry resolves to a file that is present on the disk, and the VM is not held in setup mode. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'No logon subsystem fault was found. The Windows subsystem and required logon binaries are non-zero, hash-readable Microsoft images; every optional command resolves, and the VM is not held in setup mode. No changes were made.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
