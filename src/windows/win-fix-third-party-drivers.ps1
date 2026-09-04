@@ -844,7 +844,7 @@ try {
                     Log-Output "  [WOULD RESTORE] $($entry.Service): Start -> $($entry.OriginalStart)" | Tee-Object -FilePath $logFile -Append
                 }
             }
-            Log-Output "Detect only: no changes were made." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detect only: $($entries.Count) entry(s) would be restored. No changes were made." | Tee-Object -FilePath $logFile -Append
             Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
             return $STATUS_SUCCESS
         }
@@ -939,7 +939,6 @@ try {
     }
 
     if ($isDetectOnly) {
-        Log-Output "Detect only: $($repairable.Count) driver(s) would be disabled, $($protected.Count) protected driver(s) would be left alone. No changes were made." | Tee-Object -FilePath $logFile -Append
         foreach ($finding in $repairable) {
             Log-Output "  [WOULD DISABLE] $($finding.Item): $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
@@ -949,6 +948,9 @@ try {
         if ($verifierPending) {
             Log-Output "  [WOULD CLEAR  ] Driver Verifier: $($context.Verifier.Summary)" | Tee-Object -FilePath $logFile -Append
         }
+        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+        # so a summary printed first is the first thing a long run loses.
+        Log-Output "Detect only: $($repairable.Count) driver(s) would be disabled, $($protected.Count) protected driver(s) would be left alone. No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }

@@ -1012,10 +1012,12 @@ try {
     }
 
     if ($isDetectOnly) {
-        Log-Output "Detect only: $totalFixable correctable entry/entries on $(@($scans | Where-Object { $_.State.Fixable -gt 0 }).Count) partition(s). No changes were made." | Tee-Object -FilePath $logFile -Append
         foreach ($scan in ($scans | Where-Object { $_.State.Fixable -gt 0 })) {
             Log-Output "  $($scan.Target.Label): $($scan.State.Fixable) entry/entries in $(@($scan.State.Records | Where-Object { @($_.Entries | Where-Object { $_.CanRepair }).Count -gt 0 } | ForEach-Object { "FRN $($_.Frn) $($_.Name)" }) -join ', ')" | Tee-Object -FilePath $logFile -Append
         }
+        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+        # so a summary printed first is the first thing a long run loses.
+        Log-Output "Detect only: $totalFixable correctable entry/entries on $(@($scans | Where-Object { $_.State.Fixable -gt 0 }).Count) partition(s). No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }

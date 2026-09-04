@@ -1978,10 +1978,12 @@ try {
             Log-Output 'Detect only: the system partition and its boot sectors are consistent with this disk. No changes were made.' | Tee-Object -FilePath $logFile -Append
         }
         else {
-            Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
             foreach ($finding in $findings) {
                 Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
             }
+            # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+            # so a summary printed first is the first thing a long run loses.
+            Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
         }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS

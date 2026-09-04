@@ -944,9 +944,15 @@ try {
         foreach ($entry in $proxyFix) {
             Log-Output "  Disable the machine proxy in $($entry.SubKey)." | Tee-Object -FilePath $logFile -Append
         }
-        if ($serviceFix.Count -eq 0 -and $interfaceFix.Count -eq 0 -and $providerFix.Count -eq 0 -and $dnsFix.Count -eq 0 -and -not $globalDnsFix -and $proxyFix.Count -eq 0) {
+        $plannedCount = @($serviceFix).Count + @($interfaceFix).Count + @($providerFix).Count + @($dnsFix).Count + $(if ($globalDnsFix) { 1 } else { 0 }) + @($proxyFix).Count
+
+        if ($plannedCount -eq 0) {
             Log-Output '  Nothing. Every finding above is reported only, and needs clearStaticDns=true or clearProxy=true to be acted on.' | Tee-Object -FilePath $logFile -Append
         }
+        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+        # so a summary printed first is the first thing a long run loses. Until this line existed a
+        # detect run named every fault and then never said how many, or how many it would act on.
+        Log-Output "Detect only: found $($faults.Count) networking fault(s), $plannedCount of which a repair run would act on. No changes were made." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }

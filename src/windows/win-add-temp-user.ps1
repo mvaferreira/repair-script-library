@@ -811,11 +811,13 @@ try {
         Log-Output "DETECT: ready to create '$username' through the Setup hook." | Tee-Object -FilePath $logFile -Append
     }
     else {
-        Log-Output "DETECT: $($findings.Count) finding(s)." | Tee-Object -FilePath $logFile -Append
         foreach ($finding in $findings) {
             $prefix = if ($finding.Repairable) { 'REPAIRABLE' } else { 'BLOCKING  ' }
             Log-Output "  [$prefix] $($finding.Cause): $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
+        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+        # so a summary printed first is the first thing a long run loses.
+        Log-Output "DETECT: $($findings.Count) finding(s)." | Tee-Object -FilePath $logFile -Append
     }
 
     if ($isDetectOnly) {
