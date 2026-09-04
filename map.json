@@ -70,6 +70,11 @@
 		"description" : "Enables nested hyperV using attached data disk as OS disk."
 	},
 	{
+		"id" : "win-fix-logon-subsystem",
+		"path" : "src/windows/win-fix-logon-subsystem.ps1",
+		"description" : "Repairs the offline logon path behind stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI, and \"The User Profile Service service failed the sign-in\". Checks Session Manager BootExecute and SetupExecute, the SYSTEM\\Setup setup-mode command, Winlogon Shell and Userinit, and the ProfileList entries, resolving every command against the binary it actually names on the attached disk. Removes only the entries whose binary is missing, keeps the ones that resolve, and writes a Windows default back only when removing the broken entries would leave the value empty. Backs up each hive before it is written. Pass detectOnly=true to report only. Clearing local Group Policy is a separate job, handled by win-reset-group-policy. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
 		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
