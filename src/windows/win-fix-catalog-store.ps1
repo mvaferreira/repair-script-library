@@ -99,6 +99,25 @@
 #
 #   On a healthy disk every check passes, no finding is produced, and this script writes nothing.
 #
+# .PARAMETER detectOnly
+#   'true' reports what is wrong and changes nothing at all. No catalog is copied and no backup is
+#   taken.
+#
+# .PARAMETER windowsDrive
+#   Skips discovery and uses this drive letter as the offline Windows volume.
+#
+# .PARAMETER donorPath
+#   Merges from this path instead of the disk's own <windows>\servicing\Packages. Leave it empty
+#   for the normal repair, which needs no donor because the servicing payload on the broken disk
+#   is the same build and UBR by construction. Supply it only when the lost catalog belongs to a
+#   third-party boot driver, which servicing\Packages cannot republish.
+#
+# .PARAMETER forceDonor
+#   'true' uses the chosen source even when it fails the coverage check - that is, even when it
+#   resolves too few of this machine's own reference binaries to be a build match. The check
+#   exists because a mismatched store indexes perfectly and resolves nothing, so overriding it
+#   can add files without making the machine bootable. It has no effect on a source that passes.
+#
 #   Reference: "Driver Signing" and "Kernel-Mode Code Signing requirements"
 #   https://learn.microsoft.com/windows-hardware/drivers/install/driver-signing
 #
