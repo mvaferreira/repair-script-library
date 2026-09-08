@@ -533,7 +533,21 @@ function Test-OfflineFileSignature {
         Status, Subject and VersionCompany.
 
     .EXAMPLE
-        (Test-OfflineFileSignature -FilePath 'D:\Windows\System32\drivers\storvsc.sys').IsMicrosoft
+        (Test-OfflineFileSignature -FilePath 'D:\Windows\System32\drivers\storvsc.sys').IsLikelyMicrosoft
+
+        IsLikelyMicrosoft, not IsMicrosoft. storvsc.sys is an inbox driver, so it is
+        catalog-signed rather than Authenticode-signed, and its catalog lives on the
+        offline image the rescue VM cannot consult. IsMicrosoft is therefore $false for a
+        perfectly healthy copy. Asking for IsMicrosoft here would classify every inbox
+        driver as untrusted, which is the more dangerous answer in this direction.
+
+    .EXAMPLE
+        $sig = Test-OfflineFileSignature -FilePath 'D:\Windows\System32\winload.efi'
+        if ($sig.Confidence -eq 'High' -and -not $sig.IsMicrosoft) { 'replace it' }
+
+        The safe shape for the opposite direction. Act on a file being bad only when
+        Authenticode gave a definitive answer, so an unreadable catalog cannot be mistaken
+        for evidence of tampering.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$FilePath
