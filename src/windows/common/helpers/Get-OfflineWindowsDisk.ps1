@@ -18,6 +18,8 @@
       Set-OfflineDisksOnline        Bring attached virtual data disks online and writable.
       Add-PartitionDriveLetter      Assign a free drive letter to a partition via diskpart.
       Get-FreeDriveLetter           Return the next unused drive letter.
+      Remove-OfflineDriveLetter     Release one drive letter this run assigned.
+      Clear-OfflineDriveLetter      Release every drive letter this run assigned (finally).
       Stop-NestedRepairVm           Stop a nested Hyper-V repair VM holding the disk.
 
     Get-OfflineWindowsDisk sets $script:OfflineWindowsDrive, which the offline registry
@@ -29,9 +31,33 @@
     These functions return values, so they buffer their messages with Add-OfflineRepairLog
     instead of calling Log-* directly. Call Write-OfflineRepairLog at script level to flush.
     The rescue VM's own system disk is always excluded from the search.
+    Once a volume is chosen, Set-OfflineRepairRoot binds it, so every other helper's
+    Assert-OfflineTarget gate can prove it is acting on the broken disk and not the rescue VM.
 
 .VERSION
     v1.0: Initial version.
+    v1.1: Fail closed when the rescue VM system disk cannot be resolved. Select attached
+          disks by BusType (so NVMe disks are seen) rather than by model name, and exclude
+          any boot/system disk and the 'Temporary Storage' resource disk. Validate the drive
+          letter passed to diskpart against command injection. Check the diskpart exit code
+          before reporting an online as successful. Poll for an assigned letter instead of a
+          fixed sleep, and track assigned letters so Remove-OfflineDriveLetter and
+          Clear-OfflineDriveLetter can release them. Add DiskNumber to the sort keys for a
+          deterministic selection, and bind the chosen volume as the offline repair root.
+    v1.2: Declare SupportsShouldProcess on the state-changing helpers (Set-OfflineDisksOnline,
+          Stop-NestedRepairVm, Remove-OfflineDriveLetter) and guard each mutation with
+          $PSCmdlet.ShouldProcess, so they honour -WhatIf. ConfirmImpact is left at the default
+          (Medium), below the default $ConfirmPreference (High), so non-interactive SYSTEM runs
+          are unchanged and never block on a prompt. Return the assigned-letter tracking list
+          with a unary comma so it is not unrolled to $null (empty) or a detached copy, which
+          otherwise made Register/Remove/Clear act on a throwaway rather than the shared list.
+    v1.3: Make Clear-OfflineDriveLetter safe to call from a finally block. It now releases each
+          letter in its own try/catch by delegating to Remove-OfflineDriveLetter (the single
+          guarded release path), so one letter that cannot be released no longer abandons the
+          rest, successfully-released letters are untracked individually instead of a blanket
+          Clear() that would also drop the failures, the letters still stuck are named in a
+          single Warning, and the function never throws. It declares SupportsShouldProcess so
+          -WhatIf flows into the delegated calls and its behaviour matches Remove-OfflineDriveLetter.
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
@@ -241,7 +267,15 @@ function Stop-NestedRepairVm {
         Only relevant when the repair VM was created with 'az vm repair create --enable-nested'.
         Returns the names of the VMs that were stopped. Silently does nothing when the
         Hyper-V role is not installed.
+
+        SupportsShouldProcess is declared so -WhatIf reports each VM it would turn off.
+        ConfirmImpact is left at the default (Medium), below the default $ConfirmPreference
+        (High), so the non-interactive SYSTEM run under az vm repair proceeds without a prompt.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([System.Object[]])]
+    param()
+
     $stopped = @()
 
     if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { return $stopped }
@@ -255,6 +289,7 @@ function Stop-NestedRepairVm {
     }
 
     foreach ($vm in $running) {
+        if (-not $PSCmdlet.ShouldProcess($vm.Name, 'Turn off nested Hyper-V VM so its disk can be mounted offline')) { continue }
         Add-OfflineRepairLog -Level Info -Message "Stopping nested Hyper-V VM '$($vm.Name)' so its disk can be mounted offline."
         Stop-VM -Name $vm.Name -TurnOff -Force -ErrorAction SilentlyContinue
         $stopped += $vm.Name
@@ -264,25 +299,70 @@ function Stop-NestedRepairVm {
     return $stopped
 }
 
+function Test-TemporaryStorageDisk {
+    <#
+    .SYNOPSIS
+        Reports whether a disk is the Azure temporary/resource disk.
+
+    .DESCRIPTION
+        The temporary/resource disk is local scratch space that is wiped on deallocation.
+        It sits on the same bus as the disks being repaired and carries no attribute the
+        bus-type filter would exclude, so without an explicit check it would be brought
+        online and made writable like a broken OS disk. Azure labels its volume
+        'Temporary Storage', which is the only reliable signal, so it is matched on that.
+
+    .OUTPUTS
+        $true when any volume on the disk is labelled 'Temporary Storage'.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Disk
+    )
+
+    try {
+        $labels = @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue |
+                Get-Volume -ErrorAction SilentlyContinue |
+                ForEach-Object { "$($_.FileSystemLabel)" })
+    }
+    catch {
+        return $false
+    }
+
+    return [bool]($labels -contains 'Temporary Storage')
+}
+
 function Set-OfflineDisksOnline {
     <#
     .SYNOPSIS
         Brings every attached virtual data disk online and clears the read-only flag.
 
     .DESCRIPTION
-        The rescue VM's own system disk is never touched. Returns the disk numbers
-        that were processed.
+        The rescue VM's own boot/system disk and the Azure temporary/resource disk are
+        never touched. Returns the disk numbers that were successfully brought online.
+
+        SupportsShouldProcess is declared so -WhatIf reports each disk it would online.
+        ConfirmImpact is left at the default (Medium), below the default $ConfirmPreference
+        (High), so the non-interactive run proceeds without a prompt.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory = $false)][int[]]$ExcludeDiskNumber = @()
     )
 
     $processed = @()
+    # Azure SCSI disks report 'Msft Virtual Disk' but NVMe disks report 'Microsoft NVMe
+    # Direct Disk', so a model-name match misses NVMe entirely; the bus type sees both. The
+    # boot/system disk and the wipe-on-deallocate resource disk are excluded so a failed
+    # precondition can never bring the rescue VM's live OS disk online.
     $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
-            $_.FriendlyName -like '*Virtual Disk*' -and $_.Number -notin $ExcludeDiskNumber
+            $_.BusType -in @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual') -and
+            $_.Number -notin $ExcludeDiskNumber -and
+            -not ($_.IsBoot -or $_.IsSystem) -and
+            -not (Test-TemporaryStorageDisk -Disk $_)
         })
 
     foreach ($disk in $disks) {
+        if (-not $PSCmdlet.ShouldProcess("disk $($disk.Number)", 'Bring online and clear the read-only flag')) { continue }
+
         # diskpart is used rather than Set-Disk because it succeeds on disks whose
         # partition table is damaged, which is common on the disks we are repairing.
         $script = @"
@@ -290,15 +370,23 @@ select disk $($disk.Number)
 attributes disk clear readonly noerr
 online disk noerr
 "@
-        $null = $script | diskpart.exe 2>&1
-        $processed += $disk.Number
+        $output = $script | diskpart.exe 2>&1
+        # diskpart exits non-zero when it could not process the script, which is the
+        # difference between a real online and a silent no-op, so a disk is counted only
+        # when the exit code confirms it. Its output is logged on failure, not discarded.
+        if ($LASTEXITCODE -eq 0) {
+            $processed += $disk.Number
+        }
+        else {
+            Add-OfflineRepairLog -Level Warning -Message "diskpart could not bring disk $($disk.Number) online (exit code $LASTEXITCODE): $(($output | Out-String).Trim())"
+        }
     }
 
     if ($processed.Count -gt 0) {
         Add-OfflineRepairLog -Level Info -Message "Brought attached virtual disk(s) online: $($processed -join ', ')"
     }
     else {
-        Add-OfflineRepairLog -Level Warning -Message 'No attached virtual data disk was found on the rescue VM.'
+        Add-OfflineRepairLog -Level Warning -Message 'No attached virtual data disk was brought online on the rescue VM.'
     }
 
     # Give the volume stack a moment to surface the new volumes.
@@ -319,17 +407,32 @@ function Add-PartitionDriveLetter {
         Get-Partition, because the partition object never reports a drive letter for
         hidden System and Recovery partitions even after one has been assigned.
 
+    .PARAMETER DriveLetter
+        Optional letter to assign, as 'D', 'D:' or 'D:\'. When omitted a free letter is
+        chosen. It is validated down to a single letter before use, because it is
+        interpolated into a diskpart script where an embedded newline would inject commands.
+
     .OUTPUTS
-        The assigned drive letter (without a colon), or $null on failure.
+        The assigned drive letter (without a colon), or $null on failure. A letter that was
+        successfully assigned is tracked, so Remove-OfflineDriveLetter or
+        Clear-OfflineDriveLetter can release it later.
     #>
     param(
         [Parameter(Mandatory = $true)][int]$DiskNumber,
         [Parameter(Mandatory = $true)][int]$PartitionNumber,
-        [Parameter(Mandatory = $false)][string]$DriveLetter
+        [Parameter(Mandatory = $false)][ValidatePattern('^[A-Za-z]:?\\?$')][string]$DriveLetter
     )
 
     if ([string]::IsNullOrWhiteSpace($DriveLetter)) { $DriveLetter = Get-FreeDriveLetter }
     $DriveLetter = $DriveLetter.TrimEnd(':', '\').ToUpperInvariant()
+
+    # ValidatePattern is skipped when the parameter is omitted, and TrimEnd only strips
+    # trailing characters, so this re-assertion is what actually guarantees a single letter
+    # reaches the here-string below. Without it an embedded newline would inject diskpart
+    # commands such as 'select disk 0' / 'clean' onto the wrong disk.
+    if ($DriveLetter -notmatch '^[A-Z]$') {
+        throw "Invalid drive letter '$DriveLetter'. Expected a single letter A-Z."
+    }
 
     $diskpartScript = @"
 select disk $DiskNumber
@@ -337,19 +440,23 @@ select partition $PartitionNumber
 assign letter=$DriveLetter
 exit
 "@
-    $null = $diskpartScript | diskpart.exe 2>&1
-    Start-Sleep -Milliseconds 500
+    $output = $diskpartScript | diskpart.exe 2>&1
+    $diskpartExit = $LASTEXITCODE
 
-    if (Test-OfflinePath "${DriveLetter}:\") {
+    if (Wait-OfflineDriveLetterReady -DriveLetter $DriveLetter) {
         Add-OfflineRepairLog -Level Info -Message "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber."
+        Register-OfflineAssignedDriveLetter -DriveLetter $DriveLetter -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
         return $DriveLetter
     }
+
+    Add-OfflineRepairLog -Level Info -Message "diskpart did not surface ${DriveLetter}: for disk $DiskNumber partition $PartitionNumber (exit code $diskpartExit). Trying an access path. diskpart output: $(($output | Out-String).Trim())"
 
     # Fallback for partitions diskpart refuses to address, such as the MSR partition.
     try {
         Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -AccessPath "${DriveLetter}:" -ErrorAction Stop
-        if (Test-OfflinePath "${DriveLetter}:\") {
+        if (Wait-OfflineDriveLetterReady -DriveLetter $DriveLetter) {
             Add-OfflineRepairLog -Level Info -Message "Assigned drive letter ${DriveLetter}: to disk $DiskNumber partition $PartitionNumber (access path)."
+            Register-OfflineAssignedDriveLetter -DriveLetter $DriveLetter -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
             return $DriveLetter
         }
     }
@@ -357,8 +464,204 @@ exit
         Add-OfflineRepairLog -Level Info -Message "Could not add an access path for disk $DiskNumber partition ${PartitionNumber}: $($_.Exception.Message)"
     }
 
+    # The assignment ultimately failed. diskpart may still have half-attached the letter, so
+    # release it rather than leak it and drop this partition out of every later run's alphabet.
+    Clear-PartitionDriveLetterAssignment -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -DriveLetter $DriveLetter
     Add-OfflineRepairLog -Level Warning -Message "Could not assign a drive letter to disk $DiskNumber partition $PartitionNumber."
     return $null
+}
+
+function Wait-OfflineDriveLetterReady {
+    <#
+    .SYNOPSIS
+        Waits for a freshly assigned drive letter to become reachable.
+
+    .DESCRIPTION
+        diskpart returns before the volume stack has finished surfacing the new root, and on
+        a slower storage stack a single fixed sleep races it: the probe runs too early, the
+        assignment is reported as failed, and the letter is leaked. Polling closes that race
+        and still returns as soon as the root responds.
+
+    .OUTPUTS
+        $true once the drive root responds, $false if it never does within the timeout.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$DriveLetter,
+        [Parameter(Mandatory = $false)][int]$TimeoutSeconds = 10
+    )
+
+    $letter = $DriveLetter.TrimEnd(':', '\')
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-OfflinePath "${letter}:\") { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return [bool](Test-OfflinePath "${letter}:\")
+}
+
+function Get-OfflineAssignedDriveLetterList {
+    <#
+    .SYNOPSIS
+        Returns the backing list of letters this session assigned, creating it on first use.
+
+    .DESCRIPTION
+        The list lives in the shared OfflineRepairCommon state, the same hashtable that holds
+        the log buffer and the bound roots, so a caller's finally-block cleanup sees exactly
+        what the discovery pass assigned. See that file's header for why the shared state is
+        global rather than script-scoped.
+    #>
+    $state = Get-OfflineRepairState
+    if (-not $state.ContainsKey('AssignedDriveLetters') -or -not $state['AssignedDriveLetters']) {
+        $state['AssignedDriveLetters'] = [System.Collections.Generic.List[object]]::new()
+    }
+    # The unary comma returns the live List as a single object. Without it PowerShell unrolls
+    # the collection on output, so an empty list comes back as $null and a populated one as a
+    # detached copy, and Register/Remove/Clear would then mutate a throwaway rather than the
+    # instance the shared state holds. Callers must assign the result before piping it.
+    return , $state['AssignedDriveLetters']
+}
+
+function Register-OfflineAssignedDriveLetter {
+    <#
+    .SYNOPSIS
+        Records a drive letter this session assigned, so it can be released later.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$DriveLetter,
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber
+    )
+
+    $letter = $DriveLetter.TrimEnd(':', '\').ToUpperInvariant()
+    $list = Get-OfflineAssignedDriveLetterList
+    if ($list | Where-Object { $_.Letter -eq $letter }) { return }
+    [void]$list.Add([PSCustomObject]@{ Letter = $letter; DiskNumber = $DiskNumber; PartitionNumber = $PartitionNumber })
+}
+
+function Get-OfflineAssignedDriveLetter {
+    <#
+    .SYNOPSIS
+        Returns the drive letters this session assigned, in the form 'K:'.
+    #>
+    # Assign first: Get-OfflineAssignedDriveLetterList returns the live List as a single
+    # object, so piping it straight from the call would hand ForEach-Object the whole list
+    # instead of its entries. Piping the assigned variable enumerates the entries.
+    $list = Get-OfflineAssignedDriveLetterList
+    return @($list | ForEach-Object { "$($_.Letter):" })
+}
+
+function Clear-PartitionDriveLetterAssignment {
+    <#
+    .SYNOPSIS
+        Releases a drive letter from a partition, by diskpart with an access-path fallback.
+
+    .DESCRIPTION
+        Internal. The letter is validated to a single letter before it reaches the diskpart
+        script, for the same injection reason as Add-PartitionDriveLetter. Best effort: a
+        letter that is already gone is not treated as an error.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber,
+        [Parameter(Mandatory = $true)][string]$DriveLetter
+    )
+
+    $letter = $DriveLetter.TrimEnd(':', '\').ToUpperInvariant()
+    if ($letter -notmatch '^[A-Z]$') { return }
+
+    $diskpartScript = @"
+select disk $DiskNumber
+select partition $PartitionNumber
+remove letter=$letter noerr
+exit
+"@
+    $null = $diskpartScript | diskpart.exe 2>&1
+
+    if (Test-OfflinePath "${letter}:\") {
+        try { Remove-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -AccessPath "${letter}:" -ErrorAction Stop }
+        catch { Add-OfflineRepairLog -Level Info -Message "Could not remove access path ${letter}: from disk $DiskNumber partition ${PartitionNumber}: $($_.Exception.Message)" }
+    }
+}
+
+function Remove-OfflineDriveLetter {
+    <#
+    .SYNOPSIS
+        Releases one drive letter this session assigned and stops tracking it.
+
+    .DESCRIPTION
+        SupportsShouldProcess is declared so -WhatIf reports the letter it would release.
+        ConfirmImpact is left at the default (Medium), below the default $ConfirmPreference
+        (High), so a caller's finally-block cleanup releases the letter without a prompt.
+
+    .PARAMETER DriveLetter
+        The letter to release, as 'K', 'K:' or 'K:\'.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z]:?\\?$')][string]$DriveLetter
+    )
+
+    $letter = $DriveLetter.TrimEnd(':', '\').ToUpperInvariant()
+    $list = Get-OfflineAssignedDriveLetterList
+    $tracked = @($list | Where-Object { $_.Letter -eq $letter })
+    foreach ($entry in $tracked) {
+        if (-not $PSCmdlet.ShouldProcess("drive letter $($entry.Letter): (disk $($entry.DiskNumber) partition $($entry.PartitionNumber))", 'Release drive letter')) { continue }
+        Clear-PartitionDriveLetterAssignment -DiskNumber $entry.DiskNumber -PartitionNumber $entry.PartitionNumber -DriveLetter $entry.Letter
+        Add-OfflineRepairLog -Level Info -Message "Released drive letter $($entry.Letter): from disk $($entry.DiskNumber) partition $($entry.PartitionNumber)."
+        [void]$list.Remove($entry)
+    }
+}
+
+function Clear-OfflineDriveLetter {
+    <#
+    .SYNOPSIS
+        Releases every drive letter this session assigned. For a caller's finally block.
+
+    .DESCRIPTION
+        The discovery pass assigns temporary letters to the EFI System and Recovery
+        partitions, and every run would otherwise leak them until the alphabet is exhausted.
+        A caller runs this in a finally so the letters are handed back even when the repair
+        in between throws.
+
+        Because it runs in a finally, it must never throw: a throw here would replace the
+        real repair exception and hide the actual failure from the operator. So every letter
+        is released in its own try/catch - one letter that cannot be released no longer
+        abandons the rest. Each letter that IS released is untracked individually (by the
+        delegated Remove-OfflineDriveLetter), so nothing blanket-clears the list while it
+        still holds failures and a later attempt does not retry a letter already handed back.
+        Anything still stuck is named in a single Warning rather than passed off as clean.
+
+        Every release is delegated to Remove-OfflineDriveLetter instead of calling
+        Clear-PartitionDriveLetterAssignment directly, so there is exactly one guarded release
+        path: Remove-OfflineDriveLetter owns the ShouldProcess gate, the diskpart call and the
+        untracking, and this function cannot drift from it. SupportsShouldProcess is declared
+        here only to expose -WhatIf/-Confirm and let the preference flow into those delegated
+        calls; this function performs no state change of its own, which is why it does not call
+        ShouldProcess itself. Under -WhatIf it therefore releases nothing and reports each
+        letter, exactly as Remove-OfflineDriveLetter does for a single letter.
+
+    .OUTPUTS
+        None. Letters that could not be released are surfaced with a Warning and left tracked
+        for a later attempt; nothing is written to the pipeline, so a bare call in a caller's
+        finally block does not pollute that caller's output.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    # Snapshot the letters first: Remove-OfflineDriveLetter mutates the shared tracking list as
+    # it releases each one, so iterating the live list would skip entries.
+    $failed = @()
+    foreach ($letter in @(Get-OfflineAssignedDriveLetter)) {
+        try {
+            Remove-OfflineDriveLetter -DriveLetter $letter
+        }
+        catch {
+            $failed += "$letter ($($_.Exception.Message))"
+        }
+    }
+    if ($failed.Count -gt 0) {
+        Add-OfflineRepairLog -Level Warning -Message "Drive-letter cleanup could not release: $($failed -join '; '). They remain tracked for a later attempt."
+    }
 }
 
 function Get-OfflineWindowsInstallCandidate {
@@ -436,7 +739,6 @@ function Get-OfflineWindowsInstallCandidate {
             }
         }
         finally {
-            $Error.Clear()
             [GC]::Collect()
             [GC]::WaitForPendingFinalizers()
             for ($i = $loadedKeys.Count - 1; $i -ge 0; $i--) {
@@ -482,8 +784,11 @@ function Get-OfflineWindowsDisk {
         Skip discovery and use this drive letter as the offline Windows volume.
 
     .OUTPUTS
-        PSCustomObject with DiskNumber, Generation, WindowsDrive, WindowsPath,
-        BootDrive, BcdStorePath, ProductName, GuestComputerName and Candidates.
+        PSCustomObject with DiskNumber, PartitionStyle, Generation, WindowsDrive,
+        WindowsPath, PartitionNumber, BootDrive, BcdStorePath, ProductName, BuildNumber,
+        GuestComputerName, SetupInProgress, PartitionRoots, AssignedDriveLetters and
+        Candidates. AssignedDriveLetters holds the letters this run assigned; pass each to
+        Remove-OfflineDriveLetter, or call Clear-OfflineDriveLetter, in the caller's finally.
 
     .EXAMPLE
         $offline = Get-OfflineWindowsDisk
@@ -494,19 +799,29 @@ function Get-OfflineWindowsDisk {
         [Parameter(Mandatory = $false)][string]$WindowsDrive
     )
 
-    $systemDiskNumber = -1
+    # The rescue VM's own OS disk must be known before anything is brought online, because
+    # every exclusion below keys off it. A real disk number is >= 0, so leaving this at a
+    # sentinel would make the exclusion match nothing and expose the live OS disk. Fail
+    # closed rather than warn and carry on.
     try {
         $systemDiskNumber = (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':')) -ErrorAction Stop).DiskNumber
     }
     catch {
-        Add-OfflineRepairLog -Level Warning -Message "Could not determine the rescue VM system disk number: $($_.Exception.Message)"
+        throw "Could not determine the rescue VM's own system disk number, so the broken disk cannot be told apart from it: $($_.Exception.Message)"
     }
 
     $null = Stop-NestedRepairVm
     $null = Set-OfflineDisksOnline -ExcludeDiskNumber @($systemDiskNumber | Where-Object { $_ -ge 0 })
 
+    # Select by bus type, not model name: Azure NVMe disks report 'Microsoft NVMe Direct
+    # Disk', which the old '*Virtual Disk*' match missed. The rescue VM's own system disk,
+    # any boot/system disk, and the 'Temporary Storage' resource disk are all excluded so a
+    # broken precondition can never route the repair onto the live OS.
     $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
-            $_.FriendlyName -like '*Virtual Disk*' -and $_.Number -ne $systemDiskNumber -and
+            $_.BusType -in @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual') -and
+            $_.Number -ne $systemDiskNumber -and
+            -not ($_.IsBoot -or $_.IsSystem) -and
+            -not (Test-TemporaryStorageDisk -Disk $_) -and
             ($DiskNumber -lt 0 -or $_.Number -eq $DiskNumber)
         })
 
@@ -578,8 +893,10 @@ function Get-OfflineWindowsDisk {
         throw 'No offline Windows installation was found on the attached disk(s).'
     }
 
+    # DiskNumber is the final key so that two installations with an equal score and build
+    # settle on the same disk every run instead of ordering nondeterministically.
     $sorted = @($candidates | Sort-Object @{ Expression = 'Score'; Descending = $true },
-        @{ Expression = { [int]($_.CurrentBuildNumber -as [int]) }; Descending = $true }, PartitionNumber)
+        @{ Expression = { [int]($_.CurrentBuildNumber -as [int]) }; Descending = $true }, PartitionNumber, DiskNumber)
     $selected = $sorted[0]
     foreach ($candidate in $sorted) { $candidate.Selected = ($candidate.Drive -eq $selected.Drive) }
 
@@ -628,23 +945,38 @@ function Get-OfflineWindowsDisk {
         Add-OfflineRepairLog -Level Warning -Message 'No boot partition was found on the attached disk. Boot configuration repairs will not be available.'
     }
 
+    # Bind the chosen volume as the offline repair root. This is what lets every other
+    # helper's Assert-OfflineTarget gate prove it is writing to the broken disk and not to
+    # the rescue VM. Set-OfflineRepairRoot throws if this somehow resolved to the rescue
+    # VM's own system drive, which is the fail-closed behaviour we want. The boot/EFI
+    # partition is a separate volume on the same disk that BCD repairs write to, so it is
+    # bound too or the gate would refuse them.
+    $null = Set-OfflineRepairRoot -Path $selected.Drive
+    if ($bootDrive) {
+        $bootRoot = "$bootDrive".TrimEnd('\')
+        if ($bootRoot -match '^[A-Za-z]:$' -and $bootRoot -ne $selected.Drive) {
+            $null = Set-OfflineRepairRoot -Path $bootRoot
+        }
+    }
+
     $script:OfflineWindowsDrive = $selected.Drive
 
     $result = [PSCustomObject]@{
-        DiskNumber        = $selected.DiskNumber
-        PartitionStyle    = "$($selectedDisk.PartitionStyle)"
-        Generation        = $generation
-        WindowsDrive      = $selected.Drive
-        WindowsPath       = $selected.WindowsRoot
-        PartitionNumber   = $selected.PartitionNumber
-        BootDrive         = $bootDrive
-        BcdStorePath      = $bcdStorePath
-        ProductName       = $selected.ProductName
-        BuildNumber       = $selected.CurrentBuildNumber
-        GuestComputerName = $selected.GuestComputerName
-        SetupInProgress   = $selected.SetupInProgress
-        PartitionRoots    = $partitionRoots
-        Candidates        = $sorted
+        DiskNumber           = $selected.DiskNumber
+        PartitionStyle       = "$($selectedDisk.PartitionStyle)"
+        Generation           = $generation
+        WindowsDrive         = $selected.Drive
+        WindowsPath          = $selected.WindowsRoot
+        PartitionNumber      = $selected.PartitionNumber
+        BootDrive            = $bootDrive
+        BcdStorePath         = $bcdStorePath
+        ProductName          = $selected.ProductName
+        BuildNumber          = $selected.CurrentBuildNumber
+        GuestComputerName    = $selected.GuestComputerName
+        SetupInProgress      = $selected.SetupInProgress
+        PartitionRoots       = $partitionRoots
+        AssignedDriveLetters = Get-OfflineAssignedDriveLetter
+        Candidates           = $sorted
     }
 
     Add-OfflineRepairLog -Level Info -Message "Offline Windows: $($result.WindowsPath) (disk $($result.DiskNumber), Gen$($result.Generation), $($result.ProductName) build $($result.BuildNumber))"
