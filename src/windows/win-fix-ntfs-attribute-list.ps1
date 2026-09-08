@@ -962,7 +962,13 @@ try {
                 Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction Stop
                 Log-Info "Brought disk $($disk.Number) online for the raw scan." | Tee-Object -FilePath $logFile -Append
             }
-            catch { }
+            catch {
+                # Not fatal - another disk may still carry the volume, so the loop continues. But it
+                # must not be silent: a disk that stayed offline is the most likely reason the scan
+                # below finds no NTFS partition, and without this the run reports "nothing to scan"
+                # as a success while never having looked at the disk that mattered.
+                Log-Warning "Could not bring disk $($disk.Number) online for the raw scan: $($_.Exception.Message). Any NTFS partition on that disk will not be scanned." | Tee-Object -FilePath $logFile -Append
+            }
         }
     }
 

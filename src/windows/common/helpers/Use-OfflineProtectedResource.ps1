@@ -1068,8 +1068,20 @@ function Save-OfflinePathSecurity {
         [switch]$IsDirectory
     )
 
-    if ($IsDirectory) { [System.IO.Directory]::SetAccessControl($Path, $Security) }
-    else { [System.IO.File]::SetAccessControl($Path, $Security) }
+    if ($IsDirectory) {
+        if ([System.IO.Directory].GetMethod('SetAccessControl', [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))) {
+            [System.IO.Directory]::SetAccessControl($Path, $Security)
+            return
+        }
+        [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.DirectoryInfo]::new($Path), $Security)
+        return
+    }
+
+    if ([System.IO.File].GetMethod('SetAccessControl', [type[]]@([string], [System.Security.AccessControl.FileSecurity]))) {
+        [System.IO.File]::SetAccessControl($Path, $Security)
+        return
+    }
+    [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.FileInfo]::new($Path), $Security)
 }
 
 function Grant-OfflinePathAccess {

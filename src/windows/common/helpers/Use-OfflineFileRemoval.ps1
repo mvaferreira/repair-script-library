@@ -702,16 +702,24 @@ function Test-OfflineRemovalResult {
         return [PSCustomObject]@{ Passed = $false; Inconclusive = $false; Check = @($checks); Failure = @($failures) }
     }
 
-    # 2. It is the same folder, not a replacement.
-    $sameFolder = ($null -eq $before.CreatedUtc) -or ($null -eq $after.CreatedUtc) -or ($before.CreatedUtc -eq $after.CreatedUtc)
-    Add-Check -Name 'Folder not recreated' -Passed $sameFolder -Detail $(
-        if ($sameFolder) { 'the creation timestamp is unchanged' }
+    # 2. It is the same folder, not a replacement. A timestamp that could not be read on either
+    #    side is INCONCLUSIVE, not PASS. "I could not read it" is the absence of evidence, and
+    #    recording absence of evidence as a passed check is what makes a verification step mean
+    #    nothing. Post-check 6 already draws this distinction; checks 2 and 3 now match it.
+    $folderComparable = ($null -ne $before.CreatedUtc) -and ($null -ne $after.CreatedUtc)
+    $sameFolder = (-not $folderComparable) -or ($before.CreatedUtc -eq $after.CreatedUtc)
+    $folderStatus = if ($folderComparable) { $null } else { 'INCONCLUSIVE' }
+    Add-Check -Name 'Folder not recreated' -Passed $sameFolder -Status $folderStatus -Detail $(
+        if (-not $folderComparable) { 'the creation timestamp could not be read, so whether the folder was replaced could not be proven' }
+        elseif ($sameFolder) { 'the creation timestamp is unchanged' }
         else { "the creation timestamp changed from $($before.CreatedUtc) to $($after.CreatedUtc)" })
 
-    # 3. The ACL is unchanged.
-    $sameAcl = ($null -eq $before.Sddl) -or ($null -eq $after.Sddl) -or ($before.Sddl -eq $after.Sddl)
-    Add-Check -Name 'Folder ACL unchanged' -Passed $sameAcl -Detail $(
-        if ($null -eq $before.Sddl -or $null -eq $after.Sddl) { 'the ACL could not be read, so there is nothing to compare' }
+    # 3. The ACL is unchanged. Same rule as check 2: unreadable is unproven, not passed.
+    $aclComparable = ($null -ne $before.Sddl) -and ($null -ne $after.Sddl)
+    $sameAcl = (-not $aclComparable) -or ($before.Sddl -eq $after.Sddl)
+    $aclStatus = if ($aclComparable) { $null } else { 'INCONCLUSIVE' }
+    Add-Check -Name 'Folder ACL unchanged' -Passed $sameAcl -Status $aclStatus -Detail $(
+        if (-not $aclComparable) { 'the ACL could not be read, so whether it changed could not be proven' }
         elseif ($sameAcl) { 'the ACL is unchanged' }
         else { 'the ACL changed' })
 
@@ -1001,10 +1009,14 @@ function Invoke-OfflineRemovalPlan {
     }
 
     $result.Success = $true
-    # Verdict last. An inconclusive hive check is a success with a caveat and must not read as a
-    # clean, fully proven one.
+    # Verdict last. An inconclusive check is a success with a caveat and must not read as a clean,
+    # fully proven one. The caveat names the checks that were actually unproven rather than
+    # assuming it was the hive check: checks 2 and 3 can also land here, and a hardcoded
+    # explanation would confidently report the wrong reason.
     if ($verification.Inconclusive) {
-        Add-OfflineRepairLog -Level Warning -Message "Removal of '$($Plan.Label)' succeeded, but registry-hive verification was INCONCLUSIVE: no hive in the folder was loadable beforehand, so the hives could not be proven intact."
+        $unproven = @($verification.Check | Where-Object { $_.Status -eq 'INCONCLUSIVE' })
+        $unprovenDetail = ($unproven | ForEach-Object { "$($_.Name) - $($_.Detail)" }) -join '; '
+        Add-OfflineRepairLog -Level Warning -Message "Removal of '$($Plan.Label)' succeeded, but $($unproven.Count) check(s) could not be proven: $unprovenDetail"
     }
     else {
         Add-OfflineRepairLog -Message "Removal of '$($Plan.Label)' succeeded and every check passed."
