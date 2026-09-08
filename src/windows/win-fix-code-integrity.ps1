@@ -427,7 +427,7 @@ function Get-BcdSigningState {
     $loaderId = Get-BcdPreferredOsGuid -StorePath $StorePath
     if (-not $loaderId) { return $state }
 
-    $details = Get-BcdLoaderDetails -StorePath $StorePath -Identifier $loaderId
+    $details = Get-BcdLoaderDetail -StorePath $StorePath -Identifier $loaderId
     if (-not $details) { return $state }
 
     $state.Available = $true

@@ -15,7 +15,7 @@
       Assert-OfflineBcdStorePath Throw unless a store path is an offline store, not the rescue VM's.
       Invoke-BcdEnum            Run a read-only bcdedit enumeration and report its exit code.
       Get-BcdInventory          Parse the whole store into a structured object.
-      Get-BcdLoaderDetails      Parse a single loader entry.
+      Get-BcdLoaderDetail      Parse a single loader entry.
       Get-BcdBootLoaderId       Resolve the identifier of the real (non-setup) OS loader.
       Get-BcdPreferredOsGuid    Resolve the preferred OS loader GUID.
       Backup-BcdStore           Copy the store before it is modified.
@@ -192,7 +192,7 @@ function Test-BcdStorePath {
     return $null -ne (Get-BcdStoreItem -StorePath $StorePath)
 }
 
-function Get-BcdTextSections {
+function Get-BcdTextSection {
     <#
     .SYNOPSIS
         Splits bcdedit output into Title/Body sections using its underline separators.
@@ -325,7 +325,7 @@ function Get-BcdInventory {
     }
 
     $loaders = [System.Collections.Generic.List[PSCustomObject]]::new()
-    foreach ($section in (Get-BcdTextSections -Text $inventory.RawText)) {
+    foreach ($section in (Get-BcdTextSection -Text $inventory.RawText)) {
         $title = $section.Title
         $body = $section.Body
 
@@ -344,7 +344,7 @@ function Get-BcdInventory {
     return [PSCustomObject]$inventory
 }
 
-function Get-BcdLoaderDetails {
+function Get-BcdLoaderDetail {
     <#
     .SYNOPSIS
         Returns the parsed details of a single BCD loader entry.

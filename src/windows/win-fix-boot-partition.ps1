@@ -1228,7 +1228,7 @@ function Get-RecordedEspIdentity {
 
     try {
         Invoke-WithHive 'SYSTEM' {
-            foreach ($controlSet in @(Get-OfflineControlSetNames)) {
+            foreach ($controlSet in @(Get-OfflineReferencedControlSetName)) {
                 foreach ($bus in $script:PartitionTableCacheBuses) {
                     $busPath = "HKLM:\BROKENSYSTEM\$controlSet\Enum\$bus"
                     if (-not (Test-Path $busPath)) { continue }

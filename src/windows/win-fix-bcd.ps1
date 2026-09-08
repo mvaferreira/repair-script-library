@@ -400,7 +400,7 @@ function Get-BcdEntryFinding {
 
     # The {bootmgr} entry's own device and path. A store that points its boot manager at a partition
     # that no longer resolves fails before any OS entry is read.
-    $bootMgrSection = @(Get-BcdTextSections -Text $Inventory.RawText | Where-Object {
+    $bootMgrSection = @(Get-BcdTextSection -Text $Inventory.RawText | Where-Object {
             $_.Title -match '^Windows Boot Manager$' -or $_.Body -match '(?im)^\s*identifier\s+\{bootmgr\}\s*$'
         } | Select-Object -First 1)
     if ($bootMgrSection.Count -gt 0) {
@@ -603,7 +603,7 @@ function Invoke-TargetedBcdRepair {
         $inventory = Get-BcdInventory -StorePath $StorePath
         foreach ($imcFinding in $imcFindings) {
             $cleared = 0
-            foreach ($section in (Get-BcdTextSections -Text $inventory.RawText)) {
+            foreach ($section in (Get-BcdTextSection -Text $inventory.RawText)) {
                 if ($section.Body -notmatch "(?im)^\s*$($imcFinding.Data)\s+\S") { continue }
                 if ($section.Body -notmatch '(?im)^\s*identifier\s+(\S+)') { continue }
                 $target = $Matches[1]

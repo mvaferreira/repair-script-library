@@ -22,7 +22,7 @@
       Invoke-WithHive                   Mount hive(s), run a script block, always unmount.
       Get-OfflineSystemRootPath         Active ControlSet path inside the mounted SYSTEM hive.
       Get-OfflineControlSetName         Active ControlSet name (e.g. ControlSet001).
-      Get-OfflineControlSetNames        All referenced ControlSet names (Current/Default/LKG).
+      Get-OfflineReferencedControlSetName        All referenced ControlSet names (Current/Default/LKG).
       Backup-OfflineHiveFile            Copy a hive file before it is modified.
       Resolve-OfflineImagePath          Translate a guest ImagePath into a rescue-VM path.
 
@@ -566,7 +566,7 @@ function Get-OfflineControlSetName {
     return (Split-Path -Path (Get-OfflineSystemRootPath) -Leaf)
 }
 
-function Get-OfflineControlSetNames {
+function Get-OfflineReferencedControlSetName {
     <#
     .SYNOPSIS
         Returns every ControlSet referenced by Select (Current, Default, LastKnownGood).

@@ -67,6 +67,11 @@ function Get-OfflineRepairState {
         One hashtable in $global: holds the log buffer, the bound offline roots and the
         registered hive mount keys. See the file header for why this is not $script:.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+        Justification = 'Deliberate, and confined to this one function. These helpers are dot-sourced, and a $script: variable binds to the scope that did the dot-sourcing: a helper sourced from inside a function would get its own private copy of the root list, so Assert-OfflineTarget would check a set the caller never populated and the gate would fail open. Each az vm repair run is a fresh process, so there is nothing to leak into; Clear-OfflineRepairRoot resets it for tests.')]
+    [CmdletBinding()]
+    param()
+
     if (-not $global:OfflineRepairState) {
         $global:OfflineRepairState = @{
             LogBuffer = [System.Collections.Generic.List[object]]::new()
@@ -265,6 +270,8 @@ function Set-OfflineRepairRoot {
     .EXAMPLE
         Set-OfflineRepairRoot -Path 'D:'
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'This changes in-process state only - it records which volume the helpers are allowed to touch - and never changes the system. Supporting -WhatIf would be actively harmful: skipping the bind would leave no root registered, so every subsequent Assert-OfflineTarget would throw and the run would fail for a reason unrelated to what the operator asked about.')]
     param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
 
     $normalised = ConvertTo-OfflineComparablePath $Path
