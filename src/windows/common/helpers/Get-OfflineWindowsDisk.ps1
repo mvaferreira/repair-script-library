@@ -707,6 +707,7 @@ function Get-OfflineWindowsInstallCandidate {
         CurrentBuildNumber  = ''
         GuestComputerName   = ''
         SetupInProgress     = $false
+        ProbeStatus         = 'NotProbed'
         Score               = 0
         Selected            = $false
     }
@@ -719,18 +720,33 @@ function Get-OfflineWindowsInstallCandidate {
         $systemKey = "${tempBase}_SYSTEM"
         $loadedKeys = [System.Collections.Generic.List[string]]::new()
 
+        # The probe is best-effort by design: a SOFTWARE hive that cannot be read is a
+        # fault this library exists to repair, so failing to read it must not abort
+        # discovery. But it must not be silent either - an unreadable hive costs this
+        # candidate up to 40 of its score, which is enough to change which installation
+        # is selected on a disk carrying more than one. Every failure below is recorded
+        # on the candidate and surfaced as a Warning.
+        $probeNotes = [System.Collections.Generic.List[string]]::new()
+
         try {
-            $null = reg.exe load "HKLM\$softwareKey" "$softwareHivePath" 2>&1 | Out-String
+            $regOut = (reg.exe load "HKLM\$softwareKey" "$softwareHivePath" 2>&1 | Out-String).Trim()
             if ($LASTEXITCODE -eq 0) {
                 [void]$loadedKeys.Add($softwareKey)
-                $cv = Get-ItemProperty "HKLM:\$softwareKey\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+                $cvError = $null
+                $cv = Get-ItemProperty "HKLM:\$softwareKey\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue -ErrorVariable cvError
                 if ($cv) {
                     $candidate.ProductName = [string]$cv.ProductName
                     $candidate.CurrentBuildNumber = [string]$cv.CurrentBuildNumber
                 }
+                else {
+                    [void]$probeNotes.Add("SOFTWARE\Microsoft\Windows NT\CurrentVersion could not be read: $(if ($cvError) { $cvError[0].Exception.Message } else { 'key not present' })")
+                }
+            }
+            else {
+                [void]$probeNotes.Add("reg load of $softwareHivePath failed (exit $LASTEXITCODE): $regOut")
             }
 
-            $null = reg.exe load "HKLM\$systemKey" "$systemHivePath" 2>&1 | Out-String
+            $regOut = (reg.exe load "HKLM\$systemKey" "$systemHivePath" 2>&1 | Out-String).Trim()
             if ($LASTEXITCODE -eq 0) {
                 [void]$loadedKeys.Add($systemKey)
                 $currentSet = (Get-ItemProperty "HKLM:\$systemKey\Select" -ErrorAction SilentlyContinue).Current
@@ -742,14 +758,34 @@ function Get-OfflineWindowsInstallCandidate {
                     $candidate.SetupInProgress = $true
                 }
             }
+            else {
+                [void]$probeNotes.Add("reg load of $systemHivePath failed (exit $LASTEXITCODE): $regOut")
+            }
         }
         finally {
             [GC]::Collect()
             [GC]::WaitForPendingFinalizers()
             for ($i = $loadedKeys.Count - 1; $i -ge 0; $i--) {
-                $null = reg.exe unload "HKLM\$($loadedKeys[$i])" 2>&1
+                # A probe hive that will not unload keeps the offline hive file open for the
+                # rest of the run, which is worse than the missing score: the repair that
+                # follows cannot mount it. Never pass that off as clean.
+                $unloadOut = (reg.exe unload "HKLM\$($loadedKeys[$i])" 2>&1 | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0) {
+                    [void]$probeNotes.Add("reg unload of HKLM\$($loadedKeys[$i]) failed (exit $LASTEXITCODE): $unloadOut. The offline hive file may stay locked for this run.")
+                }
             }
         }
+
+        if ($probeNotes.Count -eq 0) {
+            $candidate.ProbeStatus = 'OK'
+        }
+        else {
+            $candidate.ProbeStatus = $probeNotes -join '; '
+            Add-OfflineRepairLog -Level Warning -Message "Offline hive probe of $normalizedPath degraded, so this installation is scored without its product name and build number: $($candidate.ProbeStatus)"
+        }
+    }
+    else {
+        $candidate.ProbeStatus = "Skipped: SYSTEM hive present = $($candidate.SystemHivePresent), SOFTWARE hive present = $($candidate.SoftwareHivePresent)"
     }
 
     if (Test-OfflinePath (Join-OfflinePath -Root $normalizedPath -ChildPath '$WINDOWS.~BT')) { $candidate.SetupInProgress = $true }
@@ -979,6 +1015,7 @@ function Get-OfflineWindowsDisk {
         BuildNumber          = $selected.CurrentBuildNumber
         GuestComputerName    = $selected.GuestComputerName
         SetupInProgress      = $selected.SetupInProgress
+        ProbeStatus          = $selected.ProbeStatus
         PartitionRoots       = $partitionRoots
         AssignedDriveLetters = Get-OfflineAssignedDriveLetter
         Candidates           = $sorted
