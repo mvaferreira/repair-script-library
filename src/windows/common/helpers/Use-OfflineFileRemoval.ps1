@@ -9,23 +9,43 @@
     legitimately clears sit in the same folder as SYSTEM, SOFTWARE and their .LOG1/.LOG2 recovery
     logs, and a mistake there is unrecoverable on a disk that is already not booting.
 
-    The safety comes from four things, in order:
+    The safety comes from these things, in order:
 
-      1. A two-layer allow-list. A file is only eligible if its extension is on the caller's match
-         list AND is not on the caller's protected list. The second test can never fire given the
-         first, which is the point: it is there so that widening the match list later cannot
-         quietly make a hive recovery log deletable.
+      1. A genuine two-layer guard, where either layer on its own is enough to refuse a file:
+
+           a. The hive base-name veto. A file whose name without its extension is one of the
+              folder's registry hives - SYSTEM, SOFTWARE, SECURITY, SAM, DEFAULT and so on - is
+              rejected outright, whether it is the bare hive or one of that hive's transaction and
+              recovery logs (SYSTEM.LOG1, SOFTWARE.LOG2, SECURITY.blf, SYSTEM.regtrans-ms). Clearing
+              a hive's dirty logs while the hive itself stays is a known way to make the hive
+              unmountable, so the hive's own name is never removable in any form.
+
+           b. The extension allow-list. Of what the veto leaves, a file is eligible only if its
+              extension is on the caller's match list and is not on the caller's protected list.
+
+         The two layers are independent on purpose: the veto bounds the file by identity and the
+         allow-list bounds it by kind, so widening one can never quietly defeat the other.
 
       2. Acting only from a captured list. The folder is enumerated once, into a plan. Nothing is
          re-enumerated between deciding and deleting, so the set of files removed is exactly the
-         set that was reported and backed up.
+         set that was reported and backed up. Reparse points are dropped during that enumeration
+         and never removed, so a link planted in the folder cannot redirect a delete off the disk.
 
-      3. A hash-verified backup taken before anything is deleted. A copy that reported success but
-         produced a short file would make the rollback useless at the moment it is needed.
+      3. A hash-verified backup taken before anything is deleted, into a folder unique to the run,
+         so one run can never overwrite an earlier run's only copy of the originals. Each file's
+         owner and DACL are recorded in binary form alongside its bytes, so a rollback restores the
+         security it had and not merely its contents.
 
-      4. Six checks afterwards, all of which must pass, and a rollback of the whole set if any
-         fails. A partially cleared CLFS log set is worse than a full one, because the .blf then
-         refers to containers that no longer exist.
+      4. Independent checks afterwards, and a rollback of the whole set if any fails. The registry
+         check reports INCONCLUSIVE, not PASS, when no hive was loadable beforehand, so a run that
+         proved nothing about the hives cannot look like one that proved them intact. A partially
+         cleared CLFS log set is worse than a full one, because the .blf then refers to containers
+         that no longer exist. A rollback that itself fails - contents now gone with nothing put
+         back - is reported as a distinct, fatal outcome rather than as an ordinary failure.
+
+      5. A hard binding to the offline disk. Every path this helper deletes is checked with
+         Assert-OfflineTarget first, so a caller that passes a degraded or unrooted path is refused
+         rather than allowed to delete from the rescue VM's own volume.
 
     Deleting itself goes through Invoke-OfflineProtectedFileRemoval. An ordinary delete is tried
     first, and
@@ -44,9 +64,23 @@
     caller flushes it, because these functions return values and a Log-* call would corrupt them.
 
 .NOTES
-    Requires OfflineRepairCommon.ps1 (Add-OfflineRepairLog, Join-OfflinePath, Test-OfflinePath),
-    Use-OfflineRegistryHive.ps1 (Test-OfflineHiveFile) and Use-OfflineProtectedResource.ps1
-    (Invoke-OfflineProtectedFileRemoval).
+    Requires OfflineRepairCommon.ps1 (Add-OfflineRepairLog, Assert-OfflineTarget, Join-OfflinePath,
+    Test-OfflinePath), Use-OfflineRegistryHive.ps1 (Test-OfflineHiveFile) and
+    Use-OfflineProtectedResource.ps1 (Invoke-OfflineProtectedFileRemoval, Copy-OfflineProtectedFile,
+    Enable-OfflineOwnershipPrivilege, Save-OfflinePathSecurity).
+
+.VERSION
+    v1.1: Added the hive base-name veto so a hive's own transaction and recovery logs
+          (SYSTEM.LOG1, SOFTWARE.LOG2, SECURITY.blf, SYSTEM.regtrans-ms) can no longer be removed;
+          the guard is now genuinely two independent layers. Bound every delete to the offline root
+          with Assert-OfflineTarget and stopped following reparse points. Made the rollback loud
+          (it fails when it recovers fewer files than expected), routed restores through
+          Copy-OfflineProtectedFile, and record and replay each file's owner and DACL in binary
+          form. Surfaced rollback status on the result and made a failed rollback a distinct fatal
+          outcome. Gave each run its own backup folder. Made post-check 4 re-test the filesystem
+          instead of trusting the removed list, and post-check 6 report INCONCLUSIVE when no hive
+          was testable.
+    v1.0: Initial version.
 #>
 
 function Get-OfflineFileHashValue {
@@ -81,16 +115,55 @@ function Test-OfflineRemovableFile {
         Decides whether one file name is eligible for removal.
 
     .DESCRIPTION
-        Two independent tests must both agree: the extension is on the match list, and it is not on
-        the protected list. See the file header for why the second test is kept even though the
-        first makes it unreachable.
+        Two independent layers, either of which is enough on its own to refuse the file:
+
+          1. The base-name veto. A file whose name without its extension matches one of the folder's
+             registry hives is refused outright, whether it is the bare hive (SYSTEM) or one of that
+             hive's transaction and recovery logs (SYSTEM.LOG1, SOFTWARE.LOG2, SECURITY.blf,
+             SYSTEM.regtrans-ms). Deleting a hive's dirty logs while the hive itself stays is a known
+             way to make the hive unmountable - the exact damage this helper exists to prevent - so
+             the hive's own name is never removable in any form.
+
+          2. The extension allow-list. Of what the veto leaves, a file is eligible only if its
+             extension is on the match list and is not on the protected list.
+
+    .PARAMETER Name
+        File name (leaf, not a full path) to test.
+
+    .PARAMETER MatchExtension
+        Extensions eligible for removal, lower-case and with the leading dot, e.g. '.log1'.
+
+    .PARAMETER ProtectedExtension
+        Extensions never eligible even when they appear on the match list.
+
+    .PARAMETER HiveName
+        Registry hive base names (SYSTEM, SOFTWARE, ...) whose files must never be removed. Matched
+        against the name without its extension, ordinal and case-insensitively.
+
+    .OUTPUTS
+        [bool] - $true only when the file may be removed.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$MatchExtension,
-        [Parameter(Mandatory = $false)][AllowEmptyCollection()][string[]]$ProtectedExtension = @()
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][string[]]$ProtectedExtension = @(),
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][string[]]$HiveName = @()
     )
 
+    # Layer 1: the base-name veto. GetFileNameWithoutExtension collapses both SYSTEM and SYSTEM.LOG1
+    # onto "SYSTEM", so a hive and every one of its logs are refused together, in any casing.
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($Name)
+    foreach ($hive in @($HiveName)) {
+        if ([string]::IsNullOrEmpty($hive)) { continue }
+        if ([string]::Equals($baseName, $hive, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+
+    # Layer 2: the extension allow-list.
+    #
+    # The extensionless refusal here is load-bearing and must stay. A bare hive such as SYSTEM has no
+    # extension, and before the veto above existed this was the ONLY reason it was safe; it still
+    # guards every other extensionless file - a hive this folder was never told to name, a caller
+    # that passes no HiveName - that the veto cannot know to reject by name.
     $extension = [System.IO.Path]::GetExtension($Name)
     if ([string]::IsNullOrEmpty($extension)) { return $false }
 
@@ -118,15 +191,21 @@ function Get-OfflineFolderSnapshot {
         later skips a null on either side, because "could not read it before and cannot read it now"
         is not evidence of a change.
 
+        Reparse points (symlinks, junctions) are recorded as other files and never as matched ones,
+        so a link planted in the folder can never be selected for removal - deleting or taking
+        ownership of a link can reach a target off the offline disk entirely.
+
     .OUTPUTS
         PSCustomObject with Path, Present, Accessible, AccessError, CreatedUtc, Sddl, MatchedFile[]
-        and OtherFile[].
+        and OtherFile[]. Reparse points and registry-hive files are always classified as OtherFile.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$MatchExtension,
         [Parameter(Mandatory = $false)][AllowEmptyCollection()][string[]]$ProtectedExtension = @(),
-        [Parameter(Mandatory = $false)][switch]$IncludeHash
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][string[]]$HiveName = @(),
+        [Parameter(Mandatory = $false)][switch]$IncludeHash,
+        [Parameter(Mandatory = $false)][switch]$LogReparseSkips
     )
 
     $snapshot = [PSCustomObject]@{
@@ -174,7 +253,17 @@ function Get-OfflineFolderSnapshot {
             Hash         = $null
         }
 
-        if (Test-OfflineRemovableFile -Name $item.Name -MatchExtension $MatchExtension -ProtectedExtension $ProtectedExtension) {
+        # A reparse point (symlink, junction) is a redirection, not a file to be cleared: removing
+        # or taking ownership of one can reach a target outside this folder, and off the offline
+        # disk. It is never eligible, whatever its name; it is kept as an other file so the
+        # verification still proves it was left untouched.
+        if ($item.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+            if ($LogReparseSkips) { Add-OfflineRepairLog -Level Warning -Message "Skipping $($item.Name): it is a reparse point (link), so it will not be removed." }
+            $others.Add($record)
+            continue
+        }
+
+        if (Test-OfflineRemovableFile -Name $item.Name -MatchExtension $MatchExtension -ProtectedExtension $ProtectedExtension -HiveName $HiveName) {
             if ($IncludeHash) { $record.Hash = Get-OfflineFileHashValue -Path $item.FullName }
             $matched.Add($record)
         }
@@ -282,7 +371,7 @@ function Get-OfflineRemovalPlan {
         [Parameter(Mandatory = $false)][switch]$IncludeHash
     )
 
-    $snapshot = Get-OfflineFolderSnapshot -Path $Path -MatchExtension $MatchExtension -ProtectedExtension $ProtectedExtension -IncludeHash:$IncludeHash
+    $snapshot = Get-OfflineFolderSnapshot -Path $Path -MatchExtension $MatchExtension -ProtectedExtension $ProtectedExtension -HiveName $HiveName -IncludeHash:$IncludeHash -LogReparseSkips
 
     $hiveState = @()
     if ($snapshot.Present -and @($HiveName).Count -gt 0) {
@@ -319,8 +408,14 @@ function Backup-OfflineFile {
         Attributes are recorded rather than copied. Copy-Item does not carry them, and the rollback
         has to put back a file that is byte-identical and marked the same way.
 
+        The owner and DACL are recorded too, in binary form, so the rollback can put back the exact
+        security the file had. Binary rather than SDDL on purpose: a machine-relative SDDL alias
+        (BA, SY and the like) would re-resolve against the rescue VM on the way back in, so a hive
+        log could return owned by the wrong authority.
+
     .OUTPUTS
-        PSCustomObject with Name, Source, Backup, Attributes, Success and Reason.
+        PSCustomObject with Name, Source, Backup, Attributes, Security, Success and Reason.
+        Security is a byte[] security descriptor, or $null when it could not be read.
     #>
     param(
         [Parameter(Mandatory = $true)]$File,
@@ -332,6 +427,7 @@ function Backup-OfflineFile {
         Source     = $File.FullName
         Backup     = (Join-Path $BackupPath $File.Name)
         Attributes = $File.Attributes
+        Security   = $null
         Success    = $false
         Reason     = $null
     }
@@ -357,25 +453,95 @@ function Backup-OfflineFile {
         return $result
     }
 
+    # Record the live source's owner and DACL, so a rollback restores the security the file had and
+    # not merely its bytes. Best-effort: a file whose descriptor cannot be read is still backed up
+    # and still deletable, but the rollback is warned that it could only put the contents back.
+    try {
+        if (Get-Command -Name 'Enable-OfflineOwnershipPrivilege' -ErrorAction SilentlyContinue) { Enable-OfflineOwnershipPrivilege }
+        $result.Security = (Get-Acl -LiteralPath $File.FullName -ErrorAction Stop).GetSecurityDescriptorBinaryForm()
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "The security descriptor of $($File.Name) could not be recorded ($($_.Exception.Message)); a rollback would restore its contents but not its original permissions."
+        $result.Security = $null
+    }
+
     $result.Success = $true
     return $result
+}
+
+function Restore-OfflineFileSecurity {
+    <#
+    .SYNOPSIS
+        Replays an owner and DACL captured in binary form onto a restored file.
+
+    .DESCRIPTION
+        Only the Owner, Group and Access sections are written - never the SACL - so the write needs
+        no SeSecurityPrivilege and touches nothing to do with auditing. Setting the owner back to an
+        authority the rescue VM is not (TrustedInstaller, for a system hive) needs SeRestore, which
+        Enable-OfflineOwnershipPrivilege turns on.
+
+        The descriptor is replayed from bytes, not SDDL, because a machine-relative alias in an SDDL
+        string would resolve against the rescue VM rather than the offline image.
+
+    .OUTPUTS
+        [bool] - $true when the security was written, $false when it could not be.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][AllowNull()][byte[]]$BinaryDescriptor = $null
+    )
+
+    if (-not $BinaryDescriptor -or $BinaryDescriptor.Length -eq 0) { return $false }
+    if (-not (Test-OfflinePath $Path)) { return $false }
+
+    try {
+        if (Get-Command -Name 'Enable-OfflineOwnershipPrivilege' -ErrorAction SilentlyContinue) { Enable-OfflineOwnershipPrivilege }
+
+        $security = [System.Security.AccessControl.FileSecurity]::new()
+        $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor `
+            [System.Security.AccessControl.AccessControlSections]::Group -bor `
+            [System.Security.AccessControl.AccessControlSections]::Access
+        $security.SetSecurityDescriptorBinaryForm($BinaryDescriptor, $sections)
+
+        if (Get-Command -Name 'Save-OfflinePathSecurity' -ErrorAction SilentlyContinue) {
+            Save-OfflinePathSecurity -Path $Path -Security $security
+        }
+        else {
+            [System.IO.File]::SetAccessControl($Path, $security)
+        }
+        return $true
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "Could not replay the recorded security on $Path ($($_.Exception.Message)); it may carry inherited permissions instead of its original owner and DACL."
+        return $false
+    }
 }
 
 function Restore-OfflineFileSet {
     <#
     .SYNOPSIS
-        Puts a backed-up set of files back where they came from.
+        Puts a backed-up set of files back where they came from, contents and security both.
 
     .DESCRIPTION
         Used both by the automatic rollback when verification fails and by a caller's "-revert"
         path.
 
-        The file is copied back and then given its recorded attributes again. A restored .blf that
-        is missing its original attributes is not the file that was there before, and CLFS is
-        entitled to notice.
+        Each file is copied back through Copy-OfflineProtectedFile, not a plain Copy-Item, so a file
+        that had to be de-protected to be backed up - a system hive log owned by TrustedInstaller -
+        can actually be written back into its hardened folder. A plain copy fails silently on
+        exactly the protected files that matter most. Its recorded attributes and its recorded owner
+        and DACL are then reapplied, so a restored file is the one that was there before and not a
+        look-alike carrying the rescue VM's idea of permissions.
+
+        The rollback is deliberately loud. The backup folder is enumerated with -ErrorAction Stop,
+        and the run is reported as failed unless the number of files recovered equals the number
+        expected. A backup folder that has gone missing or unreadable, or a restore that quietly put
+        back fewer files than it took, is the one moment this must not be mistaken for "there was
+        nothing to restore".
 
     .OUTPUTS
-        PSCustomObject with Restored, Failed and Detail[].
+        PSCustomObject with Restored, Failed, Expected, Succeeded and Detail[]. Succeeded is $true
+        only when nothing failed and every expected file came back.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$BackupPath,
@@ -383,39 +549,76 @@ function Restore-OfflineFileSet {
         [Parameter(Mandatory = $false)][AllowNull()]$FileRecord = $null
     )
 
+    $recordCount = @($FileRecord | Where-Object { $_ }).Count
     $summary = [PSCustomObject]@{
-        Restored = 0
-        Failed   = 0
-        Detail   = @()
+        Restored  = 0
+        Failed    = 0
+        Expected  = $recordCount
+        Succeeded = $false
+        Detail    = @()
     }
     $detail = [System.Collections.Generic.List[string]]::new()
 
-    if (-not (Test-Path -LiteralPath $BackupPath)) {
-        $detail.Add("The backup folder $BackupPath is not present.")
+    # Restoring goes through the protected-copy path, so the helper that provides it has to be
+    # loaded. Saying so once beats failing per file with an obscure "command not found".
+    if (-not (Get-Command -Name 'Copy-OfflineProtectedFile' -ErrorAction SilentlyContinue)) {
+        $detail.Add('Use-OfflineProtectedResource.ps1 is not loaded, so files cannot be restored through the protected-copy path.')
         $summary.Failed = 1
         $summary.Detail = @($detail)
         return $summary
     }
 
-    $backedUp = @(Get-ChildItem -LiteralPath $BackupPath -File -Force -ErrorAction SilentlyContinue)
+    if (-not (Test-Path -LiteralPath $BackupPath)) {
+        $detail.Add("The backup folder $BackupPath is not present, so nothing could be restored.")
+        $summary.Failed = 1
+        $summary.Detail = @($detail)
+        return $summary
+    }
+
+    # -ErrorAction Stop, not SilentlyContinue: a folder that cannot be enumerated has to surface as
+    # a failure, not as an empty loop that returns "restored 0, failed 0" and reads as success.
+    try {
+        $backedUp = @(Get-ChildItem -LiteralPath $BackupPath -File -Force -ErrorAction Stop)
+    }
+    catch {
+        $detail.Add("The backup folder $BackupPath could not be read ($($_.Exception.Message)), so the rollback cannot proceed.")
+        $summary.Failed = 1
+        $summary.Detail = @($detail)
+        return $summary
+    }
+
+    # With no file record to go by, the backup folder itself is the expectation.
+    if ($recordCount -le 0) { $summary.Expected = $backedUp.Count }
+
     foreach ($item in $backedUp) {
         $destination = Join-Path $TargetPath $item.Name
-        try {
-            Copy-Item -LiteralPath $item.FullName -Destination $destination -Force -ErrorAction Stop
+        $recorded = @($FileRecord) | Where-Object { $_ -and $_.Name -eq $item.Name } | Select-Object -First 1
 
-            $recorded = @($FileRecord) | Where-Object { $_ -and $_.Name -eq $item.Name } | Select-Object -First 1
-            if ($recorded -and $recorded.Attributes) {
-                try { (Get-Item -LiteralPath $destination -Force -ErrorAction Stop).Attributes = [System.IO.FileAttributes]$recorded.Attributes }
-                catch { $detail.Add("Restored $($item.Name) but could not reapply its attributes ($($_.Exception.Message)).") }
-            }
-
-            $summary.Restored++
-            $detail.Add("Restored $($item.Name).")
-        }
-        catch {
+        $copy = Copy-OfflineProtectedFile -Source $item.FullName -Destination $destination
+        if (-not $copy.Copied) {
             $summary.Failed++
-            $detail.Add("Could not restore $($item.Name): $($_.Exception.Message)")
+            $detail.Add("Could not restore $($item.Name): $($copy.Reason)")
+            continue
         }
+
+        if ($recorded -and $recorded.Attributes) {
+            try { (Get-Item -LiteralPath $destination -Force -ErrorAction Stop).Attributes = [System.IO.FileAttributes]$recorded.Attributes }
+            catch { $detail.Add("Restored $($item.Name) but could not reapply its attributes ($($_.Exception.Message)).") }
+        }
+
+        if ($recorded -and $recorded.Security) {
+            if (-not (Restore-OfflineFileSecurity -Path $destination -BinaryDescriptor $recorded.Security)) {
+                $detail.Add("Restored $($item.Name) but could not reapply its original owner and DACL.")
+            }
+        }
+
+        $summary.Restored++
+        $detail.Add("Restored $($item.Name).")
+    }
+
+    $summary.Succeeded = ($summary.Failed -eq 0 -and $summary.Restored -eq $summary.Expected)
+    if (-not $summary.Succeeded -and $summary.Failed -eq 0) {
+        $detail.Add("Rollback recovered $($summary.Restored) of $($summary.Expected) expected file(s).")
     }
 
     $summary.Detail = @($detail)
@@ -428,17 +631,24 @@ function Test-OfflineRemovalResult {
         Proves the deletion removed the planned files and nothing else.
 
     .DESCRIPTION
-        Six checks, all of which must pass. Check 5 is the one that matters most: comparing every
-        other file in the folder by size, last write time and attributes is the direct evidence
-        that the registry hives and their .LOG1/.LOG2 recovery logs were neither removed nor
-        modified. Check 6 then has Windows confirm the hives still parse.
+        Six checks. Check 5 is the one that matters most: comparing every other file in the folder
+        by size, last write time and attributes is the direct evidence that the registry hives and
+        their .LOG1/.LOG2 recovery logs were neither removed nor modified. Check 6 then has Windows
+        confirm the hives still parse.
+
+        Check 4 re-reads the filesystem directly rather than trusting the list of files the delete
+        loop reported it removed, so it can actually catch a delete that did not take. Check 6
+        reports INCONCLUSIVE rather than PASS when no hive was loadable beforehand, so a run that
+        proved nothing about the hives is never mistaken for one that proved them intact; an
+        inconclusive check is not a failure and does not roll the run back.
 
         A folder ACL that could not be read before and cannot be read now is passed rather than
         failed, because there is nothing to compare and refusing on that basis would roll back a
         correct repair on a build that simply restricts the folder.
 
     .OUTPUTS
-        PSCustomObject with Passed, Check[] and Failure[].
+        PSCustomObject with Passed, Inconclusive, Check[] and Failure[]. Each Check carries Name,
+        Passed, Status ('PASS', 'FAIL' or 'INCONCLUSIVE') and Detail.
     #>
     param(
         [Parameter(Mandatory = $true)]$Plan,
@@ -449,11 +659,12 @@ function Test-OfflineRemovalResult {
     $failures = [System.Collections.Generic.List[string]]::new()
 
     $before = $Plan.Snapshot
-    $after = Get-OfflineFolderSnapshot -Path $Plan.Path -MatchExtension $Plan.MatchExtension -ProtectedExtension $Plan.ProtectedExtension
+    $after = Get-OfflineFolderSnapshot -Path $Plan.Path -MatchExtension $Plan.MatchExtension -ProtectedExtension $Plan.ProtectedExtension -HiveName $Plan.HiveName
 
     function Add-Check {
-        param([string]$Name, [bool]$Passed, [string]$Detail)
-        $checks.Add([PSCustomObject]@{ Name = $Name; Passed = $Passed; Detail = $Detail })
+        param([string]$Name, [bool]$Passed, [string]$Detail, [string]$Status = $null)
+        if ([string]::IsNullOrEmpty($Status)) { $Status = if ($Passed) { 'PASS' } else { 'FAIL' } }
+        $checks.Add([PSCustomObject]@{ Name = $Name; Passed = $Passed; Status = $Status; Detail = $Detail })
         if (-not $Passed) { $failures.Add("$Name - $Detail") }
     }
 
@@ -462,7 +673,7 @@ function Test-OfflineRemovalResult {
         if ($after.Present) { 'the folder is still present' } else { 'the folder is gone' })
 
     if (-not $after.Present) {
-        return [PSCustomObject]@{ Passed = $false; Check = @($checks); Failure = @($failures) }
+        return [PSCustomObject]@{ Passed = $false; Inconclusive = $false; Check = @($checks); Failure = @($failures) }
     }
 
     # 2. It is the same folder, not a replacement.
@@ -478,17 +689,18 @@ function Test-OfflineRemovalResult {
         elseif ($sameAcl) { 'the ACL is unchanged' }
         else { 'the ACL changed' })
 
-    # 4. Exactly the planned files went, and no others.
+    # 4. Exactly the planned files went, and no others. This re-reads the offline filesystem
+    #    directly with Test-OfflinePath rather than trusting $Removed - the very list it exists to
+    #    validate - so a delete the loop reported but that did not actually take is still caught.
     $expectedGone = @($Removed | ForEach-Object { $_.Name })
-    $stillThere = @($after.MatchedFile | ForEach-Object { $_.Name })
-    $notRemoved = @($expectedGone | Where-Object { $stillThere -contains $_ })
+    $stillOnDisk = @($expectedGone | Where-Object { Test-OfflinePath (Join-OfflinePath $Plan.Path $_) })
     $plannedNames = @($before.MatchedFile | ForEach-Object { $_.Name })
-    $unexpectedlyGone = @($plannedNames | Where-Object { $expectedGone -notcontains $_ -and $stillThere -notcontains $_ })
+    $unexpectedlyGone = @($plannedNames | Where-Object { $expectedGone -notcontains $_ -and -not (Test-OfflinePath (Join-OfflinePath $Plan.Path $_)) })
 
-    $removalOk = ($notRemoved.Count -eq 0 -and $unexpectedlyGone.Count -eq 0)
+    $removalOk = ($stillOnDisk.Count -eq 0 -and $unexpectedlyGone.Count -eq 0)
     Add-Check -Name 'Planned files removed' -Passed $removalOk -Detail $(
         if ($removalOk) { "$($expectedGone.Count) file(s) removed as planned" }
-        elseif ($notRemoved.Count -gt 0) { "still present: $($notRemoved -join ', ')" }
+        elseif ($stillOnDisk.Count -gt 0) { "still on disk: $($stillOnDisk -join ', ')" }
         else { "removed without being planned: $($unexpectedlyGone -join ', ')" })
 
     # 5. Everything else in the folder is byte-for-byte and flag-for-flag as it was.
@@ -508,24 +720,31 @@ function Test-OfflineRemovalResult {
     # 6. Hives that loaded before still load.
     $hiveProblems = [System.Collections.Generic.List[string]]::new()
     $testedBefore = @($Plan.HiveState | Where-Object { $_.Tested -and $_.Loads })
-    if ($testedBefore.Count -gt 0) {
+    if ($testedBefore.Count -eq 0) {
+        # Nothing was provable here - no hive in this folder loaded beforehand, or none was named -
+        # so the removal cannot be said to have preserved them. INCONCLUSIVE, never PASS, so a run
+        # that proved nothing about the hives is not read as one that proved them intact. It is not
+        # counted as a failure and so does not roll the run back.
+        Add-Check -Name 'Registry hives still load' -Passed $true -Status 'INCONCLUSIVE' -Detail 'no hive in this folder was loadable beforehand, so whether the removal preserved them could not be proven'
+    }
+    else {
         $afterHive = Get-OfflineFolderHiveState -Path $Plan.Path -HiveName $Plan.HiveName -MaxBytes $Plan.HiveMaxBytes
         foreach ($original in $testedBefore) {
             $current = @($afterHive) | Where-Object { $_.Name -eq $original.Name } | Select-Object -First 1
             if (-not $current -or -not $current.Tested) { $hiveProblems.Add("$($original.Name) could not be retested"); continue }
             if (-not $current.Loads) { $hiveProblems.Add("$($original.Name) no longer loads ($($current.Reason))") }
         }
+        $hivesOk = ($hiveProblems.Count -eq 0)
+        Add-Check -Name 'Registry hives still load' -Passed $hivesOk -Detail $(
+            if ($hivesOk) { "all $($testedBefore.Count) hive(s) still load" }
+            else { ($hiveProblems -join '; ') })
     }
-    $hivesOk = ($hiveProblems.Count -eq 0)
-    Add-Check -Name 'Registry hives still load' -Passed $hivesOk -Detail $(
-        if ($testedBefore.Count -eq 0) { 'no hive in this folder was testable beforehand, so there is nothing to compare' }
-        elseif ($hivesOk) { "all $($testedBefore.Count) hive(s) still load" }
-        else { ($hiveProblems -join '; ') })
 
     return [PSCustomObject]@{
-        Passed  = ($failures.Count -eq 0)
-        Check   = @($checks)
-        Failure = @($failures)
+        Passed       = ($failures.Count -eq 0)
+        Inconclusive = [bool](@($checks | Where-Object { $_.Status -eq 'INCONCLUSIVE' }).Count -gt 0)
+        Check        = @($checks)
+        Failure      = @($failures)
     }
 }
 
@@ -545,8 +764,15 @@ function Invoke-OfflineRemovalPlan {
         folder's SDDL before and after, so an ownership change that was not handed back fails the
         run and rolls it back rather than being left behind.
 
+        Every path is checked against the bound offline root with Assert-OfflineTarget before it is
+        touched - the folder once, and each file again as it is deleted - so a degraded or unrooted
+        path is refused rather than allowed to delete from the rescue VM's own volume. The backup
+        goes into a folder unique to this run, so one run cannot overwrite an earlier run's backups.
+
         A failure at any point rolls the whole plan back. A partially cleared CLFS log set is worse
-        than a full one: the .blf refers to containers that would no longer exist.
+        than a full one: the .blf refers to containers that would no longer exist. A rollback that
+        itself fails - files now gone with nothing put back - is reported as a distinct, fatal
+        outcome (RollbackAttempted true with RollbackSucceeded false), not as an ordinary failure.
 
         Progress is recorded with Add-OfflineRepairLog rather than Log-*. The Log-* functions write
         to the output stream, so calling one here would put log strings into this function's return
@@ -554,20 +780,27 @@ function Invoke-OfflineRemovalPlan {
         each call instead.
 
     .OUTPUTS
-        PSCustomObject with Label, BackupPath, Removed[], Verification, Success and Reason.
+        PSCustomObject with Label, BackupPath, Removed[], Verification, Success, Reason,
+        RollbackAttempted, RollbackSucceeded and RollbackDetail[]. A run where Success is false,
+        RollbackAttempted is true and RollbackSucceeded is false is the fatal case: the offline
+        image is missing files the rollback could not put back.
     #>
     param(
         [Parameter(Mandatory = $true)]$Plan,
-        [Parameter(Mandatory = $true)][string]$BackupRoot
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot
     )
 
     $result = [PSCustomObject]@{
-        Label        = $Plan.Label
-        BackupPath   = $null
-        Removed      = @()
-        Verification = $null
-        Success      = $false
-        Reason       = $null
+        Label             = $Plan.Label
+        BackupPath        = $null
+        Removed           = @()
+        Verification      = $null
+        Success           = $false
+        Reason            = $null
+        RollbackAttempted = $false
+        RollbackSucceeded = $false
+        RollbackDetail    = @()
     }
 
     # Checked here, before anything is copied or deleted, so a script that forgot to dot-source
@@ -579,10 +812,39 @@ function Invoke-OfflineRemovalPlan {
         return $result
     }
 
-    $backupPath = Join-Path $BackupRoot $Plan.Label
+    # The whole set has to sit under the bound offline root. Asserted once here, loudly, before a
+    # single byte is copied or deleted: a caller that passes a degraded C:\ path, or forgot to bind
+    # a disk at all, is refused outright rather than allowed to clear files off the rescue VM's own
+    # volume.
+    try {
+        if ($PSBoundParameters.ContainsKey('OfflineRoot') -and $OfflineRoot) {
+            [void](Assert-OfflineTarget -Path $Plan.Path -OfflineRoot $OfflineRoot -Action 'delete')
+        }
+        else {
+            [void](Assert-OfflineTarget -Path $Plan.Path -Action 'delete')
+        }
+    }
+    catch {
+        $result.Reason = "the target folder is not on the offline disk: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Error -Message $result.Reason
+        return $result
+    }
+
+    # A folder unique to this run - label, PID and a millisecond timestamp - so a second run can
+    # never write over the first run's backups and destroy the only copy of the originals.
+    $runStamp = '{0}_{1}_{2}' -f $Plan.Label, $PID, (Get-Date -Format 'yyyyMMddHHmmssfff')
+    $backupPath = Join-Path $BackupRoot $runStamp
     try { New-Item -Path $backupPath -ItemType Directory -Force -ErrorAction Stop | Out-Null }
     catch {
         $result.Reason = "the backup folder $backupPath could not be created: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Error -Message $result.Reason
+        return $result
+    }
+    # Belt and braces: even with the unique name, refuse to reuse a folder that already holds files
+    # rather than risk overwriting a backup that is somehow already there.
+    if (@(Get-ChildItem -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+        $result.Reason = "the backup folder $backupPath already contains files; refusing to reuse it and risk overwriting a previous backup"
+        Add-OfflineRepairLog -Level Error -Message $result.Reason
         return $result
     }
     $result.BackupPath = $backupPath
@@ -598,7 +860,10 @@ function Invoke-OfflineRemovalPlan {
         return $result
     }
 
-    # Back everything up first. Nothing is deleted until every file has a verified copy.
+    # Back everything up first. Nothing is deleted until every file has a verified copy. The backup
+    # records - each carrying the file's recorded attributes and its owner and DACL - are what a
+    # rollback restores from, so they are kept for the rollback calls below.
+    $backups = [System.Collections.Generic.List[object]]::new()
     foreach ($file in @($Plan.Snapshot.MatchedFile)) {
         $backup = Backup-OfflineFile -File $file -BackupPath $backupPath
         if (-not $backup.Success) {
@@ -606,6 +871,7 @@ function Invoke-OfflineRemovalPlan {
             Add-OfflineRepairLog -Level Error -Message $result.Reason
             return $result
         }
+        $backups.Add($backup)
         Add-OfflineRepairLog -Message "Backed up $($file.Name) ($([math]::Round($file.Length / 1KB)) KB)."
     }
 
@@ -618,6 +884,22 @@ function Invoke-OfflineRemovalPlan {
     $removed = [System.Collections.Generic.List[object]]::new()
     $deleteFailed = $null
     foreach ($file in @($Plan.Snapshot.MatchedFile)) {
+        # Assert each resolved path again, immediately before it is deleted. The set-level check
+        # above proves the folder is on the offline disk; this proves the individual file still is,
+        # closing the gap a caller-supplied or link-redirected path could otherwise slip through.
+        try {
+            if ($PSBoundParameters.ContainsKey('OfflineRoot') -and $OfflineRoot) {
+                [void](Assert-OfflineTarget -Path $file.FullName -OfflineRoot $OfflineRoot -Action 'delete')
+            }
+            else {
+                [void](Assert-OfflineTarget -Path $file.FullName -Action 'delete')
+            }
+        }
+        catch {
+            $deleteFailed = "$($file.Name) is not on the offline disk: $($_.Exception.Message)"
+            break
+        }
+
         $attempt = Invoke-OfflineProtectedFileRemoval -Path $file.FullName
 
         if ($attempt.Removed) {
@@ -643,9 +925,20 @@ function Invoke-OfflineRemovalPlan {
 
     if ($deleteFailed) {
         Add-OfflineRepairLog -Level Error -Message "$deleteFailed Rolling this set back."
-        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord $Plan.Snapshot.MatchedFile
+        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord @($backups)
         foreach ($line in @($rollback.Detail)) { Add-OfflineRepairLog -Message "  $line" }
-        $result.Reason = $deleteFailed
+        $result.RollbackAttempted = $true
+        $result.RollbackSucceeded = [bool]$rollback.Succeeded
+        $result.RollbackDetail = @($rollback.Detail)
+        # Verdict last, so it survives the 4096-character tail az vm run-command keeps.
+        if ($rollback.Succeeded) {
+            $result.Reason = "$deleteFailed The set was rolled back and the offline image is unchanged."
+            Add-OfflineRepairLog -Level Warning -Message "Removal of '$($Plan.Label)' failed and was rolled back cleanly; the offline image is unchanged."
+        }
+        else {
+            $result.Reason = "FATAL: $deleteFailed The rollback then failed ($($rollback.Restored) of $($rollback.Expected) restored); the offline image is missing files with no restored backup. Recover by hand from $backupPath."
+            Add-OfflineRepairLog -Level Error -Message $result.Reason
+        }
         return $result
     }
 
@@ -654,19 +947,41 @@ function Invoke-OfflineRemovalPlan {
     $result.Verification = $verification
 
     foreach ($check in @($verification.Check)) {
-        $line = "  [$(if ($check.Passed) { 'PASS' } else { 'FAIL' })] $($check.Name): $($check.Detail)"
-        if ($check.Passed) { Add-OfflineRepairLog -Message $line }
-        else { Add-OfflineRepairLog -Level Error -Message $line }
+        $line = "  [$($check.Status)] $($check.Name): $($check.Detail)"
+        switch ($check.Status) {
+            'FAIL' { Add-OfflineRepairLog -Level Error -Message $line }
+            'INCONCLUSIVE' { Add-OfflineRepairLog -Level Warning -Message $line }
+            default { Add-OfflineRepairLog -Message $line }
+        }
     }
 
     if (-not $verification.Passed) {
         Add-OfflineRepairLog -Level Error -Message "Verification failed for $($Plan.Label). Rolling it back."
-        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord $Plan.Snapshot.MatchedFile
+        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord @($backups)
         foreach ($line in @($rollback.Detail)) { Add-OfflineRepairLog -Message "  $line" }
-        $result.Reason = ($verification.Failure -join '; ')
+        $result.RollbackAttempted = $true
+        $result.RollbackSucceeded = [bool]$rollback.Succeeded
+        $result.RollbackDetail = @($rollback.Detail)
+        # Verdict last, so it survives the 4096-character tail az vm run-command keeps.
+        if ($rollback.Succeeded) {
+            $result.Reason = ($verification.Failure -join '; ')
+            Add-OfflineRepairLog -Level Warning -Message "Verification of '$($Plan.Label)' failed and was rolled back cleanly; the offline image is unchanged."
+        }
+        else {
+            $result.Reason = "FATAL: verification failed and the rollback then failed ($($rollback.Restored) of $($rollback.Expected) restored): $($verification.Failure -join '; '). The offline image is missing files with no restored backup. Recover by hand from $backupPath."
+            Add-OfflineRepairLog -Level Error -Message $result.Reason
+        }
         return $result
     }
 
     $result.Success = $true
+    # Verdict last. An inconclusive hive check is a success with a caveat and must not read as a
+    # clean, fully proven one.
+    if ($verification.Inconclusive) {
+        Add-OfflineRepairLog -Level Warning -Message "Removal of '$($Plan.Label)' succeeded, but registry-hive verification was INCONCLUSIVE: no hive in the folder was loadable beforehand, so the hives could not be proven intact."
+    }
+    else {
+        Add-OfflineRepairLog -Message "Removal of '$($Plan.Label)' succeeded and every check passed."
+    }
     return $result
 }
