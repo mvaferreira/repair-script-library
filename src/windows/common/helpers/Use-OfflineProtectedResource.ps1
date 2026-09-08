@@ -15,7 +15,12 @@
 
     This helper closes that gap without leaving the disk less protected than it found it:
 
-      1. The original descriptor is captured first, in SDDL form, including owner and group.
+      1. The original descriptor is captured first, including owner and group. Registry keys, and
+         this file's own copy, rename and delete paths, capture it in BINARY form, which round-trips
+         losslessly where an SDDL string can silently drop the protected-DACL (P) and auto-inherited
+         (AI) control flags and re-resolve machine-relative aliases (LA, DA, DU, DC) against the
+         rescue VM's own SIDs. An SDDL capture is still offered for the scenarios that consume it as
+         a string.
 
       2. Ownership is taken, and only then is an access rule added - a DACL cannot be written by
          an account that does not own the object.
@@ -37,6 +42,22 @@
     Registry handles are closed explicitly and the finalizer queue is drained before returning.
     A single leaked RegistryKey handle makes the later 'reg unload' fail, which strands the
     offline hive mounted under HKLM on the rescue VM.
+
+.VERSION
+    1.0  Capture the descriptor, take ownership, repair, and replay the descriptor whole.
+
+    1.1  Hardened after the PR #143 review:
+         - Every function that writes, deletes, takes ownership or changes a security descriptor
+           now calls Assert-OfflineTarget BEFORE any privilege is enabled, so a privileged operation
+           cannot land on the rescue VM's own disk or hive if an upstream precondition degrades. The
+           public entry points take an optional -OfflineRoot to state the binding explicitly.
+         - Registry descriptors are captured and replayed in BINARY rather than SDDL, so the P/AI
+           control flags and machine-relative SIDs survive the round-trip; the file paths do the
+           same through an optional binary capture while still returning SDDL for external callers.
+         - Every restore is verified by reading the descriptor back and comparing owner, DACL and
+           protection; a key that cannot be reopened to restore is reported, not silently skipped.
+         - A value removal reports success only once the value is verified gone, and the key's
+           descriptor is put back even when taking ownership throws part way through.
 #>
 
 $script:OfflinePrivilegeReady = $false
@@ -45,6 +66,13 @@ $script:OfflineBackupPrivilegeReady = $false
 # Owner, Group and Access. SACL is deliberately not captured or replayed: reading it needs
 # SeSecurityPrivilege and writing it back can fail on its own, and nothing here changes auditing.
 $script:OfflineSecuritySection = 'Owner,Group,Access'
+
+# The same three sections as the enum the binary security APIs take. Binary capture and replay is
+# used wherever this file restores its own descriptors, because it is lossless where the SDDL string
+# above is not: SDDL re-resolves machine-relative aliases and can drop the P/AI control flags.
+$script:OfflineSecuritySections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+    [System.Security.AccessControl.AccessControlSections]::Group -bor
+    [System.Security.AccessControl.AccessControlSections]::Access
 
 function Initialize-OfflinePrivilegeType {
     <#
@@ -150,6 +178,7 @@ function Enable-OfflineBackupPrivilege {
         acquire the right to take an object it was only meant to look at.
     #>
     [CmdletBinding()]
+    [OutputType([bool])]
     param()
 
     if ($script:OfflineBackupPrivilegeReady) { return $true }
@@ -199,18 +228,110 @@ function ConvertTo-OfflineNativeSubKey {
     return $null
 }
 
+function Get-OfflineRawOwner {
+    <#
+    .SYNOPSIS
+        Reading just the owner SID out of a binary security descriptor.
+
+    .DESCRIPTION
+        Used to decide whether the owner still needs replaying. Comparing the captured owner with
+        the current one avoids a privileged owner-write when the owner never changed. Returns an
+        empty string when there is no owner or the descriptor cannot be parsed.
+
+    .OUTPUTS
+        [string] the owner SID in S-1-... form, or an empty string.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([byte[]]$BinaryDescriptor)
+
+    if (-not $BinaryDescriptor -or $BinaryDescriptor.Length -eq 0) { return '' }
+    try {
+        $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($BinaryDescriptor, 0)
+        if ($raw.Owner) { return $raw.Owner.Value }
+        return ''
+    }
+    catch { return '' }
+}
+
+function Test-OfflineDescriptorMatch {
+    <#
+    .SYNOPSIS
+        Confirming a descriptor read back after a restore matches the one that was captured.
+
+    .DESCRIPTION
+        A restore is not trusted until it is verified, the same way a privileged value write is read
+        back and byte-compared before it is called done. Raw self-relative bytes are not compared
+        whole, because two equivalent descriptors can be laid out differently; instead the owner, the
+        protected (P) and auto-inherited (AI) control flags, and every DACL ACE (compared by its own
+        binary form, in canonical order) are checked. Those are exactly the parts an SDDL round-trip
+        used to corrupt, so a mismatch here is a real restore failure, not a layout artefact.
+
+        Returns $true only when both descriptors parse and every compared part is identical.
+
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [byte[]]$Captured,
+        [byte[]]$ReadBack
+    )
+
+    if (-not $Captured -or -not $ReadBack) { return $false }
+    try {
+        $a = [System.Security.AccessControl.RawSecurityDescriptor]::new($Captured, 0)
+        $b = [System.Security.AccessControl.RawSecurityDescriptor]::new($ReadBack, 0)
+
+        if ("$($a.Owner)" -ne "$($b.Owner)") { return $false }
+
+        $mask = [System.Security.AccessControl.ControlFlags]'DiscretionaryAclProtected, DiscretionaryAclAutoInherited'
+        if (($a.ControlFlags -band $mask) -ne ($b.ControlFlags -band $mask)) { return $false }
+
+        $da = $a.DiscretionaryAcl
+        $db = $b.DiscretionaryAcl
+        if (($null -eq $da) -ne ($null -eq $db)) { return $false }
+        if ($da) {
+            if ($da.Count -ne $db.Count) { return $false }
+            for ($i = 0; $i -lt $da.Count; $i++) {
+                if ($da[$i].BinaryLength -ne $db[$i].BinaryLength) { return $false }
+                $xb = [byte[]]::new($da[$i].BinaryLength)
+                $yb = [byte[]]::new($db[$i].BinaryLength)
+                $da[$i].GetBinaryForm($xb, 0)
+                $db[$i].GetBinaryForm($yb, 0)
+                for ($j = 0; $j -lt $xb.Length; $j++) {
+                    if ($xb[$j] -ne $yb[$j]) { return $false }
+                }
+            }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
 function Get-OfflineRegistryKeySecurity {
     <#
     .SYNOPSIS
-        Capturing a registry key's owner, group and DACL as SDDL, before anything is changed.
+        Capturing a registry key's owner, group and DACL in binary form, before anything is changed.
 
     .DESCRIPTION
-        Returns $null when the descriptor cannot be read. A caller that gets $null must not take
-        ownership: without a capture there is nothing to put back, and an object left owned by
-        SYSTEM with an extra FullControl ACE is a permanent change to a system it was only meant
-        to borrow.
+        Returns the descriptor as a byte array, or $null when it cannot be read. Binary is used
+        rather than SDDL because a descriptor captured on the rescue VM and replayed against an
+        offline hive has to survive the round-trip exactly: an SDDL string re-resolves the
+        machine-relative aliases (LA, DA, DU, DC) against the rescue VM's own SIDs and can drop the
+        protected (P) and auto-inherited (AI) control flags when it is parsed on another machine.
+        The binary form carries the raw SIDs and the exact control bits, so none of that happens.
+
+        A caller that gets $null must not take ownership: without a capture there is nothing to put
+        back, and an object left owned by SYSTEM with an extra FullControl ACE is a permanent change
+        to a system it was only meant to borrow.
+
+    .OUTPUTS
+        [byte[]] the descriptor's Owner, Group and DACL in self-relative binary form, or $null.
     #>
     [CmdletBinding()]
+    [OutputType([byte[]])]
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
@@ -223,10 +344,7 @@ function Get-OfflineRegistryKeySecurity {
             $subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree, $rights)
         if (-not $key) { return $null }
 
-        $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
-                    [System.Security.AccessControl.AccessControlSections]::Group -bor
-                    [System.Security.AccessControl.AccessControlSections]::Access
-        return $key.GetAccessControl($sections).GetSecurityDescriptorSddlForm($script:OfflineSecuritySection)
+        return $key.GetAccessControl($script:OfflineSecuritySections).GetSecurityDescriptorBinaryForm()
     }
     catch { return $null }
     finally { if ($key) { $key.Close() } }
@@ -246,19 +364,52 @@ function Grant-OfflineRegistryKeyAccess {
         because removing a value needs rights on its own key only - and because recursing a key
         like COMPONENTS would walk the entire component store to no purpose.
 
-        Returns the list of captured descriptors, oldest first, for Restore-OfflineRegistrySecurity
-        to replay. A key whose descriptor could not be captured is skipped rather than taken.
+        Assert-OfflineTarget runs before any privilege is enabled, so a key outside the mounted
+        offline hive is refused before ownership is ever taken. That gate is the whole point of the
+        helper: a privileged take-and-modify can only ever reach the offline image, never the rescue
+        VM's own registry, even if an upstream precondition silently degrades.
+
+        Each captured descriptor is appended to -CapturedInto, if the caller supplies a list, as it
+        is taken. That way a throw part way through a subtree still leaves the caller holding
+        everything captured so far to restore, instead of the whole capture being lost with a return
+        value that never arrived. The same list is returned for callers that do not pass one.
+
+        Descriptors are captured in binary (see Get-OfflineRegistryKeySecurity) so the replay is
+        lossless. A key whose descriptor could not be captured is skipped rather than taken.
+
+    .PARAMETER Path
+        The offline hive key to take. Must resolve under a registered mounted hive.
+
+    .PARAMETER NoRecurse
+        Take only this key, not the subtree below it.
+
+    .PARAMETER OfflineRoot
+        Optional explicit mounted-hive key to validate $Path against instead of the registered
+        mount(s). Forwarded to Assert-OfflineTarget.
+
+    .PARAMETER CapturedInto
+        Optional caller-owned list that each captured descriptor is appended to as it is taken, so a
+        partial capture survives a mid-subtree throw.
+
+    .OUTPUTS
+        [System.Collections.Generic.List[object]] the captured descriptors, oldest first.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Generic.List[object]])]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [switch]$NoRecurse
+        [switch]$NoRecurse,
+        [string]$OfflineRoot = '',
+        [System.Collections.Generic.List[object]]$CapturedInto
     )
+
+    # The gate first, before a single privilege is enabled: if the path is not under a mounted
+    # offline hive this throws, and nothing is taken.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'take ownership of')
 
     Enable-OfflineOwnershipPrivilege
     $me = Get-OfflineCurrentUserSid
-    $captured = [System.Collections.Generic.List[object]]::new()
+    $captured = if ($CapturedInto) { $CapturedInto } else { [System.Collections.Generic.List[object]]::new() }
 
     # Enumerate before changing anything: the recursion below opens provider handles, and doing
     # that after ownership changes has been written makes a partial failure harder to unwind.
@@ -274,8 +425,8 @@ function Grant-OfflineRegistryKeyAccess {
         $subKey = ConvertTo-OfflineNativeSubKey -Path $target
         if (-not $subKey) { continue }
 
-        $sddl = Get-OfflineRegistryKeySecurity -Path $target
-        if (-not $sddl) {
+        $descriptor = Get-OfflineRegistryKeySecurity -Path $target
+        if (-not $descriptor) {
             Add-OfflineRepairLog -Level Info -Message "Could not read the security descriptor of $subKey, so its ownership was left alone."
             continue
         }
@@ -317,7 +468,7 @@ function Grant-OfflineRegistryKeyAccess {
         }
         finally { if ($accessKey) { $accessKey.Close() } }
 
-        [void]$captured.Add([PSCustomObject]@{ Path = $target; SubKey = $subKey; Sddl = $sddl })
+        [void]$captured.Add([PSCustomObject]@{ Path = $target; SubKey = $subKey; Descriptor = $descriptor })
     }
 
     # The provider opens keys of its own while enumerating. Releasing them here is what keeps the
@@ -336,9 +487,15 @@ function Restore-OfflineRegistrySecurity {
     .DESCRIPTION
         Keys that no longer exist are skipped, because a key that was successfully deleted has
         nothing to restore - that is the normal outcome, not an error. The descriptor is replayed
-        whole rather than by removing the ACE that was added, which also puts the owner back.
+        whole from its binary capture rather than by removing the ACE that was added, which also
+        puts the owner back and cannot be corrupted by SDDL alias re-resolution.
 
-        Returns the number of keys whose descriptor was successfully replayed.
+        Each restore is verified by reading the descriptor back and comparing owner, DACL and
+        protection (see Test-OfflineDescriptorMatch). A key that cannot be reopened, rewritten or
+        verified is reported with a Warning and a subinacl hint, because leaving it owned by this
+        account with an added ACE is a lasting change to the offline image, not a clean outcome.
+
+        Returns the number of keys whose descriptor was replayed AND verified.
     #>
     [CmdletBinding()]
     [OutputType([int])]
@@ -351,7 +508,7 @@ function Restore-OfflineRegistrySecurity {
     $ordered = @($Captured | Sort-Object -Property { ($_.SubKey -split '\\').Count } -Descending)
 
     foreach ($entry in $ordered) {
-        if (-not $entry.SubKey -or -not $entry.Sddl) { continue }
+        if (-not $entry.SubKey -or -not $entry.Descriptor) { continue }
 
         $key = $null
         try {
@@ -360,12 +517,33 @@ function Restore-OfflineRegistrySecurity {
                       [System.Security.AccessControl.RegistryRights]::TakeOwnership
             $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
                 $entry.SubKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
-            if (-not $key) { continue }
+            if (-not $key) {
+                # OpenSubKey returns null only for a key that does not exist; an existing key we may
+                # not open throws instead and is handled by the catch below. A key captured and then
+                # deleted on purpose - the whole subtree beneath a removed key - is the normal
+                # outcome and has nothing to restore, so it is skipped silently. But a key that is
+                # still present yet came back null is one we failed to reopen: leaving it owned by
+                # this account with the added ACE is a lasting change to the offline image, so it is
+                # reported rather than passed over.
+                if (Test-Path -LiteralPath $entry.Path) {
+                    Add-OfflineRepairLog -Level Warning -Message "Could not reopen $($entry.SubKey) to restore its original ACL, so it is left owned by this account. Restore it by hand with: subinacl /keyreg `"$($entry.SubKey)`" /setowner=`"NT SERVICE\TrustedInstaller`""
+                }
+                continue
+            }
 
             $sd = [System.Security.AccessControl.RegistrySecurity]::new()
-            $sd.SetSecurityDescriptorSddlForm($entry.Sddl, $script:OfflineSecuritySection)
+            $sd.SetSecurityDescriptorBinaryForm($entry.Descriptor, $script:OfflineSecuritySections)
             $key.SetAccessControl($sd)
-            $restored++
+
+            # Trust nothing: read the descriptor back and compare it to the capture, the same way a
+            # privileged value write is read back and byte-compared before it is called done.
+            $readBack = Get-OfflineRegistryKeySecurity -Path $entry.Path
+            if ($readBack -and (Test-OfflineDescriptorMatch -Captured $entry.Descriptor -ReadBack $readBack)) {
+                $restored++
+            }
+            else {
+                Add-OfflineRepairLog -Level Warning -Message "The original ACL was written back to $($entry.SubKey) but did not read back identically, so it cannot be counted as restored. Check it by hand with: subinacl /keyreg `"$($entry.SubKey)`" /display"
+            }
         }
         catch {
             Add-OfflineRepairLog -Level Warning -Message "Could not restore the original ACL on $($entry.SubKey): $($_.Exception.Message). Restore it by hand with: subinacl /keyreg `"$($entry.SubKey)`" /setowner=`"NT SERVICE\TrustedInstaller`""
@@ -437,10 +615,15 @@ function Invoke-OfflineProtectedKeyRemoval {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [string]$Label = ''
+        [string]$Label = '',
+        [string]$OfflineRoot = ''
     )
 
     if (-not $Label) { $Label = $Path }
+
+    # The gate before the plain delete below, which is itself a mutation: refuse a key that is not
+    # under the mounted offline hive before anything is attempted against it.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'delete the offline registry key')
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return [PSCustomObject]@{ Removed = $true; TookOwnership = $false; Restored = 0; Reason = 'The key was not present.' }
@@ -459,9 +642,9 @@ function Invoke-OfflineProtectedKeyRemoval {
         # itself grants. -NoRecurse keeps the grant off every sibling of the target.
         $parent = Split-Path -Path $Path -Parent
         if ($parent -and (ConvertTo-OfflineNativeSubKey -Path $parent)) {
-            foreach ($entry in @(Grant-OfflineRegistryKeyAccess -Path $parent -NoRecurse)) { [void]$captured.Add($entry) }
+            [void](Grant-OfflineRegistryKeyAccess -Path $parent -NoRecurse -OfflineRoot $OfflineRoot -CapturedInto $captured)
         }
-        foreach ($entry in @(Grant-OfflineRegistryKeyAccess -Path $Path)) { [void]$captured.Add($entry) }
+        [void](Grant-OfflineRegistryKeyAccess -Path $Path -OfflineRoot $OfflineRoot -CapturedInto $captured)
     }
     catch {
         $undone = Restore-OfflineRegistrySecurity -Captured $captured.ToArray()
@@ -508,14 +691,33 @@ function Invoke-OfflineProtectedValueRemoval {
         The caller supplies a test rather than a comparison value, because "still set" for these
         markers means non-zero rather than merely present.
 
-        Returns an object with Removed, TookOwnership, Restored and Reason.
+        Both the plain remove and the owned remove run with -ErrorAction Stop. A refused remove is
+        caught and escalated rather than swallowed, so a value that only reads back as gone because
+        its key denies read is never mistaken for one that was removed, and success is reported only
+        once the value is verified gone. If taking ownership throws part way, the key's descriptor is
+        still put back, mirroring the write counterpart.
+
+        Assert-OfflineTarget runs before any remove, so a value whose key is not under the mounted
+        offline hive is refused before anything is attempted.
+
+    .PARAMETER OfflineRoot
+        Optional explicit mounted-hive key to validate $Path against, forwarded to the gate and the
+        ownership grant.
+
+    .OUTPUTS
+        [PSCustomObject] with Removed, TookOwnership, Restored and Reason.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][scriptblock]$StillSet
+        [Parameter(Mandatory = $true)][scriptblock]$StillSet,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
     )
+
+    # The gate before the plain remove below, which mutates: refuse a value whose key is not under
+    # the mounted offline hive before anything is attempted.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'remove the offline registry value from')
 
     $read = { (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).$Name }
 
@@ -523,26 +725,42 @@ function Invoke-OfflineProtectedValueRemoval {
         return [PSCustomObject]@{ Removed = $true; TookOwnership = $false; Restored = 0; Reason = 'The value was not set.' }
     }
 
-    Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
-    if (-not (& $StillSet (& $read))) {
+    # -ErrorAction Stop, not SilentlyContinue: a refused remove has to be told apart from a real
+    # one. An access-denied failure falls through to the ownership path; any other failure is the
+    # honest answer and is rethrown, exactly as the write counterpart does.
+    $deniedPlain = $false
+    try {
+        Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-OfflineRegistryAccessDenied -ErrorRecord $_) { $deniedPlain = $true }
+        else { throw }
+    }
+    if (-not $deniedPlain -and -not (& $StillSet (& $read))) {
         return [PSCustomObject]@{ Removed = $true; TookOwnership = $false; Restored = 0; Reason = 'Removed without changing any permission.' }
     }
 
     Add-OfflineRepairLog -Level Info -Message "$Name is protected by its key's ACL. Taking the key, removing the value, and putting the ACL back."
 
-    $captured = @()
-    try { $captured = @(Grant-OfflineRegistryKeyAccess -Path $Path -NoRecurse) }
+    $captured = [System.Collections.Generic.List[object]]::new()
+    try { [void](Grant-OfflineRegistryKeyAccess -Path $Path -NoRecurse -OfflineRoot $OfflineRoot -CapturedInto $captured) }
     catch {
-        return [PSCustomObject]@{ Removed = $false; TookOwnership = $false; Restored = 0; Reason = "Ownership could not be taken: $($_.Exception.Message)" }
+        # Ownership may have been taken on the key before the failure, so its descriptor is put back
+        # rather than left changed - the asymmetry the write counterpart already avoids.
+        $undone = Restore-OfflineRegistrySecurity -Captured $captured.ToArray()
+        return [PSCustomObject]@{ Removed = $false; TookOwnership = $true; Restored = $undone; Reason = "Ownership could not be taken: $($_.Exception.Message)" }
     }
 
+    $removed = $false
+    $failure = $null
     try {
-        Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction Stop
         $removed = -not (& $StillSet (& $read))
     }
+    catch { $failure = $_ }
     finally {
         # Always. The key is still here, so an unrestored descriptor is a permanent change.
-        $restored = Restore-OfflineRegistrySecurity -Captured $captured
+        $restored = Restore-OfflineRegistrySecurity -Captured $captured.ToArray()
     }
 
     return [PSCustomObject]@{
@@ -550,7 +768,7 @@ function Invoke-OfflineProtectedValueRemoval {
         TookOwnership = $true
         Restored      = $restored
         Reason        = $(if ($removed) { "Removed after taking the key. $restored descriptor(s) were put back." }
-                          else { "The value survived even after the key was taken. $restored descriptor(s) were put back." })
+                          else { "The value survived even after the key was taken$(if ($failure) { " ($($failure.Exception.Message))" }). $restored descriptor(s) were put back." })
     }
 }
 
@@ -570,6 +788,7 @@ function Test-OfflineRegistryAccessDenied {
         the caller, and then still fail.
     #>
     [CmdletBinding()]
+    [OutputType([bool])]
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
     $ex = $ErrorRecord.Exception
@@ -634,11 +853,18 @@ function Invoke-OfflineProtectedRegistryWrite {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][scriptblock]$Action,
-        [Parameter(Mandatory = $false)][string]$Description = 'the value'
+        [Parameter(Mandatory = $false)][string]$Description = 'the value',
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
     )
 
+    # The gate before the fast-path write below: even the plain attempt mutates the hive, so a key
+    # outside the mounted offline image must be refused before $Action runs at all.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'write to the offline registry key')
+
     try {
-        & $Action
+        # [void] so the caller scriptblock's own pipeline output cannot merge with and contaminate
+        # this function's returned result object.
+        [void](& $Action)
         return [PSCustomObject]@{ Written = $true; TookOwnership = $false; Restored = 0; Reason = 'Written without changing any permission.' }
     }
     catch {
@@ -653,24 +879,25 @@ function Invoke-OfflineProtectedRegistryWrite {
 
     Add-OfflineRepairLog -Level Info -Message "$guardPath is protected by its own ACL. Taking the key to write $Description, then putting the ACL back."
 
-    $captured = @()
-    try { $captured = @(Grant-OfflineRegistryKeyAccess -Path $guardPath -NoRecurse) }
+    $captured = [System.Collections.Generic.List[object]]::new()
+    try { [void](Grant-OfflineRegistryKeyAccess -Path $guardPath -NoRecurse -OfflineRoot $OfflineRoot -CapturedInto $captured) }
     catch {
-        [void](Restore-OfflineRegistrySecurity -Captured $captured)
+        [void](Restore-OfflineRegistrySecurity -Captured $captured.ToArray())
         return [PSCustomObject]@{ Written = $false; TookOwnership = $false; Restored = 0; Reason = "Ownership could not be taken: $($_.Exception.Message)" }
     }
 
     $written = $false
     $failure = $null
     try {
-        & $Action
+        # [void] so the caller scriptblock's own pipeline output cannot contaminate the result.
+        [void](& $Action)
         $written = $true
     }
     catch { $failure = $_ }
     finally {
         # Always. The key is still here, so an unrestored descriptor is a permanent change to a
         # system this script was only meant to borrow.
-        $restored = Restore-OfflineRegistrySecurity -Captured $captured
+        $restored = Restore-OfflineRegistrySecurity -Captured $captured.ToArray()
     }
 
     return [PSCustomObject]@{
@@ -698,12 +925,15 @@ function Get-OfflineProtectedRegistryValue {
         then writing a default over something it never looked at.
     #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Name',
+        Justification = 'Name is used, inside the $read scriptblock below. PSScriptAnalyzer does not look into a scriptblock assigned to a variable, so it cannot see the three uses there. Removing the parameter would break every caller.')]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $false)]$DefaultValue = $null,
         [Parameter(Mandatory = $false)][ref]$Found,
-        [Parameter(Mandatory = $false)][ref]$Denied
+        [Parameter(Mandatory = $false)][ref]$Denied,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
     )
 
     if ($Found) { $Found.Value = $false }
@@ -728,28 +958,48 @@ function Get-OfflineProtectedRegistryValue {
     $guardPath = Get-OfflineNearestExistingKey -Path $Path
     if (-not $guardPath) { return $DefaultValue }
 
-    $captured = @()
-    try { $captured = @(Grant-OfflineRegistryKeyAccess -Path $guardPath -NoRecurse) }
+    $captured = [System.Collections.Generic.List[object]]::new()
+    try { [void](Grant-OfflineRegistryKeyAccess -Path $guardPath -NoRecurse -OfflineRoot $OfflineRoot -CapturedInto $captured) }
     catch {
-        [void](Restore-OfflineRegistrySecurity -Captured $captured)
+        [void](Restore-OfflineRegistrySecurity -Captured $captured.ToArray())
         return $DefaultValue
     }
 
     try { return & $read }
     catch { return $DefaultValue }
-    finally { [void](Restore-OfflineRegistrySecurity -Captured $captured) }
+    finally { [void](Restore-OfflineRegistrySecurity -Captured $captured.ToArray()) }
 }
 
 function Get-OfflinePathSecurity {
     <#
     .SYNOPSIS
-        Capturing a file or folder's owner, group and DACL as SDDL.
+        Capturing a file or folder's owner, group and DACL as SDDL, and optionally in binary form.
+
+    .DESCRIPTION
+        Returns the descriptor as an SDDL string, which is the form the scenarios that consume this
+        capture expect. When -BinaryForm is supplied it is also set to the same descriptor's binary
+        form, which round-trips losslessly where an SDDL string can drop the protected (P) and
+        auto-inherited (AI) control flags and re-resolve machine-relative SIDs; the copy, rename and
+        delete paths in this file restore from that binary rather than from the SDDL.
+
+    .PARAMETER BinaryForm
+        Optional [ref] set to the descriptor's Owner+Group+DACL binary form ([byte[]]), or $null on
+        failure.
+
+    .OUTPUTS
+        [string] the descriptor in SDDL form, or $null.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][ref]$BinaryForm
+    )
 
+    if ($BinaryForm) { $BinaryForm.Value = $null }
     try {
-        return (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetSecurityDescriptorSddlForm($script:OfflineSecuritySection)
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($BinaryForm) { $BinaryForm.Value = $acl.GetSecurityDescriptorBinaryForm() }
+        return $acl.GetSecurityDescriptorSddlForm($script:OfflineSecuritySection)
     }
     catch { return $null }
 }
@@ -810,17 +1060,43 @@ function Grant-OfflinePathAccess {
     .DESCRIPTION
         Returns the captured SDDL, or $null when it could not be captured - in which case nothing
         is changed, because an object that cannot be handed back should not be taken.
+
+        Assert-OfflineTarget runs before any privilege is enabled, so a path outside the bound
+        offline root is refused before ownership is ever taken - a privileged take-and-modify can
+        only ever reach the offline image, never the rescue VM's own disk.
+
+        -CapturedBinary optionally receives the original descriptor in binary form, which the
+        internal copy, rename and delete paths replay in preference to the SDDL because it
+        round-trips losslessly where SDDL does not.
+
+    .PARAMETER OfflineRoot
+        Optional explicit offline root to validate $Path against instead of the bound root(s).
+
+    .PARAMETER CapturedBinary
+        Optional [ref] set to the original descriptor's binary form, for a lossless restore.
+
+    .OUTPUTS
+        [string] the captured descriptor in SDDL form, or $null.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = '',
+        [Parameter(Mandatory = $false)][ref]$CapturedBinary
+    )
+
+    # The gate before any privilege is enabled.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'take ownership of')
 
     Enable-OfflineOwnershipPrivilege
 
-    $original = Get-OfflinePathSecurity -Path $Path
+    $binary = $null
+    $original = Get-OfflinePathSecurity -Path $Path -BinaryForm ([ref]$binary)
     if (-not $original) {
         Add-OfflineRepairLog -Level Info -Message "Could not read the security descriptor of $Path, so its ownership was left alone."
         return $null
     }
+    if ($CapturedBinary) { $CapturedBinary.Value = $binary }
 
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $isDirectory = $item.PSIsContainer
@@ -861,33 +1137,86 @@ function Restore-OfflinePathSecurity {
         /remove:g shape - also drops the inherited and shipped ACEs alongside it, which is how
         WinSxS ends up quietly damaged by a repair that looked like it cleaned up after itself.
 
+        When -BinaryDescriptor is supplied it is replayed in preference to the SDDL, because a binary
+        descriptor round-trips losslessly where an SDDL string can drop the protected (P) and
+        auto-inherited (AI) control flags and re-resolve machine-relative aliases against the rescue
+        VM's own SIDs. The internal copy, rename and delete paths capture and pass it; external
+        callers that hold only the SDDL still get the SDDL replay.
+
+        A binary restore is verified: the descriptor is read back and compared (owner, DACL and
+        protection), and a restore that does not read back identically is reported and returns
+        $false rather than being counted as done.
+
         A missing path is not an error: the caller may legitimately offer both the original and
         the renamed path without knowing which one survived.
+
+    .PARAMETER BinaryDescriptor
+        Optional [byte[]] captured by Grant-OfflinePathAccess -CapturedBinary. Replayed and verified
+        in preference to -Sddl when present.
+
+    .PARAMETER OfflineRoot
+        Optional explicit offline root. Defaults to the root bound during disk discovery.
+        Forwarded to Assert-OfflineTarget.
+
+    .OUTPUTS
+        [bool] $true when the descriptor was written (and, for a binary restore, verified).
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [AllowEmptyString()][string]$Sddl = ''
+        [AllowEmptyString()][string]$Sddl = '',
+        [byte[]]$BinaryDescriptor,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
     )
 
-    if (-not $Sddl) { return $false }
+    $haveBinary = ($BinaryDescriptor -and $BinaryDescriptor.Length -gt 0)
+    if (-not $Sddl -and -not $haveBinary) { return $false }
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
 
-    Enable-OfflineOwnershipPrivilege
+    # Gated like every other privileged path, and for the same reason. Restoring is not inherently
+    # safe just because it puts something back: this enables SeTakeOwnershipPrivilege and then writes
+    # a descriptor that was captured from a DIFFERENT object, so a $Path that resolved to the rescue
+    # VM's own C: would have its owner and DACL replaced with the offline image's. The gate runs after
+    # the missing-path check, because a path that is not there is explicitly not an error here.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'restore the security descriptor of')
 
-    # Only the sections that actually differ are written. If ownership was never taken - because it
-    # was already ours - then replaying the owner would be a privileged write with no effect, and
-    # on a restricted account it would fail and take the DACL restore down with it.
-    $sections = $script:OfflineSecuritySection
-    $capturedOwner = Get-OfflineSddlOwner -Sddl $Sddl
-    if ($capturedOwner -and $capturedOwner -eq (Get-OfflineSddlOwner -Sddl (Get-OfflinePathSecurity -Path $Path))) {
-        $sections = 'Access'
-    }
+    Enable-OfflineOwnershipPrivilege
 
     try {
         $isDirectory = (Get-Item -LiteralPath $Path -Force).PSIsContainer
         $sd = if ($isDirectory) { [System.Security.AccessControl.DirectorySecurity]::new() } else { [System.Security.AccessControl.FileSecurity]::new() }
+
+        if ($haveBinary) {
+            # Only the sections that actually differ are written. If ownership was never taken -
+            # because it was already ours - replaying the owner would be a privileged write with no
+            # effect that fails on a restricted account and takes the DACL restore down with it.
+            $capturedOwner = Get-OfflineRawOwner -BinaryDescriptor $BinaryDescriptor
+            $currentBinary = $null
+            [void](Get-OfflinePathSecurity -Path $Path -BinaryForm ([ref]$currentBinary))
+            $sections = $script:OfflineSecuritySections
+            if ($capturedOwner -and $currentBinary -and ($capturedOwner -eq (Get-OfflineRawOwner -BinaryDescriptor $currentBinary))) {
+                $sections = [System.Security.AccessControl.AccessControlSections]::Access
+            }
+            $sd.SetSecurityDescriptorBinaryForm($BinaryDescriptor, $sections)
+            Save-OfflinePathSecurity -Path $Path -Security $sd -IsDirectory:$isDirectory
+
+            # Trust nothing: read the descriptor back and confirm it matches before calling it done.
+            $readBack = $null
+            [void](Get-OfflinePathSecurity -Path $Path -BinaryForm ([ref]$readBack))
+            if ($readBack -and (Test-OfflineDescriptorMatch -Captured $BinaryDescriptor -ReadBack $readBack)) {
+                return $true
+            }
+            Add-OfflineRepairLog -Level Warning -Message "The original ACL was written back to $Path but did not read back identically, so it cannot be counted as restored. Check it by hand with: icacls `"$Path`""
+            return $false
+        }
+
+        # SDDL fall-back for external callers that captured only the string form.
+        $sections = $script:OfflineSecuritySection
+        $capturedOwner = Get-OfflineSddlOwner -Sddl $Sddl
+        if ($capturedOwner -and $capturedOwner -eq (Get-OfflineSddlOwner -Sddl (Get-OfflinePathSecurity -Path $Path))) {
+            $sections = 'Access'
+        }
         $sd.SetSecurityDescriptorSddlForm($Sddl, $sections)
         Save-OfflinePathSecurity -Path $Path -Security $sd -IsDirectory:$isDirectory
         return $true
@@ -921,8 +1250,13 @@ function Rename-OfflineProtectedFile {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$NewName
+        [Parameter(Mandatory = $true)][string]$NewName,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
     )
+
+    # The gate before the plain rename below, which mutates: refuse a file that is not under the
+    # bound offline root before anything is attempted, even the plain first attempt.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'rename the offline file')
 
     # The existence check itself can be refused on a protected folder, which is a symptom of the
     # very problem this function exists to solve rather than a reason to give up. Only a clean
@@ -951,10 +1285,12 @@ function Rename-OfflineProtectedFile {
 
     $originalSddl = $null
     $fileSddl = $null
+    $parentBin = $null
+    $fileBin = $null
     $absent = $false
     $renamed = $false
     try {
-        $originalSddl = Grant-OfflinePathAccess -Path $parent
+        $originalSddl = Grant-OfflinePathAccess -Path $parent -OfflineRoot $OfflineRoot -CapturedBinary ([ref]$parentBin)
         if (-not $originalSddl) {
             return [PSCustomObject]@{ Renamed = $false; NewPath = ''; TookOwnership = $false; Restored = $false; Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError" }
         }
@@ -967,7 +1303,7 @@ function Rename-OfflineProtectedFile {
             $reason = 'The file was not present once the folder could be read.'
         }
         else {
-            $fileSddl = Grant-OfflinePathAccess -Path $Path
+            $fileSddl = Grant-OfflinePathAccess -Path $Path -OfflineRoot $OfflineRoot -CapturedBinary ([ref]$fileBin)
             Rename-Item -LiteralPath $Path -NewName $NewName -Force -ErrorAction Stop
             $renamed = $true
             $reason = 'Renamed after taking ownership of the file and its parent folder.'
@@ -979,11 +1315,12 @@ function Rename-OfflineProtectedFile {
     finally {
         # Always, on every path. Both objects were borrowed, not acquired. The file goes back
         # first, under whichever name it ended up with, while the parent still grants access to it.
+        # The binary capture is replayed and verified in preference to the SDDL.
         $restoredFile = $true
         if ($fileSddl) {
-            $restoredFile = Restore-OfflinePathSecurity -Path $(if ($renamed) { $target } else { $Path }) -Sddl $fileSddl
+            $restoredFile = Restore-OfflinePathSecurity -Path $(if ($renamed) { $target } else { $Path }) -Sddl $fileSddl -BinaryDescriptor $fileBin
         }
-        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $originalSddl) -and $restoredFile
+        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $originalSddl -BinaryDescriptor $parentBin) -and $restoredFile
     }
 
     return [PSCustomObject]@{
@@ -1048,7 +1385,14 @@ function Invoke-OfflineProtectedFileRemoval {
         Returns an object with Removed, TookOwnership, Restored and Reason.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
+    )
+
+    # The gate before the plain delete below, which mutates: refuse a file that is not under the
+    # bound offline root before anything is attempted, even the plain first attempt.
+    [void](Assert-OfflineTarget -Path $Path -OfflineRoot $OfflineRoot -Action 'delete the offline file')
 
     # A denied existence check is a symptom of the problem this function exists to solve, not an
     # answer. Only a clean "not there" counts as absent.
@@ -1075,10 +1419,12 @@ function Invoke-OfflineProtectedFileRemoval {
 
     $parentSddl = $null
     $fileSddl = $null
+    $parentBin = $null
+    $fileBin = $null
     $removed = $false
     $absent = $false
     try {
-        $parentSddl = Grant-OfflinePathAccess -Path $parent
+        $parentSddl = Grant-OfflinePathAccess -Path $parent -OfflineRoot $OfflineRoot -CapturedBinary ([ref]$parentBin)
         if (-not $parentSddl) {
             return [PSCustomObject]@{ Removed = $false; TookOwnership = $false; Restored = $false; Absent = $false; Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError" }
         }
@@ -1089,7 +1435,7 @@ function Invoke-OfflineProtectedFileRemoval {
             $reason = 'The file was not present once the folder could be read.'
         }
         else {
-            $fileSddl = Grant-OfflinePathAccess -Path $Path
+            $fileSddl = Grant-OfflinePathAccess -Path $Path -OfflineRoot $OfflineRoot -CapturedBinary ([ref]$fileBin)
             Clear-OfflineBlockingAttribute -Path $Path
             Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
             $removed = $true
@@ -1102,11 +1448,12 @@ function Invoke-OfflineProtectedFileRemoval {
     finally {
         # The file's descriptor is only restorable when the file survived. Restoring a path that was
         # successfully deleted would report false, which must not be read as a failure to hand back.
+        # The binary capture is replayed and verified in preference to the SDDL.
         $restoredFile = $true
         if ($fileSddl -and -not $removed) {
-            $restoredFile = Restore-OfflinePathSecurity -Path $Path -Sddl $fileSddl
+            $restoredFile = Restore-OfflinePathSecurity -Path $Path -Sddl $fileSddl -BinaryDescriptor $fileBin
         }
-        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $parentSddl) -and $restoredFile
+        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $parentSddl -BinaryDescriptor $parentBin) -and $restoredFile
     }
 
     return [PSCustomObject]@{
@@ -1143,8 +1490,14 @@ function Copy-OfflineProtectedFile {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot = ''
     )
+
+    # The gate is on the destination, which is what gets written: refuse a write whose target is
+    # not under the bound offline root before the plain copy below runs. The source is only read,
+    # so it may legitimately sit on the rescue VM (a staged replacement file).
+    [void](Assert-OfflineTarget -Path $Destination -OfflineRoot $OfflineRoot -Action 'write the offline file')
 
     if (-not (Test-Path -LiteralPath $Source)) {
         return [PSCustomObject]@{ Copied = $false; TookOwnership = $false; Restored = $false; Reason = "The source file $Source was not present." }
@@ -1169,10 +1522,12 @@ function Copy-OfflineProtectedFile {
 
     $parentSddl = $null
     $fileSddl = $null
+    $parentBin = $null
+    $fileBin = $null
     $copied = $false
     $reason = ''
     try {
-        $parentSddl = Grant-OfflinePathAccess -Path $parent
+        $parentSddl = Grant-OfflinePathAccess -Path $parent -OfflineRoot $OfflineRoot -CapturedBinary ([ref]$parentBin)
         if (-not $parentSddl) {
             return [PSCustomObject]@{ Copied = $false; TookOwnership = $false; Restored = $false; Reason = "The folder's security descriptor could not be read, so its ownership was left alone. Original error: $firstError" }
         }
@@ -1180,7 +1535,7 @@ function Copy-OfflineProtectedFile {
         # Re-checked now that the folder can actually be read: the first check ran against a folder
         # that may have been denying us, so its answer could not be trusted.
         if (Test-Path -LiteralPath $Destination) {
-            $fileSddl = Grant-OfflinePathAccess -Path $Destination
+            $fileSddl = Grant-OfflinePathAccess -Path $Destination -OfflineRoot $OfflineRoot -CapturedBinary ([ref]$fileBin)
             Clear-OfflineBlockingAttribute -Path $Destination
         }
 
@@ -1194,9 +1549,10 @@ function Copy-OfflineProtectedFile {
     finally {
         # The destination's own descriptor is replayed onto whatever now sits at that path, so a
         # freshly written file ends up owned by TrustedInstaller exactly as the one it replaced was.
+        # The binary capture is replayed and verified in preference to the SDDL.
         $restoredFile = $true
-        if ($fileSddl) { $restoredFile = Restore-OfflinePathSecurity -Path $Destination -Sddl $fileSddl }
-        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $parentSddl) -and $restoredFile
+        if ($fileSddl) { $restoredFile = Restore-OfflinePathSecurity -Path $Destination -Sddl $fileSddl -BinaryDescriptor $fileBin }
+        $restored = (Restore-OfflinePathSecurity -Path $parent -Sddl $parentSddl -BinaryDescriptor $parentBin) -and $restoredFile
     }
 
     return [PSCustomObject]@{
@@ -1206,568 +1562,3 @@ function Copy-OfflineProtectedFile {
         Reason        = $reason
     }
 }
-
-#region Privileged registry access
-# The functions above take ownership when a DACL refuses. The functions below never do: they open
-# the key with REG_OPTION_BACKUP_RESTORE while SeBackupPrivilege and SeRestorePrivilege are held,
-# which makes the kernel grant access on the strength of the privilege and skip the DACL check
-# entirely. Nothing about the key changes, so a detection pass cannot dirty a healthy machine.
-#
-# "Privileged" here means "opened by privilege rather than by permission". It has nothing to do
-# with Backup-OfflineHiveFile, which copies a hive file.
-#
-# Use these when a key denies read to everyone including SYSTEM - mpssvc's AppCs key is the known
-# example. Use the *-OfflineProtected* functions when the key is merely owned by TrustedInstaller.
-
-function Initialize-OfflinePrivilegedRegistryType {
-    <#
-    .SYNOPSIS
-        Compiling the registry P/Invoke used by the backup-restore path.
-
-    .DESCRIPTION
-        The .NET registry classes give no way to pass REG_OPTION_BACKUP_RESTORE, and the PowerShell
-        provider gives no way either, so the Win32 API is called directly.
-
-        RegCreateKeyEx is used rather than RegOpenKeyEx because the backup-restore option is only
-        honoured by RegCreateKeyEx. That function creates the key when it is absent, which would be
-        a write to a machine that may be healthy, so every open checks the disposition it returns
-        and removes anything it created before handing the handle back.
-    #>
-    [CmdletBinding()]
-    param()
-
-    if ('OfflinePrivilegedRegistry' -as [type]) { return }
-
-    Add-Type -TypeDefinition @"
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class OfflinePrivilegedRegistry
-{
-    const int REG_OPTION_BACKUP_RESTORE = 0x00000004;
-    const int REG_CREATED_NEW_KEY = 1;
-    const int KEY_READ = 0x20019;
-    const int KEY_WRITE = 0x20006;
-    const int ERROR_SUCCESS = 0;
-    const int ERROR_NO_MORE_ITEMS = 259;
-    const int ERROR_MORE_DATA = 234;
-    const int ERROR_ALREADY_EXISTS = 183;
-    static readonly IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegCreateKeyExW(IntPtr hKey, string lpSubKey, int Reserved, string lpClass,
-        int dwOptions, int samDesired, IntPtr lpSecurityAttributes, out IntPtr phkResult,
-        out int lpdwDisposition);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegDeleteKeyW(IntPtr hKey, string lpSubKey);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern int RegCloseKey(IntPtr hKey);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegEnumValueW(IntPtr hKey, int dwIndex, StringBuilder lpValueName,
-        ref int lpcchValueName, IntPtr lpReserved, IntPtr lpType, IntPtr lpData, IntPtr lpcbData);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegEnumKeyExW(IntPtr hKey, int dwIndex, StringBuilder lpName, ref int lpcchName,
-        IntPtr lpReserved, IntPtr lpClass, IntPtr lpcchClass, IntPtr lpftLastWriteTime);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegQueryValueExW(IntPtr hKey, string lpValueName, IntPtr lpReserved,
-        out int lpType, byte[] lpData, ref int lpcbData);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegDeleteValueW(IntPtr hKey, string lpValueName);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegSetValueExW(IntPtr hKey, string lpValueName, int Reserved, int dwType,
-        byte[] lpData, int cbData);
-
-    // Opens an existing key through the backup path. Never leaves a key behind that it created:
-    // if the disposition says the key was new, it is deleted again and the call reports failure,
-    // so a caller can treat a non-zero result as "not there" without having changed anything.
-    static int Open(string subKey, bool forWrite, out IntPtr handle)
-    {
-        handle = IntPtr.Zero;
-        int disposition;
-        int access = forWrite ? (KEY_READ | KEY_WRITE) : KEY_READ;
-        int rc = RegCreateKeyExW(HKLM, subKey, 0, null, REG_OPTION_BACKUP_RESTORE, access,
-                                 IntPtr.Zero, out handle, out disposition);
-        if (rc != ERROR_SUCCESS) { handle = IntPtr.Zero; return rc; }
-        if (disposition == REG_CREATED_NEW_KEY)
-        {
-            RegCloseKey(handle);
-            RegDeleteKeyW(HKLM, subKey);
-            handle = IntPtr.Zero;
-            return ERROR_ALREADY_EXISTS;
-        }
-        return ERROR_SUCCESS;
-    }
-
-    public static int KeyExists(string subKey, out bool exists)
-    {
-        exists = false;
-        IntPtr h;
-        int rc = Open(subKey, false, out h);
-        if (rc == ERROR_ALREADY_EXISTS) { return ERROR_SUCCESS; }
-        if (rc != ERROR_SUCCESS) { return rc; }
-        RegCloseKey(h);
-        exists = true;
-        return ERROR_SUCCESS;
-    }
-
-    // Deliberately creates the key when it is absent, and says which happened. Kept separate from
-    // Open on purpose: Open guarantees that reading or correcting a value never adds anything to a
-    // machine that may be healthy, so the one operation allowed to add has to be asked for by name.
-    public static int CreateKey(string subKey, out bool created)
-    {
-        created = false;
-        IntPtr h;
-        int disposition;
-        int rc = RegCreateKeyExW(HKLM, subKey, 0, null, REG_OPTION_BACKUP_RESTORE,
-                                 KEY_READ | KEY_WRITE, IntPtr.Zero, out h, out disposition);
-        if (rc != ERROR_SUCCESS) { return rc; }
-        created = (disposition == REG_CREATED_NEW_KEY);
-        RegCloseKey(h);
-        return ERROR_SUCCESS;
-    }
-
-    public static int SubKeyNames(string subKey, out string[] names)
-    {
-        names = new string[0];
-        IntPtr h;
-        int rc = Open(subKey, false, out h);
-        if (rc != ERROR_SUCCESS) { return rc; }
-        try
-        {
-            List<string> found = new List<string>();
-            for (int i = 0; ; i++)
-            {
-                StringBuilder sb = new StringBuilder(256);
-                int len = sb.Capacity;
-                int r = RegEnumKeyExW(h, i, sb, ref len, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-                if (r == ERROR_NO_MORE_ITEMS) { break; }
-                if (r != ERROR_SUCCESS) { return r; }
-                found.Add(sb.ToString());
-            }
-            names = found.ToArray();
-            return ERROR_SUCCESS;
-        }
-        finally { RegCloseKey(h); }
-    }
-
-    public static int ValueNames(string subKey, out string[] names)
-    {
-        names = new string[0];
-        IntPtr h;
-        int rc = Open(subKey, false, out h);
-        if (rc != ERROR_SUCCESS) { return rc; }
-        try
-        {
-            List<string> found = new List<string>();
-            for (int i = 0; ; i++)
-            {
-                // 16383 characters is the documented maximum length of a value name.
-                StringBuilder sb = new StringBuilder(16384);
-                int len = sb.Capacity;
-                int r = RegEnumValueW(h, i, sb, ref len, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-                if (r == ERROR_NO_MORE_ITEMS) { break; }
-                if (r != ERROR_SUCCESS) { return r; }
-                found.Add(sb.ToString());
-            }
-            names = found.ToArray();
-            return ERROR_SUCCESS;
-        }
-        finally { RegCloseKey(h); }
-    }
-
-    public static int GetValue(string subKey, string name, out int type, out byte[] data)
-    {
-        type = 0;
-        data = null;
-        IntPtr h;
-        int rc = Open(subKey, false, out h);
-        if (rc != ERROR_SUCCESS) { return rc; }
-        try
-        {
-            int size = 0;
-            int r = RegQueryValueExW(h, name, IntPtr.Zero, out type, null, ref size);
-            if (r != ERROR_SUCCESS && r != ERROR_MORE_DATA) { return r; }
-            byte[] buffer = new byte[size];
-            r = RegQueryValueExW(h, name, IntPtr.Zero, out type, buffer, ref size);
-            if (r != ERROR_SUCCESS) { return r; }
-            data = buffer;
-            return ERROR_SUCCESS;
-        }
-        finally { RegCloseKey(h); }
-    }
-
-    public static int DeleteValue(string subKey, string name)
-    {
-        IntPtr h;
-        int rc = Open(subKey, true, out h);
-        if (rc != ERROR_SUCCESS) { return rc; }
-        try { return RegDeleteValueW(h, name); }
-        finally { RegCloseKey(h); }
-    }
-
-    // The caller supplies the type as well as the bytes. The LSA policy database stores the
-    // logon-right mask as REG_NONE, and rewriting it as REG_BINARY or REG_DWORD changes the shape
-    // of the value even when the four bytes are identical, so the type is never inferred here.
-    public static int SetValue(string subKey, string name, int type, byte[] data)
-    {
-        IntPtr h;
-        int rc = Open(subKey, true, out h);
-        if (rc != ERROR_SUCCESS) { return rc; }
-        try { return RegSetValueExW(h, name, 0, type, data, data.Length); }
-        finally { RegCloseKey(h); }
-    }
-}
-"@
-}
-
-function Get-OfflinePrivilegedRegistryValueName {
-    <#
-    .SYNOPSIS
-        Listing the value names under a key that may deny read to every account, SYSTEM included.
-
-    .DESCRIPTION
-        Returns an object rather than a bare list, because "the key holds no values" and "the key
-        could not be opened" are different answers and must not be confused. Ok is $false only when
-        something went wrong; a key that is genuinely absent comes back Ok with Exists $false.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $result = [PSCustomObject]@{ Ok = $false; Exists = $false; Names = @(); Error = '' }
-
-    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
-    if (-not $subKey) {
-        $result.Error = "$Path is not a path under HKLM."
-        return $result
-    }
-
-    [void](Enable-OfflineBackupPrivilege)
-    Initialize-OfflinePrivilegedRegistryType
-
-    $exists = $false
-    $rc = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
-    if ($rc -ne 0) {
-        $result.Error = "The key could not be opened (error $rc)."
-        return $result
-    }
-    if (-not $exists) {
-        $result.Ok = $true
-        return $result
-    }
-
-    $names = $null
-    $rc = [OfflinePrivilegedRegistry]::ValueNames($subKey, [ref]$names)
-    if ($rc -ne 0) {
-        $result.Exists = $true
-        $result.Error = "The key opened but its values could not be listed (error $rc)."
-        return $result
-    }
-
-    $result.Ok = $true
-    $result.Exists = $true
-    $result.Names = @($names)
-    return $result
-}
-
-function Get-OfflinePrivilegedRegistrySubKeyName {
-    <#
-    .SYNOPSIS
-        Listing the subkeys of a key that may deny read to every account, SYSTEM included.
-
-    .DESCRIPTION
-        The counterpart of Get-OfflinePrivilegedRegistryValueName, for callers that have to walk a
-        protected tree rather than read one key. The offline SECURITY hive is the case that needs
-        it: Policy\Accounts holds one subkey per account that has been granted a logon right or a
-        privilege, and neither the provider nor the .NET registry classes can enumerate it.
-
-        As with the value-name listing, "the key has no subkeys" and "the key could not be opened"
-        are different answers. Ok is $false only when something went wrong; a key that is genuinely
-        absent comes back Ok with Exists $false.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $result = [PSCustomObject]@{ Ok = $false; Exists = $false; Names = @(); Error = '' }
-
-    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
-    if (-not $subKey) {
-        $result.Error = "$Path is not a path under HKLM."
-        return $result
-    }
-
-    [void](Enable-OfflineBackupPrivilege)
-    Initialize-OfflinePrivilegedRegistryType
-
-    $exists = $false
-    $rc = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
-    if ($rc -ne 0) {
-        $result.Error = "The key could not be opened (error $rc)."
-        return $result
-    }
-    if (-not $exists) {
-        $result.Ok = $true
-        return $result
-    }
-
-    $names = $null
-    $rc = [OfflinePrivilegedRegistry]::SubKeyNames($subKey, [ref]$names)
-    if ($rc -ne 0) {
-        $result.Exists = $true
-        $result.Error = "The key opened but its subkeys could not be listed (error $rc)."
-        return $result
-    }
-
-    $result.Ok = $true
-    $result.Exists = $true
-    $result.Names = @($names)
-    return $result
-}
-
-function Get-OfflinePrivilegedRegistryValue {
-    <#
-    .SYNOPSIS
-        Reading one value from a key that may deny read to every account, SYSTEM included.
-
-    .DESCRIPTION
-        Returns the raw bytes and the registry type alongside a decoded value. The type matters as
-        much as the content for a caller deciding whether the value is well formed, and a decoded
-        string array cannot report either the type or the true byte length.
-
-        Strings decodes REG_SZ, REG_EXPAND_SZ and REG_MULTI_SZ. Anything else is left to Bytes.
-
-        Name accepts an empty string, which is how the Win32 registry API names a key's default
-        (unnamed) value. Without AllowEmptyString the binder rejects the call before the function
-        runs, which is not a theoretical concern: the offline SECURITY hive keeps the logon-right
-        mask in the default value of Policy\Accounts\<SID>\ActSysAc, so that is the only way to
-        read it.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name
-    )
-
-    $result = [PSCustomObject]@{
-        Ok = $false; Found = $false; Type = 0; ByteLength = 0
-        Bytes = $null; Strings = @(); Error = ''
-    }
-
-    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
-    if (-not $subKey) {
-        $result.Error = "$Path is not a path under HKLM."
-        return $result
-    }
-
-    [void](Enable-OfflineBackupPrivilege)
-    Initialize-OfflinePrivilegedRegistryType
-
-    $type = 0
-    $bytes = $null
-    $rc = [OfflinePrivilegedRegistry]::GetValue($subKey, $Name, [ref]$type, [ref]$bytes)
-
-    # 2 is ERROR_FILE_NOT_FOUND, which the API returns both for a missing key and a missing value.
-    if ($rc -eq 2) {
-        $result.Ok = $true
-        return $result
-    }
-    if ($rc -ne 0) {
-        $result.Error = "$Name could not be read (error $rc)."
-        return $result
-    }
-
-    $result.Ok = $true
-    $result.Found = $true
-    $result.Type = $type
-    $result.Bytes = $bytes
-    $result.ByteLength = @($bytes).Count
-
-    # 1 REG_SZ, 2 REG_EXPAND_SZ, 7 REG_MULTI_SZ.
-    if ($type -in 1, 2, 7 -and $result.ByteLength -gt 1) {
-        $text = [System.Text.Encoding]::Unicode.GetString($bytes)
-        $result.Strings = @($text.Split([char]0) | Where-Object { $_.Length -gt 0 })
-    }
-
-    return $result
-}
-
-function Remove-OfflinePrivilegedRegistryValue {
-    <#
-    .SYNOPSIS
-        Removing one value from a key that may deny write to every account, SYSTEM included.
-
-    .DESCRIPTION
-        The key's owner and DACL are left exactly as they were found. Only the named value is
-        removed; the key itself and every other value under it survive.
-    #>
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Name
-    )
-
-    $result = [PSCustomObject]@{ Removed = $false; Error = '' }
-
-    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
-    if (-not $subKey) {
-        $result.Error = "$Path is not a path under HKLM."
-        return $result
-    }
-
-    if (-not $PSCmdlet.ShouldProcess("$Path\$Name", 'Remove registry value')) { return $result }
-
-    if (-not (Enable-OfflineBackupPrivilege)) {
-        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be opened for write.'
-        return $result
-    }
-    Initialize-OfflinePrivilegedRegistryType
-
-    $rc = [OfflinePrivilegedRegistry]::DeleteValue($subKey, $Name)
-    if ($rc -ne 0) {
-        $result.Error = "$Name could not be removed (error $rc)."
-        return $result
-    }
-
-    $result.Removed = $true
-    return $result
-}
-
-function New-OfflinePrivilegedRegistryKey {
-    <#
-    .SYNOPSIS
-        Creating a key under a hive that may deny write to every account, SYSTEM included.
-
-    .DESCRIPTION
-        Separate from Set-OfflinePrivilegedRegistryValue because creating a key is a different
-        promise from correcting a value. Everything else in this helper is built so that reading or
-        repairing cannot add anything to a machine that may be healthy; this is the one entry point
-        that adds, so a caller has to ask for it by name.
-
-        Reports whether the key was created or was already there, so a caller can tell a repair from
-        a no-op, and confirms the key is readable afterwards rather than trusting the return code.
-    #>
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $result = [PSCustomObject]@{ Ok = $false; Created = $false; Error = '' }
-
-    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
-    if (-not $subKey) {
-        $result.Error = "$Path is not a path under HKLM."
-        return $result
-    }
-
-    if (-not $PSCmdlet.ShouldProcess($Path, 'Create registry key')) { return $result }
-
-    if (-not (Enable-OfflineBackupPrivilege)) {
-        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be created.'
-        return $result
-    }
-    Initialize-OfflinePrivilegedRegistryType
-
-    $created = $false
-    $rc = [OfflinePrivilegedRegistry]::CreateKey($subKey, [ref]$created)
-    if ($rc -ne 0) {
-        $result.Error = "$Path could not be created (error $rc)."
-        return $result
-    }
-
-    $exists = $false
-    $check = [OfflinePrivilegedRegistry]::KeyExists($subKey, [ref]$exists)
-    if ($check -ne 0 -or -not $exists) {
-        $result.Error = "$Path does not read back as an existing key after being created."
-        return $result
-    }
-
-    $result.Created = $created
-    $result.Ok = $true
-    return $result
-}
-
-function Set-OfflinePrivilegedRegistryValue {
-    <#
-    .SYNOPSIS
-        Writing one value to a key that may deny write to every account, SYSTEM included.
-
-    .DESCRIPTION
-        The key's owner and DACL are left exactly as they were found: the write goes through the
-        backup-restore path rather than by granting anyone access, so nothing has to be put back
-        afterwards and a failure part way cannot leave the hive more permissive than it was.
-
-        Type is passed in rather than inferred. The offline SECURITY hive stores the logon-right
-        mask as REG_NONE (type 0), and writing the same four bytes back as REG_BINARY changes the
-        shape of the value even though the content matches.
-
-        Name accepts an empty string, which is how the Win32 registry API names a key's default
-        (unnamed) value - the only place the ActSysAc mask exists.
-
-        Bytes accepts an empty array for the same reason: a zero-length value is a real thing in
-        this hive. LSA leaves exactly one on each Policy\Accounts\<SID> key, so recreating an
-        account entry that matches what LSA itself writes has to be able to write nothing. A
-        mandatory [byte[]] rejects an empty array outright, which is why it is allowed explicitly.
-
-        The value is read back and compared byte for byte before success is reported. A silent
-        write failure on a protected hive would otherwise be indistinguishable from a repair.
-    #>
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name,
-        [Parameter(Mandatory = $true)][int]$Type,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes
-    )
-
-    $result = [PSCustomObject]@{ Written = $false; Error = '' }
-
-    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
-    if (-not $subKey) {
-        $result.Error = "$Path is not a path under HKLM."
-        return $result
-    }
-
-    if (-not $PSCmdlet.ShouldProcess("$Path\$Name", 'Set registry value')) { return $result }
-
-    if (-not (Enable-OfflineBackupPrivilege)) {
-        $result.Error = 'SeBackupPrivilege or SeRestorePrivilege could not be enabled, so the guarded key cannot be opened for write.'
-        return $result
-    }
-    Initialize-OfflinePrivilegedRegistryType
-
-    $rc = [OfflinePrivilegedRegistry]::SetValue($subKey, $Name, $Type, $Bytes)
-    if ($rc -ne 0) {
-        $result.Error = "$(if ([string]::IsNullOrEmpty($Name)) { 'the default value' } else { $Name }) could not be written (error $rc)."
-        return $result
-    }
-
-    $readBack = Get-OfflinePrivilegedRegistryValue -Path $Path -Name $Name
-    if (-not $readBack.Ok -or -not $readBack.Found) {
-        $result.Error = "$Name was written but could not be read back."
-        return $result
-    }
-    if ($readBack.Type -ne $Type) {
-        $result.Error = "$Name reads back as type $($readBack.Type) instead of $Type."
-        return $result
-    }
-    if (@($readBack.Bytes).Count -ne $Bytes.Count) {
-        $result.Error = "$Name reads back as $($readBack.ByteLength) byte(s) instead of $($Bytes.Count)."
-        return $result
-    }
-    for ($i = 0; $i -lt $Bytes.Count; $i++) {
-        if ($readBack.Bytes[$i] -ne $Bytes[$i]) {
-            $result.Error = "$Name reads back with different content at byte $i."
-            return $result
-        }
-    }
-
-    $result.Written = $true
-    return $result
-}
-#endregion

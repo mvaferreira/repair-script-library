@@ -208,6 +208,7 @@ Param(
 . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
 . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
 . .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
+. .\src\windows\common\helpers\Use-OfflinePrivilegedRegistry.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
