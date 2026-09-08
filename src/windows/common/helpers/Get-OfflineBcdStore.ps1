@@ -12,12 +12,29 @@
       Get-BcdStorePath          Build the store path for a boot drive and firmware generation.
       Test-BcdStorePath         Test whether a BCD store exists (handles Hidden+System stores).
       Get-BcdStoreItem          Return the FileInfo for a BCD store.
+      Assert-OfflineBcdStorePath Throw unless a store path is an offline store, not the rescue VM's.
+      Invoke-BcdEnum            Run a read-only bcdedit enumeration and report its exit code.
       Get-BcdInventory          Parse the whole store into a structured object.
       Get-BcdLoaderDetails      Parse a single loader entry.
       Get-BcdBootLoaderId       Resolve the identifier of the real (non-setup) OS loader.
       Get-BcdPreferredOsGuid    Resolve the preferred OS loader GUID.
       Backup-BcdStore           Copy the store before it is modified.
       Invoke-BcdEdit            Run a bcdedit command against the offline store.
+
+    Untrusted input
+    ---------------
+    Everything this file parses comes off the broken VM's disk, so every identifier,
+    device string and element name is attacker-controllable. Two consequences shape the
+    implementation:
+
+      * bcdedit is never invoked through a shell. Invoke-BcdEdit takes an argument
+        ARRAY and passes it to the executable directly, so a value such as
+        '{default} & format d:' is one literal argument to bcdedit rather than a second
+        command. A store parsed out of the broken disk therefore cannot execute code on
+        the rescue VM.
+      * The store path is validated before it is used, and a store on the rescue VM's own
+        system drive is rejected outright, so a degraded caller cannot rewrite the boot
+        configuration the rescue VM is currently running from.
 
 .NOTES
     Name:   Get-OfflineBcdStore.ps1
@@ -29,10 +46,94 @@
 
 .VERSION
     v1.0: Initial version.
+    v1.1: Invoke-BcdEdit no longer runs bcdedit through cmd.exe and takes -Arguments
+          (string[]) instead of a -Command string; store paths and boot drives are
+          validated and the rescue VM's own drive is rejected; bcdedit exit codes are
+          inspected on the read paths so an enumeration failure is no longer reported as
+          an empty store; Backup-BcdStore verifies the copy before reporting success.
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    try {
+        . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
+    }
+    catch {
+        throw "Get-OfflineBcdStore.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$PSScriptRoot': $($_.Exception.Message)"
+    }
+}
+
+function Assert-OfflineBcdStorePath {
+    <#
+    .SYNOPSIS
+        Throws unless a BCD store path is a plausible offline store outside the rescue VM's
+        own system drive.
+
+    .DESCRIPTION
+        The rescue VM boots from its own BCD store. Rewriting that store instead of the
+        broken VM's makes the rescue VM itself unbootable, which is unrecoverable without
+        a second rescue pass. Because the drive letter reaches this file from a chain of
+        upstream lookups that can degrade quietly, the check is made here, at the point of
+        use, rather than trusted from the caller.
+
+        Where the shared offline root is bound (Get-OfflineWindowsDisk does this), the
+        store must also fall under it. That covers the case where a store sits on some
+        third attached disk that is neither the rescue VM's nor the one being repaired.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$StorePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StorePath)) {
+        throw 'Refusing to run bcdedit: the store path is empty.'
+    }
+
+    if ($StorePath -notmatch '^[A-Za-z]:\\') {
+        throw "Refusing to run bcdedit against '$StorePath': it is not rooted on a drive, so it would resolve against the rescue VM's current directory."
+    }
+
+    $storeDrive = $StorePath.Substring(0, 2).ToUpperInvariant()
+    $rescueDrive = ''
+    if ($env:SystemDrive) { $rescueDrive = $env:SystemDrive.TrimEnd('\').ToUpperInvariant() }
+
+    if ($rescueDrive -and $storeDrive -eq $rescueDrive) {
+        throw "Refusing to run bcdedit against '$StorePath': it is on the rescue VM's own system drive ($rescueDrive). Modifying it would break the rescue VM's own boot configuration."
+    }
+
+    # Only enforced once a root is bound; some callers legitimately inspect a store before
+    # the offline volume has been selected.
+    if ((Get-Command Get-OfflineRepairRoot -ErrorAction SilentlyContinue) -and (Get-OfflineRepairRoot)) {
+        Assert-OfflineTarget -Path $StorePath -Action 'run bcdedit against'
+    }
+}
+
+function Invoke-BcdEnum {
+    <#
+    .SYNOPSIS
+        Runs a read-only bcdedit enumeration and reports whether it actually succeeded.
+
+    .DESCRIPTION
+        bcdedit writes its errors to stdout and returns a non-zero exit code. Merging the
+        streams and ignoring the code makes "the store could not be opened" indistinguishable
+        from "the store is empty", and an empty inventory is what makes a repair script decide
+        the store must be rebuilt. The exit code is therefore returned alongside the text so
+        callers can tell the two apart.
+
+    .OUTPUTS
+        PSCustomObject with Success, ExitCode and Text.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$StorePath,
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string[]]$Arguments
+    )
+
+    $raw = & bcdedit.exe /store $StorePath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+
+    return [PSCustomObject]@{
+        Success  = ($exitCode -eq 0)
+        ExitCode = $exitCode
+        Text     = ($raw -join "`n")
+    }
 }
 
 function Get-BcdStorePath {
@@ -42,10 +143,17 @@ function Get-BcdStorePath {
 
     .PARAMETER Generation
         1 for BIOS/MBR (Gen1), 2 for UEFI/GPT (Gen2).
+
+    .PARAMETER BootDrive
+        The drive holding the offline boot partition, for example 'D:'. Only a bare drive
+        root is accepted. An unvalidated value here is how a store path silently becomes
+        the rescue VM's own, so the pattern is enforced rather than trimmed into shape.
     #>
     param(
         [Parameter(Mandatory = $true)][ValidateSet(1, 2)][int]$Generation,
-        [Parameter(Mandatory = $true)][string]$BootDrive
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z]:\\?$')]
+        [string]$BootDrive
     )
 
     $BootDrive = $BootDrive.TrimEnd('\')
@@ -174,8 +282,15 @@ function Get-BcdInventory {
     .SYNOPSIS
         Returns a structured view of an offline BCD store.
 
+    .DESCRIPTION
+        EnumSucceeded distinguishes a store that genuinely has no loader entries from one
+        that could not be read at all. Callers that rebuild a store on the strength of an
+        empty inventory must check it, otherwise a locked or access-denied store looks
+        identical to an empty one and gets needlessly rebuilt.
+
     .OUTPUTS
-        PSCustomObject with StorePath, RawText, DefaultId, Timeout, DisplayBootMenu and Loaders.
+        PSCustomObject with StorePath, Exists, EnumSucceeded, EnumExitCode, RawText,
+        DefaultId, Timeout, DisplayBootMenu and Loaders.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$StorePath
@@ -183,6 +298,9 @@ function Get-BcdInventory {
 
     $inventory = [ordered]@{
         StorePath       = $StorePath
+        Exists          = $false
+        EnumSucceeded   = $false
+        EnumExitCode    = $null
         RawText         = ''
         DefaultId       = ''
         Timeout         = ''
@@ -194,8 +312,17 @@ function Get-BcdInventory {
         return [PSCustomObject]$inventory
     }
 
-    $raw = & bcdedit.exe /store $StorePath /enum all 2>&1
-    $inventory.RawText = ($raw -join "`n")
+    $inventory.Exists = $true
+
+    $enum = Invoke-BcdEnum -StorePath $StorePath -Arguments @('/enum', 'all')
+    $inventory.EnumSucceeded = $enum.Success
+    $inventory.EnumExitCode = $enum.ExitCode
+    $inventory.RawText = $enum.Text
+
+    if (-not $enum.Success) {
+        Add-OfflineRepairLog -Level Warning -Message "bcdedit could not enumerate $StorePath (exit $($enum.ExitCode)): $($enum.Text.Trim())"
+        return [PSCustomObject]$inventory
+    }
 
     $loaders = [System.Collections.Generic.List[PSCustomObject]]::new()
     foreach ($section in (Get-BcdTextSections -Text $inventory.RawText)) {
@@ -229,8 +356,13 @@ function Get-BcdLoaderDetails {
 
     if (-not (Test-BcdStorePath -StorePath $StorePath)) { return $null }
 
-    $raw = & bcdedit.exe /store $StorePath /enum $Identifier 2>&1
-    $text = ($raw -join "`n")
+    $enum = Invoke-BcdEnum -StorePath $StorePath -Arguments @('/enum', $Identifier)
+    if (-not $enum.Success) {
+        Add-OfflineRepairLog -Level Warning -Message "bcdedit could not enumerate $Identifier in $StorePath (exit $($enum.ExitCode))."
+        return $null
+    }
+
+    $text = $enum.Text
     if ([string]::IsNullOrWhiteSpace($text)) { return $null }
 
     $device = [regex]::Match($text, '(?im)^\s*device\s+(.+)$').Groups[1].Value.Trim()
@@ -335,9 +467,13 @@ function Get-BcdBootLoaderId {
     }
 
     if ([string]::IsNullOrWhiteSpace($identifier)) {
-        $rawEnum = & bcdedit.exe /store $StorePath /enum 2>&1
-        $enumText = ($rawEnum -join "`n")
-        $fallbackIdentifier = [regex]::Match($enumText, '(?is)Windows Boot Loader.*?^\s*identifier\s+([^\r\n]+)',
+        $enum = Invoke-BcdEnum -StorePath $StorePath -Arguments @('/enum')
+        if (-not $enum.Success) {
+            Add-OfflineRepairLog -Level Warning -Message "bcdedit could not enumerate $StorePath (exit $($enum.ExitCode)), so the boot loader identifier is unknown."
+            return $null
+        }
+
+        $fallbackIdentifier = [regex]::Match($enum.Text, '(?is)Windows Boot Loader.*?^\s*identifier\s+([^\r\n]+)',
             [System.Text.RegularExpressions.RegexOptions]::Multiline).Groups[1].Value.Trim()
 
         if (-not [string]::IsNullOrWhiteSpace($fallbackIdentifier)) { return $fallbackIdentifier }
@@ -354,6 +490,11 @@ function Backup-BcdStore {
     .SYNOPSIS
         Copies a BCD store before it is modified, so a failed repair can be reverted.
 
+    .DESCRIPTION
+        The copy is verified before success is reported. A backup that was never written
+        is worse than no backup at all, because the caller goes on to modify the store
+        believing it can roll back.
+
     .OUTPUTS
         The full path of the backup file.
     #>
@@ -363,8 +504,16 @@ function Backup-BcdStore {
 
     if (-not (Test-BcdStorePath -StorePath $StorePath)) { throw "BCD store not found at $StorePath." }
 
+    $source = Get-BcdStoreItem -StorePath $StorePath
     $backup = "$StorePath.bak-$(Get-Date -Format yyyyMMddHHmmss)"
-    Copy-Item -LiteralPath $StorePath -Destination $backup -Force
+    Copy-Item -LiteralPath $StorePath -Destination $backup -Force -ErrorAction Stop
+
+    $copy = Get-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    if (-not $copy) { throw "The BCD store backup was reported as written but $backup does not exist." }
+    if ($source -and $copy.Length -ne $source.Length) {
+        throw "The BCD store backup at $backup is $($copy.Length) bytes but the store is $($source.Length) bytes."
+    }
+
     Add-OfflineRepairLog -Level Info -Message "Backed up the BCD store to $backup"
     return $backup
 }
@@ -374,25 +523,44 @@ function Invoke-BcdEdit {
     .SYNOPSIS
         Runs a bcdedit command against an offline store and validates the exit code.
 
-    .PARAMETER Command
-        The bcdedit arguments that follow '/store <path>', for example:
-        '/set {default} recoveryenabled No'
+    .DESCRIPTION
+        bcdedit is invoked directly, never through cmd.exe, and the arguments are passed
+        as an array. Identifiers and element names reaching this function are parsed out
+        of the broken VM's own store, so they are untrusted: building a single command
+        line from them and handing it to a shell would let a crafted store run arbitrary
+        commands on the rescue VM as SYSTEM. Passing an array keeps each element a literal
+        argument to bcdedit no matter what it contains.
+
+        The store path is validated and a store on the rescue VM's own system drive is
+        refused, so a degraded caller cannot rewrite the boot configuration that the
+        rescue VM is running from.
+
+    .PARAMETER StorePath
+        Full path to the offline BCD store.
+
+    .PARAMETER Arguments
+        The bcdedit arguments that follow '/store <path>', one array element per argument.
 
     .OUTPUTS
         PSCustomObject with Success, ExitCode and Output.
 
     .EXAMPLE
-        Invoke-BcdEdit -StorePath $store -Command "/set $loaderId hypervisorlaunchtype Off"
+        Invoke-BcdEdit -StorePath $store -Arguments @('/set', $loaderId, 'hypervisorlaunchtype', 'Off')
     #>
     param(
         [Parameter(Mandatory = $true)][string]$StorePath,
-        [Parameter(Mandatory = $true)][string]$Command
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string[]]$Arguments
     )
 
-    $fullCmd = "bcdedit.exe /store `"$StorePath`" $Command"
-    Add-OfflineRepairLog -Level Info -Message "Running: $fullCmd"
+    Assert-OfflineBcdStorePath -StorePath $StorePath
 
-    $output = & cmd.exe /c $fullCmd 2>&1 | Out-String
+    if (-not (Test-BcdStorePath -StorePath $StorePath)) {
+        throw "Refusing to run bcdedit: no BCD store exists at $StorePath."
+    }
+
+    Add-OfflineRepairLog -Level Info -Message "Running: bcdedit.exe /store `"$StorePath`" $($Arguments -join ' ')"
+
+    $output = & bcdedit.exe /store $StorePath @Arguments 2>&1 | Out-String
     $exitCode = $LASTEXITCODE
     $trimmed = $output.Trim()
 

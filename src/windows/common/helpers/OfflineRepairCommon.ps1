@@ -27,16 +27,54 @@
     still advertise a stale access path), so Join-OfflinePath builds the string without
     resolving the drive and Test-OfflinePath answers false instead of throwing.
 
+    Offline target binding
+    ----------------------
+    These helpers run as SYSTEM on a rescue VM that has its own healthy Windows
+    installation attached at C:. Every destructive operation therefore has to prove it is
+    acting on the broken disk and not on the rescue VM, because a precondition that fails
+    quietly - a drive letter that was never assigned, a disk enumeration that returned
+    nothing - otherwise leaves a path that still resolves, just on the wrong volume.
+
+    Get-OfflineWindowsDisk calls Set-OfflineRepairRoot once it has chosen a volume, and
+    Use-OfflineRegistryHive registers each mount key it creates. Assert-OfflineTarget is
+    the single gate every writing function calls before it enables a privilege. It throws
+    when nothing is bound and when the path falls outside what is bound: it never warns
+    and never returns $false, because a caller that ignores a warning is exactly the
+    failure being prevented.
+
+    Shared state lives in $global: rather than $script:. A dot-sourced $script: variable
+    binds to the scope of whoever sourced the file, so a helper sourced from inside a
+    function would keep its own private buffer and its own private root list, and the gate
+    would be asserting against a set the caller never populated.
+
 .NOTES
     Name:   OfflineRepairCommon.ps1
     Requires: common/setup/init.ps1 to be dot-sourced first (for the Log-* functions).
 
 .VERSION
     v1.0: Initial version.
+    v1.1: Added the offline target binding gate. Moved shared state to $global:. Trust
+          reporting no longer infers a Microsoft signature from an unsigned version
+          resource.
 #>
 
-if (-not (Get-Variable -Name OfflineRepairLogBuffer -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:OfflineRepairLogBuffer = [System.Collections.Generic.List[object]]::new()
+function Get-OfflineRepairState {
+    <#
+    .SYNOPSIS
+        Returns the shared helper state, creating it on first use.
+
+    .DESCRIPTION
+        One hashtable in $global: holds the log buffer, the bound offline roots and the
+        registered hive mount keys. See the file header for why this is not $script:.
+    #>
+    if (-not $global:OfflineRepairState) {
+        $global:OfflineRepairState = @{
+            LogBuffer = [System.Collections.Generic.List[object]]::new()
+            Roots     = [System.Collections.Generic.List[string]]::new()
+            HiveKeys  = [System.Collections.Generic.List[string]]::new()
+        }
+    }
+    return $global:OfflineRepairState
 }
 
 function Add-OfflineRepairLog {
@@ -49,10 +87,7 @@ function Add-OfflineRepairLog {
         [Parameter(Mandatory = $false)][ValidateSet('Info', 'Warning', 'Error', 'Output')][string]$Level = 'Info'
     )
 
-    if (-not (Get-Variable -Name OfflineRepairLogBuffer -Scope Script -ErrorAction SilentlyContinue)) {
-        $script:OfflineRepairLogBuffer = [System.Collections.Generic.List[object]]::new()
-    }
-    [void]$script:OfflineRepairLogBuffer.Add([PSCustomObject]@{ Level = $Level; Message = $Message })
+    [void](Get-OfflineRepairState).LogBuffer.Add([PSCustomObject]@{ Level = $Level; Message = $Message })
 }
 
 function Write-OfflineRepairLog {
@@ -63,21 +98,35 @@ function Write-OfflineRepairLog {
     .DESCRIPTION
         Call this only at script level. It writes to the output stream, so calling it
         inside a function whose return value is used would corrupt that value.
+
+        Entries are written before the buffer is cleared, and the clear happens in a
+        finally block. Clearing first would discard everything still unwritten if a Log-*
+        call threw, which is exactly what happens when init.ps1 was not sourced - the run
+        would lose the diagnostics that explain why it failed. For that case the Log-*
+        functions are resolved once and fall back to Write-Output.
     #>
-    if (-not (Get-Variable -Name OfflineRepairLogBuffer -Scope Script -ErrorAction SilentlyContinue)) { return }
-    if ($script:OfflineRepairLogBuffer.Count -eq 0) { return }
+    $state = Get-OfflineRepairState
+    if ($state.LogBuffer.Count -eq 0) { return }
 
-    $entries = @($script:OfflineRepairLogBuffer)
-    $script:OfflineRepairLogBuffer.Clear()
+    $haveLogger = [bool](Get-Command -Name Log-Info -ErrorAction SilentlyContinue)
 
-    foreach ($entry in $entries) {
-        if ([string]::IsNullOrEmpty($entry.Message)) { continue }
-        switch ($entry.Level) {
-            'Warning' { Log-Warning $entry.Message }
-            'Error' { Log-Error $entry.Message }
-            'Output' { Log-Output $entry.Message }
-            default { Log-Info $entry.Message }
+    try {
+        foreach ($entry in $state.LogBuffer) {
+            if ([string]::IsNullOrEmpty($entry.Message)) { continue }
+            if (-not $haveLogger) {
+                Write-Output "[$($entry.Level)] $($entry.Message)"
+                continue
+            }
+            switch ($entry.Level) {
+                'Warning' { Log-Warning $entry.Message }
+                'Error' { Log-Error $entry.Message }
+                'Output' { Log-Output $entry.Message }
+                default { Log-Info $entry.Message }
+            }
         }
+    }
+    finally {
+        $state.LogBuffer.Clear()
     }
 }
 
@@ -86,8 +135,7 @@ function Get-OfflineRepairLog {
     .SYNOPSIS
         Returns the buffered messages without flushing them.
     #>
-    if (-not (Get-Variable -Name OfflineRepairLogBuffer -Scope Script -ErrorAction SilentlyContinue)) { return @() }
-    return @($script:OfflineRepairLogBuffer)
+    return @((Get-OfflineRepairState).LogBuffer)
 }
 
 function Clear-OfflineRepairLog {
@@ -95,10 +143,297 @@ function Clear-OfflineRepairLog {
     .SYNOPSIS
         Discards the buffered messages.
     #>
-    if (Get-Variable -Name OfflineRepairLogBuffer -Scope Script -ErrorAction SilentlyContinue) {
-        $script:OfflineRepairLogBuffer.Clear()
-    }
+    (Get-OfflineRepairState).LogBuffer.Clear()
 }
+
+#region Offline target binding
+
+$script:OfflineRootPattern = '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)$'
+
+function ConvertTo-OfflineComparablePath {
+    <#
+    .SYNOPSIS
+        Normalises a file system path for prefix comparison, or returns $null if it is unusable.
+
+    .DESCRIPTION
+        Comparison has to work on drives that are not mounted, so Resolve-Path and
+        GetFullPath are both unavailable. The normalisation is therefore textual:
+        forward slashes become backslashes, repeated separators collapse, and the
+        trailing separator is dropped.
+
+        A path containing a '..' segment returns $null rather than being canonicalised.
+        There is no reliable way to resolve it without the drive, and no offline repair
+        has a legitimate reason to use one, so it is treated as unusable input.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $normalised = $Path.Trim().Replace('/', '\')
+    if ($normalised.IndexOfAny([char[]]@("`0", "`r", "`n")) -ge 0) { return $null }
+
+    $isUnc = $normalised.StartsWith('\\')
+    $normalised = $normalised.TrimStart('\')
+    while ($normalised.Contains('\\')) { $normalised = $normalised.Replace('\\', '\') }
+    if ($isUnc) { $normalised = '\\' + $normalised }
+
+    foreach ($segment in $normalised.Split('\')) {
+        if ($segment -eq '..') { return $null }
+    }
+
+    $normalised = $normalised.TrimEnd('\')
+    if ([string]::IsNullOrWhiteSpace($normalised)) { return $null }
+    return $normalised
+}
+
+function ConvertTo-OfflineComparableRegistryPath {
+    <#
+    .SYNOPSIS
+        Normalises the several spellings of an HKLM path to 'HKLM\Subkey', or $null.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $normalised = $Path.Trim().Replace('/', '\')
+    $normalised = $normalised -replace '^(Microsoft\.PowerShell\.Core\\)?Registry::', ''
+    $normalised = $normalised -replace '^HKEY_LOCAL_MACHINE(?=\\|$)', 'HKLM'
+    $normalised = $normalised -replace '^HKLM:(?=\\|$)', 'HKLM'
+
+    while ($normalised.Contains('\\')) { $normalised = $normalised.Replace('\\', '\') }
+    foreach ($segment in $normalised.Split('\')) {
+        if ($segment -eq '..') { return $null }
+    }
+
+    $normalised = $normalised.TrimEnd('\')
+    if ($normalised -notmatch '^HKLM(\\|$)') { return $null }
+    return $normalised
+}
+
+function Test-OfflineRegistryPath {
+    <#
+    .SYNOPSIS
+        Reports whether a string is spelled as a registry path rather than a file path.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return [bool]($Path.Trim() -match '^((Microsoft\.PowerShell\.Core\\)?Registry::)?(HKLM:|HKLM\\|HKEY_LOCAL_MACHINE)')
+}
+
+function Test-OfflinePathUnderRoot {
+    <#
+    .SYNOPSIS
+        Reports whether a path is the given root or sits beneath it.
+
+    .DESCRIPTION
+        Prefix comparison appends the separator before testing, so 'D:' does not match
+        'DD:\x' and 'D:\Win' does not match 'D:\Windows'.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Root,
+        [Parameter(Mandatory = $false)][switch]$Registry
+    )
+
+    if ($Registry) {
+        $candidate = ConvertTo-OfflineComparableRegistryPath $Path
+        $prefix = ConvertTo-OfflineComparableRegistryPath $Root
+    }
+    else {
+        $candidate = ConvertTo-OfflineComparablePath $Path
+        $prefix = ConvertTo-OfflineComparablePath $Root
+    }
+
+    if (-not $candidate -or -not $prefix) { return $false }
+    if ($candidate.Equals($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return $candidate.StartsWith($prefix + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Set-OfflineRepairRoot {
+    <#
+    .SYNOPSIS
+        Binds an offline volume, so the writing helpers can prove what they are acting on.
+
+    .DESCRIPTION
+        Called by Get-OfflineWindowsDisk once it has chosen a volume. Refuses the rescue
+        VM's own system drive, because binding that would defeat the entire gate.
+
+    .PARAMETER Path
+        Volume root, for example 'D:' or 'D:\'. UNC roots are accepted as '\\server\share'.
+
+    .EXAMPLE
+        Set-OfflineRepairRoot -Path 'D:'
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path)
+
+    $normalised = ConvertTo-OfflineComparablePath $Path
+    if (-not $normalised -or $normalised -notmatch $script:OfflineRootPattern) {
+        throw "'$Path' is not a usable offline root. Expected a drive root such as 'D:' or a UNC share root."
+    }
+
+    $systemDrive = ConvertTo-OfflineComparablePath $env:SystemDrive
+    if ($systemDrive -and $normalised.Equals($systemDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to bind '$Path' as an offline root: it is the rescue VM's own system drive."
+    }
+
+    $state = Get-OfflineRepairState
+    if (-not ($state.Roots | Where-Object { $_.Equals($normalised, [System.StringComparison]::OrdinalIgnoreCase) })) {
+        [void]$state.Roots.Add($normalised)
+        Add-OfflineRepairLog -Level Info -Message "Bound offline repair root $normalised."
+    }
+    return $normalised
+}
+
+function Get-OfflineRepairRoot {
+    <#
+    .SYNOPSIS
+        Returns the bound offline roots, most recently bound first.
+    #>
+    $roots = @((Get-OfflineRepairState).Roots)
+    if ($roots.Count -eq 0) { return @() }
+    [array]::Reverse($roots)
+    return $roots
+}
+
+function Clear-OfflineRepairRoot {
+    <#
+    .SYNOPSIS
+        Releases every bound root and registered hive key.
+
+    .DESCRIPTION
+        For a caller's finally block and for tests. After this, Assert-OfflineTarget
+        throws for every path until something is bound again.
+    #>
+    $state = Get-OfflineRepairState
+    $state.Roots.Clear()
+    $state.HiveKeys.Clear()
+}
+
+function Register-OfflineHiveKey {
+    <#
+    .SYNOPSIS
+        Records a mount key as belonging to the offline image.
+
+    .PARAMETER Key
+        Mount key, for example 'HKLM\BROKEN_SYSTEM'.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Key)
+
+    $normalised = ConvertTo-OfflineComparableRegistryPath $Key
+    if (-not $normalised -or $normalised -eq 'HKLM') {
+        throw "'$Key' is not a usable offline hive mount key."
+    }
+
+    $state = Get-OfflineRepairState
+    if (-not ($state.HiveKeys | Where-Object { $_.Equals($normalised, [System.StringComparison]::OrdinalIgnoreCase) })) {
+        [void]$state.HiveKeys.Add($normalised)
+    }
+    return $normalised
+}
+
+function Unregister-OfflineHiveKey {
+    <#
+    .SYNOPSIS
+        Forgets a mount key once its hive has been unloaded.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Key)
+
+    $normalised = ConvertTo-OfflineComparableRegistryPath $Key
+    if (-not $normalised) { return }
+
+    $state = Get-OfflineRepairState
+    $existing = @($state.HiveKeys | Where-Object { $_.Equals($normalised, [System.StringComparison]::OrdinalIgnoreCase) })
+    foreach ($item in $existing) { [void]$state.HiveKeys.Remove($item) }
+}
+
+function Get-OfflineHiveKey {
+    <#
+    .SYNOPSIS
+        Returns the registered offline hive mount keys.
+    #>
+    return @((Get-OfflineRepairState).HiveKeys)
+}
+
+function Assert-OfflineTarget {
+    <#
+    .SYNOPSIS
+        Throws unless a path belongs to the offline image. The gate every writer calls.
+
+    .DESCRIPTION
+        Call this before enabling a privilege, taking ownership, writing, or deleting.
+
+        It throws rather than returning $false, and it throws when nothing has been bound
+        at all. A helper that silently declines to act on an unbound target would let a
+        repair report success having changed nothing, and a helper that returned $false
+        would depend on every caller checking - which is the failure mode this exists to
+        remove.
+
+    .PARAMETER Path
+        File system path or HKLM registry path to check.
+
+    .PARAMETER OfflineRoot
+        Optional explicit root to check against instead of the bound roots. Use when a
+        caller wants to be explicit rather than rely on what Get-OfflineWindowsDisk bound.
+
+    .PARAMETER Action
+        Short description of the operation, used in the exception message.
+
+    .EXAMPLE
+        Assert-OfflineTarget -Path $file -Action 'take ownership'
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $false)][string]$OfflineRoot,
+        [Parameter(Mandatory = $false)][string]$Action = 'modify'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Refusing to $Action an empty path."
+    }
+
+    if (Test-OfflineRegistryPath $Path) {
+        $normalised = ConvertTo-OfflineComparableRegistryPath $Path
+        if (-not $normalised) {
+            throw "Refusing to $Action '$Path': it is not a usable HKLM path."
+        }
+
+        $keys = if ($PSBoundParameters.ContainsKey('OfflineRoot') -and $OfflineRoot) { @($OfflineRoot) } else { @(Get-OfflineHiveKey) }
+        if ($keys.Count -eq 0) {
+            throw "Refusing to $Action '$Path': no offline hive is mounted, so this would act on the rescue VM's own registry."
+        }
+        foreach ($key in $keys) {
+            if (Test-OfflinePathUnderRoot -Path $normalised -Root $key -Registry) { return $normalised }
+        }
+        throw "Refusing to $Action '$Path': it is outside the mounted offline hive(s) $($keys -join ', ')."
+    }
+
+    $normalised = ConvertTo-OfflineComparablePath $Path
+    if (-not $normalised) {
+        throw "Refusing to $Action '$Path': it is not a usable path."
+    }
+    if ($normalised -notmatch '^([A-Za-z]:|\\\\)') {
+        throw "Refusing to $Action '$Path': it is not rooted on a drive, so it would resolve against the rescue VM's current directory."
+    }
+
+    # Belt and braces. Even a caller that somehow bound the wrong root cannot reach the
+    # rescue VM's own Windows directory through this gate.
+    $systemRoot = ConvertTo-OfflineComparablePath $env:SystemRoot
+    if ($systemRoot -and (Test-OfflinePathUnderRoot -Path $normalised -Root $systemRoot)) {
+        throw "Refusing to $Action '$Path': it is inside the rescue VM's own Windows directory."
+    }
+
+    $roots = if ($PSBoundParameters.ContainsKey('OfflineRoot') -and $OfflineRoot) { @($OfflineRoot) } else { @(Get-OfflineRepairRoot) }
+    if ($roots.Count -eq 0) {
+        throw "Refusing to $Action '$Path': no offline root is bound. Run Get-OfflineWindowsDisk first, or pass -OfflineRoot."
+    }
+    foreach ($root in $roots) {
+        if (Test-OfflinePathUnderRoot -Path $normalised -Root $root) { return $normalised }
+    }
+    throw "Refusing to $Action '$Path': it is outside the bound offline root(s) $($roots -join ', ')."
+}
+
+#endregion
 
 function Join-OfflinePath {
     <#
@@ -110,6 +445,10 @@ function Join-OfflinePath {
         letter that is not currently mounted. Offline repairs routinely build paths on
         letters that are being mounted, are already unmounted, or are stale entries left
         on a partition, so the join is done as plain string composition instead.
+
+        The root has to be a real volume root. A root of '\' would otherwise pass the
+        emptiness check and produce a root-relative path, which resolves against whatever
+        drive the rescue VM's current directory happens to be on.
 
     .PARAMETER Root
         Root of the path, with or without a trailing backslash. For example 'D:' or 'D:\'.
@@ -125,8 +464,9 @@ function Join-OfflinePath {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ChildPath
     )
 
-    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
-    $trimmedRoot = $Root.TrimEnd('\')
+    $trimmedRoot = ConvertTo-OfflineComparablePath $Root
+    if (-not $trimmedRoot -or $trimmedRoot -notmatch $script:OfflineRootPattern) { return $null }
+
     if ([string]::IsNullOrWhiteSpace($ChildPath)) { return "$trimmedRoot\" }
     return "$trimmedRoot\$($ChildPath.TrimStart('\'))"
 }
@@ -154,20 +494,36 @@ function Test-OfflinePath {
 function Test-OfflineFileSignature {
     <#
     .SYNOPSIS
-        Reports whether a binary on the offline disk is a trustworthy Microsoft file.
+        Reports what can actually be proven about a binary on the offline disk.
 
     .DESCRIPTION
         Authenticode alone is not enough offline. Most Windows inbox binaries are catalog
         signed, and the catalog store of the broken installation is not available to the
         rescue VM, so Get-AuthenticodeSignature reports NotSigned for perfectly good files.
-        Boot manager payloads are compressed stubs that are not parseable at all. The
-        version resource is therefore used as a fallback before a file is called untrusted.
+        Boot manager payloads are compressed stubs that are not parseable at all.
+
+        The version resource is used as a fallback, but it is unsigned data that any file
+        can carry, so it never sets IsMicrosoft. Two separate signals are returned instead:
+
+          IsMicrosoft        cryptographically proven - a valid Authenticode signature
+                             whose subject carries the Microsoft organisation RDN. Use
+                             this before trusting a binary enough to act on it.
+
+          IsLikelyMicrosoft  proven, or claimed by the version resource. Use this when a
+                             false negative is the more dangerous answer, for example when
+                             deciding which drivers to leave alone.
+
+          Confidence         High when Authenticode gave a definitive answer, Low when
+                             only the version resource was available, None when nothing
+                             could be established. A caller must not treat None as either
+                             trusted or untrusted - it means the file could not be checked.
 
     .PARAMETER FilePath
         Full path to the file on the offline disk.
 
     .OUTPUTS
-        PSCustomObject with Path, IsSigned, IsMicrosoft, Status and Subject.
+        PSCustomObject with Path, IsSigned, IsMicrosoft, IsLikelyMicrosoft, Confidence,
+        Status, Subject and VersionCompany.
 
     .EXAMPLE
         (Test-OfflineFileSignature -FilePath 'D:\Windows\System32\drivers\storvsc.sys').IsMicrosoft
@@ -177,11 +533,14 @@ function Test-OfflineFileSignature {
     )
 
     $result = [PSCustomObject]@{
-        Path        = $FilePath
-        IsSigned    = $false
-        IsMicrosoft = $false
-        Status      = 'FileNotFound'
-        Subject     = ''
+        Path              = $FilePath
+        IsSigned          = $false
+        IsMicrosoft       = $false
+        IsLikelyMicrosoft = $false
+        Confidence        = 'None'
+        Status            = 'FileNotFound'
+        Subject           = ''
+        VersionCompany    = ''
     }
 
     if (-not (Test-OfflinePath $FilePath)) { return $result }
@@ -201,25 +560,41 @@ function Test-OfflineFileSignature {
     $result.Status = [string]$signature.Status
     $result.Subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
 
+    $versionInfo = $item.VersionInfo
+    if ($versionInfo -and $versionInfo.CompanyName) { $result.VersionCompany = [string]$versionInfo.CompanyName }
+
     if ($signature.Status -eq 'Valid') {
         $result.IsSigned = $true
-        if ($result.Subject -match 'O=Microsoft Corporation') { $result.IsMicrosoft = $true }
+        $result.Confidence = 'High'
+        # Anchored on the RDN boundary. An unanchored match is satisfied by a subject that
+        # merely contains the text, for example CN=O=Microsoft Corporation, O=Somebody Else.
+        if ($result.Subject -match '(?:^|,)\s*O=Microsoft Corporation\s*(?:,|$)') {
+            $result.IsMicrosoft = $true
+            $result.IsLikelyMicrosoft = $true
+        }
         return $result
     }
 
-    $versionInfo = $item.VersionInfo
-    if ($versionInfo -and $versionInfo.CompanyName -match 'Microsoft') {
-        $result.IsSigned = $true
-        $result.IsMicrosoft = $true
-        $result.Status = 'CatalogSigned'
-        $result.Subject = $versionInfo.CompanyName
+    if ($signature.Status -in @('HashMismatch', 'NotTrusted')) {
+        # Authenticode answered, and the answer is that the file is bad.
+        $result.Confidence = 'High'
+        return $result
     }
-    elseif ($signature.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
+
+    if ($result.VersionCompany -match 'Microsoft') {
+        # Consistent with a catalog signed inbox binary whose catalog the rescue VM cannot
+        # see. Claimed, not proven, so IsMicrosoft stays false.
+        $result.Status = 'CatalogSigned'
+        $result.IsLikelyMicrosoft = $true
+        $result.Confidence = 'Low'
+        return $result
+    }
+
+    if ($signature.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
         # Not parseable by Authenticode and carrying no version resource, for example a
-        # compressed boot stub. Inconclusive rather than untrusted.
+        # compressed boot stub. Inconclusive: neither trusted nor untrusted.
         $result.Status = 'NotVerifiable'
-        $result.IsSigned = $true
-        $result.IsMicrosoft = $true
+        return $result
     }
 
     return $result

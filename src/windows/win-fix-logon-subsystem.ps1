@@ -193,6 +193,7 @@ function Resolve-LogonCommand {
         SignatureStatus = 'FileNotFound'
         IsSigned        = $false
         IsMicrosoft     = $false
+        IsLikelyMicrosoft = $false
         Reason          = $null
     }
 
@@ -258,6 +259,7 @@ function Resolve-LogonCommand {
         $result.SignatureStatus = $signature.Status
         $result.IsSigned = $signature.IsSigned
         $result.IsMicrosoft = $signature.IsMicrosoft
+        $result.IsLikelyMicrosoft = $signature.IsLikelyMicrosoft
 
         if (-not $result.Present) {
             $result.Reason = "the path is not a file: $candidate"
@@ -295,6 +297,14 @@ function Test-ResolutionIntegrity {
         All commands need a non-zero file and a readable SHA-256. Required Windows executables also
         have to be identified as Microsoft by Test-OfflineFileSignature. Optional third-party
         commands need a valid signature to pass this check, but a failed check is report-only.
+
+        The Microsoft test uses IsLikelyMicrosoft rather than IsMicrosoft, because the status
+        gate on the line above has already excluded everything Authenticode rejected. What
+        remains is either cryptographically valid or catalog signed, and a catalog signed
+        inbox binary cannot be proven from the rescue VM: the catalogs that would verify
+        winlogon.exe and lsass.exe live on the offline image and are not registered here.
+        Requiring cryptographic proof at this point would reject every healthy offline
+        binary and make the scenario refuse to repair anything.
     #>
     param(
         [Parameter(Mandatory = $false)]$Resolution,
@@ -304,8 +314,8 @@ function Test-ResolutionIntegrity {
     if ($null -eq $Resolution -or -not $Resolution.Exists) { return $false }
     if ($Resolution.Length -le 0 -or "$($Resolution.SHA256)" -notmatch '^[A-Fa-f0-9]{64}$') { return $false }
     if ($Resolution.SignatureStatus -notin @('Valid', 'CatalogSigned')) { return $false }
-    if ($RequireMicrosoft) { return [bool]$Resolution.IsMicrosoft }
-    return [bool]$Resolution.IsSigned
+    if ($RequireMicrosoft) { return [bool]$Resolution.IsLikelyMicrosoft }
+    return [bool]($Resolution.IsSigned -or $Resolution.SignatureStatus -eq 'CatalogSigned')
 }
 
 function Get-WindowsSubsystemValueState {

@@ -163,8 +163,13 @@ function Get-BootStorageDriverFinding {
             if (-not $spec.Required) { continue }
 
             $signature = Test-OfflineFileSignature -FilePath $binaryPath
-            $canRecreate = $spec.CanRecreate -and $signature.IsMicrosoft
-            $reason = if ($signature.IsMicrosoft) { '' } elseif ($spec.CanRecreate) { " (driver binary is $($signature.Status), cannot rebuild the key from it)" } else { ' (this key carries image-specific state and is not safe to rebuild)' }
+            # IsLikelyMicrosoft, not IsMicrosoft. Driver binaries on an offline image are
+            # catalog signed, and the catalogs that would verify them are on that image
+            # rather than registered on the rescue VM, so cryptographic proof is normally
+            # unavailable. Requiring it here would make the scenario decline to rebuild a
+            # service key for a perfectly healthy inbox driver.
+            $canRecreate = $spec.CanRecreate -and $signature.IsLikelyMicrosoft
+            $reason = if ($signature.IsLikelyMicrosoft) { '' } elseif ($spec.CanRecreate) { " (driver binary is $($signature.Status), cannot rebuild the key from it)" } else { ' (this key carries image-specific state and is not safe to rebuild)' }
 
             [void]$findings.Add((New-Finding -Cause 'DriverServiceKey' -Item $spec.Name `
                         -Message "$($spec.Name) service key is missing, so the $($spec.Description) cannot take part in boot storage enumeration$reason" `

@@ -250,10 +250,26 @@ function Get-BootManagerFinding {
                     -Message "The boot manager binary is zero length: $($Expected.BootMgrFile)." `
                     -Tier 'Rebuild'))
     }
-    elseif (-not $signature.IsMicrosoft) {
+    elseif ($signature.Confidence -eq 'High' -and -not $signature.IsMicrosoft) {
+        # Authenticode answered definitively and the answer was bad: an invalid signature, a
+        # hash mismatch, or a valid signature belonging to someone other than Microsoft. That
+        # is real evidence of a damaged or replaced boot manager, so it escalates to Rebuild.
         [void]$findings.Add((New-Finding -Cause 'BootManagerBinary' -Item $Expected.BootMgrFile `
                     -Message "The boot manager binary is not a Microsoft file (status $($signature.Status)): $($Expected.BootMgrFile)." `
                     -Tier 'Rebuild'))
+    }
+    elseif (-not $signature.IsLikelyMicrosoft) {
+        # No cryptographic answer and the file does not identify itself as Microsoft either.
+        [void]$findings.Add((New-Finding -Cause 'BootManagerBinary' -Item $Expected.BootMgrFile `
+                    -Message "The boot manager binary could not be identified as a Microsoft file (status $($signature.Status)): $($Expected.BootMgrFile)." `
+                    -Tier 'Rebuild'))
+    }
+    elseif ($signature.Confidence -ne 'High') {
+        # The binary says it is Microsoft but nothing proved it. This is the ordinary result
+        # for a catalog signed inbox binary, because the catalogs that would verify it live on
+        # the offline image and are not registered on the rescue VM. Rebuilding the store on
+        # that signal alone would fire on healthy VMs, so it is reported and nothing more.
+        Add-OfflineRepairLog -Level Warning -Message "The boot manager binary at $($Expected.BootMgrFile) reports itself as Microsoft but could not be cryptographically verified (status $($signature.Status)). Continuing, because an offline image's catalogs are not available to the rescue VM."
     }
     else {
         Add-OfflineRepairLog -Level Info -Message "Boot manager binary present: $($Expected.BootMgrFile) ($($signature.Status))."
@@ -555,20 +571,20 @@ function Invoke-TargetedBcdRepair {
 
         switch ($finding.Cause) {
             'BcdDefaultEntry' {
-                $command = "/set {bootmgr} default $($finding.Data)"
+                $command = @('/set', '{bootmgr}', 'default', [string]$finding.Data)
             }
             'BcdImcHive' {
                 # Handled by the sweep below, which covers {bootmgr} and every loader entry.
                 $command = $null
             }
             { $_ -in @('BcdLoaderValue', 'BcdBootManagerValue') } {
-                $command = "/set $($finding.Data.Identifier) $($finding.Data.Value) $($finding.Data.Expected)"
+                $command = @('/set', [string]$finding.Data.Identifier, [string]$finding.Data.Value, [string]$finding.Data.Expected)
             }
         }
 
         if (-not $command) { continue }
 
-        $result = Invoke-BcdEdit -StorePath $StorePath -Command $command
+        $result = Invoke-BcdEdit -StorePath $StorePath -Arguments $command
         if ($result.Success) {
             $finding.Repaired = $true
             Add-OfflineRepairLog -Level Info -Message "Repaired $($finding.Cause) / $($finding.Item)."
@@ -592,7 +608,7 @@ function Invoke-TargetedBcdRepair {
                 if ($section.Body -notmatch '(?im)^\s*identifier\s+(\S+)') { continue }
                 $target = $Matches[1]
 
-                $sweep = Invoke-BcdEdit -StorePath $StorePath -Command "/deletevalue $target $($imcFinding.Data)"
+                $sweep = Invoke-BcdEdit -StorePath $StorePath -Arguments @('/deletevalue', [string]$target, [string]$imcFinding.Data)
                 if ($sweep.Success) {
                     $cleared++
                     Add-OfflineRepairLog -Level Info -Message "Cleared $($imcFinding.Data) from $target."
@@ -704,20 +720,20 @@ function Set-AzureSerialConsoleSetting {
     }
 
     $commands = @(
-        "/set {bootmgr} default $loaderId",
-        "/set {bootmgr} displaybootmenu yes",
-        "/set {bootmgr} timeout 5",
-        "/set {bootmgr} bootems yes",
-        "/set $loaderId recoveryenabled No",
-        "/set $loaderId bootstatuspolicy IgnoreAllFailures",
-        "/ems $loaderId on",
-        "/emssettings EMSPORT:1 EMSBAUDRATE:115200"
+        , @('/set', '{bootmgr}', 'default', [string]$loaderId)
+        , @('/set', '{bootmgr}', 'displaybootmenu', 'yes')
+        , @('/set', '{bootmgr}', 'timeout', '5')
+        , @('/set', '{bootmgr}', 'bootems', 'yes')
+        , @('/set', [string]$loaderId, 'recoveryenabled', 'No')
+        , @('/set', [string]$loaderId, 'bootstatuspolicy', 'IgnoreAllFailures')
+        , @('/ems', [string]$loaderId, 'on')
+        , @('/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200')
     )
 
     foreach ($command in $commands) {
-        $result = Invoke-BcdEdit -StorePath $StorePath -Command $command
+        $result = Invoke-BcdEdit -StorePath $StorePath -Arguments $command
         if (-not $result.Success) {
-            Add-OfflineRepairLog -Level Warning -Message "Azure boot setting '$command' returned exit code $($result.ExitCode)."
+            Add-OfflineRepairLog -Level Warning -Message "Azure boot setting '$($command -join ' ')' returned exit code $($result.ExitCode)."
         }
     }
     Add-OfflineRepairLog -Level Info -Message 'Applied the Azure serial console and boot policy settings to the rebuilt store.'
