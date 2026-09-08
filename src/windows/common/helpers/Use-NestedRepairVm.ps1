@@ -399,6 +399,8 @@ function Start-NestedRepairVm {
     .OUTPUTS
         PSCustomObject with Started, AlreadyRunning, State, DisksOffline, DisksAttached and Reason.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
     param(
         [Parameter(Mandatory = $true)][AllowNull()]$Vm,
         [Parameter(Mandatory = $false)][int[]]$DiskNumber = @()
@@ -452,6 +454,22 @@ function Start-NestedRepairVm {
 
         $result.Started = $true
         Add-OfflineRepairLog -Level Info -Message "Nested guest '$($current.Name)' is already running with the requested disk(s) attached."
+        return $result
+    }
+
+    # Everything from here takes disks offline on the host, so this is where -WhatIf has to stop.
+    # It returns the same shape every other exit path returns, with Started left $false, so a preview
+    # run can never be mistaken by the caller for a guest that is actually up on the repaired disk.
+    $requestedDisks = @($DiskNumber | Sort-Object -Unique)
+    $whatIfTarget = if ($requestedDisks.Count -gt 0) {
+        "nested guest '$($current.Name)' with host disk(s) $($requestedDisks -join ', ')"
+    }
+    else {
+        "nested guest '$($current.Name)'"
+    }
+    if (-not $PSCmdlet.ShouldProcess($whatIfTarget, 'Take the disk(s) offline on the host, attach them and start the guest')) {
+        $result.State = "$($current.State)"
+        $result.Reason = 'the guest was not started because -WhatIf was specified'
         return $result
     }
 
@@ -765,6 +783,8 @@ function Stop-NestedRepairVmGraceful {
     .OUTPUTS
         An object with Stopped, Graceful, WaitedSeconds, State and Reason.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
     param(
         [Parameter(Mandatory = $true)][AllowNull()]$Vm,
         [int]$TimeoutSeconds = 180,
@@ -803,6 +823,14 @@ function Stop-NestedRepairVmGraceful {
         $result.State = 'Off'
         $result.Reason = "the nested guest '$name' was already off, so it is not known whether it shut down cleanly"
         Add-OfflineRepairLog -Level Info -Message $result.Reason
+        return $result
+    }
+
+    # The shutdown request is the first thing that changes state, so -WhatIf stops here. Stopped stays
+    # $false, which is what the caller already treats as "the guest is still running".
+    if (-not $PSCmdlet.ShouldProcess("nested guest '$name'", 'Request a clean shutdown, turning it off only if it does not comply')) {
+        $result.State = [string]$current.State
+        $result.Reason = 'the guest was not stopped because -WhatIf was specified'
         return $result
     }
 
