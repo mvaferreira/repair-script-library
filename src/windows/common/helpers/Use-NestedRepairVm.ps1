@@ -74,6 +74,21 @@
             - Guests are resolved by Id, not by a name Get-VM treats as a wildcard; vmms must be running.
 #>
 
+# Resolve the offline-repair core against this file's own folder, so a scenario loads the same
+# helper wherever it dot-sources this from, and fail loudly here rather than at the first log call.
+if (-not (Get-Command -Name Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+    $dependencyPath = Join-Path -Path $PSScriptRoot -ChildPath 'OfflineRepairCommon.ps1'
+    try {
+        . $dependencyPath
+    }
+    catch {
+        throw "Use-NestedRepairVm.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$dependencyPath': $($_.Exception.Message)"
+    }
+}
+if (-not (Get-Command -Name Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+    throw "Use-NestedRepairVm.ps1 requires 'Add-OfflineRepairLog', which OfflineRepairCommon.ps1 did not define."
+}
+
 # The name 'az vm repair create --enable-nested' gives the guest it builds.
 $script:NestedRepairVmDefaultName = 'ProblemVM'
 

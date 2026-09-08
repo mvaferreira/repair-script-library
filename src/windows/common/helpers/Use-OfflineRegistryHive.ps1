@@ -48,7 +48,12 @@
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    try {
+        . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
+    }
+    catch {
+        throw "Use-OfflineRegistryHive.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$PSScriptRoot': $($_.Exception.Message)"
+    }
 }
 
 # Drive letter of the offline Windows installation, normally set by Get-OfflineWindowsDisk.ps1.

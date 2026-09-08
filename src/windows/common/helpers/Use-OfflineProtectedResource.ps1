@@ -74,6 +74,26 @@ $script:OfflineSecuritySections = [System.Security.AccessControl.AccessControlSe
     [System.Security.AccessControl.AccessControlSections]::Group -bor
     [System.Security.AccessControl.AccessControlSections]::Access
 
+# Resolve the offline-repair core against this file's own folder, so a scenario loads the same
+# helper wherever it dot-sources this from, and fail loudly here rather than at the first
+# privileged call. Assert-OfflineTarget is the gate every ownership path in this file depends on:
+# discovering it is missing halfway through taking ownership of a key is far worse than refusing
+# to load.
+if (-not (Get-Command -Name Assert-OfflineTarget -ErrorAction SilentlyContinue)) {
+    $dependencyPath = Join-Path -Path $PSScriptRoot -ChildPath 'OfflineRepairCommon.ps1'
+    try {
+        . $dependencyPath
+    }
+    catch {
+        throw "Use-OfflineProtectedResource.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$dependencyPath': $($_.Exception.Message)"
+    }
+}
+foreach ($required in @('Assert-OfflineTarget', 'Add-OfflineRepairLog')) {
+    if (-not (Get-Command -Name $required -ErrorAction SilentlyContinue)) {
+        throw "Use-OfflineProtectedResource.ps1 requires '$required', which OfflineRepairCommon.ps1 did not define."
+    }
+}
+
 function Initialize-OfflinePrivilegeType {
     <#
     .SYNOPSIS

@@ -83,6 +83,32 @@
     v1.0: Initial version.
 #>
 
+# Resolve every sibling against this file's own folder, so a scenario loads the same helpers
+# wherever it dot-sources this from, and fail loudly here rather than part-way through a
+# destructive removal. This file deletes files on the offline image and rolls them back, so a
+# missing Copy-OfflineProtectedFile or Assert-OfflineTarget discovered mid-run is the worst case.
+$script:OfflineFileRemovalDependencies = @(
+    @{ File = 'OfflineRepairCommon.ps1';          Sentinel = 'Assert-OfflineTarget' },
+    @{ File = 'Use-OfflineProtectedResource.ps1'; Sentinel = 'Copy-OfflineProtectedFile' },
+    @{ File = 'Use-OfflineRegistryHive.ps1';      Sentinel = 'Test-OfflineHiveFile' }
+)
+foreach ($dependency in $script:OfflineFileRemovalDependencies) {
+    if (Get-Command -Name $dependency.Sentinel -ErrorAction SilentlyContinue) { continue }
+    $dependencyPath = Join-Path -Path $PSScriptRoot -ChildPath $dependency.File
+    try {
+        . $dependencyPath
+    }
+    catch {
+        throw "Use-OfflineFileRemoval.ps1 could not load its dependency '$($dependency.File)' from '$dependencyPath': $($_.Exception.Message)"
+    }
+}
+foreach ($required in @('Assert-OfflineTarget', 'Add-OfflineRepairLog', 'Copy-OfflineProtectedFile',
+        'Invoke-OfflineProtectedFileRemoval', 'Save-OfflinePathSecurity', 'Test-OfflineHiveFile')) {
+    if (-not (Get-Command -Name $required -ErrorAction SilentlyContinue)) {
+        throw "Use-OfflineFileRemoval.ps1 requires '$required', which its dependencies did not define."
+    }
+}
+
 function Get-OfflineFileHashValue {
     <#
     .SYNOPSIS

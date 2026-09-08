@@ -61,7 +61,12 @@
 #>
 
 if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    try {
+        . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
+    }
+    catch {
+        throw "Get-OfflineWindowsDisk.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$PSScriptRoot': $($_.Exception.Message)"
+    }
 }
 
 # QueryDosDevice reads the NT object namespace, which is the only place a drive letter
