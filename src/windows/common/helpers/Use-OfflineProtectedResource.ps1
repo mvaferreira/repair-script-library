@@ -17,10 +17,12 @@
 
       1. The original descriptor is captured first, including owner and group. Registry keys, and
          this file's own copy, rename and delete paths, capture it in BINARY form, which round-trips
-         losslessly where an SDDL string can silently drop the protected-DACL (P) and auto-inherited
-         (AI) control flags and re-resolve machine-relative aliases (LA, DA, DU, DC) against the
-         rescue VM's own SIDs. An SDDL capture is still offered for the scenarios that consume it as
-         a string.
+         losslessly where an SDDL string re-resolves machine-relative aliases (LA, DA, DU, DC)
+         against the rescue VM's own SIDs. Measured: LA came back as the rescue VM's own local
+         administrator rather than the offline image's, and DA, DU and DC could not be parsed at all
+         on a workgroup machine - the alias needs a domain to resolve against, which a rescue VM
+         does not have. An SDDL capture is still offered for the scenarios that consume it as a
+         string.
 
       2. Ownership is taken, and only then is an access rule added - a DACL cannot be written by
          an account that does not own the object.
@@ -69,7 +71,7 @@ $script:OfflineSecuritySection = 'Owner,Group,Access'
 
 # The same three sections as the enum the binary security APIs take. Binary capture and replay is
 # used wherever this file restores its own descriptors, because it is lossless where the SDDL string
-# above is not: SDDL re-resolves machine-relative aliases and can drop the P/AI control flags.
+# above is not: SDDL re-resolves machine-relative aliases against whatever machine parses it.
 $script:OfflineSecuritySections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
     [System.Security.AccessControl.AccessControlSections]::Group -bor
     [System.Security.AccessControl.AccessControlSections]::Access
@@ -339,9 +341,10 @@ function Get-OfflineRegistryKeySecurity {
         Returns the descriptor as a byte array, or $null when it cannot be read. Binary is used
         rather than SDDL because a descriptor captured on the rescue VM and replayed against an
         offline hive has to survive the round-trip exactly: an SDDL string re-resolves the
-        machine-relative aliases (LA, DA, DU, DC) against the rescue VM's own SIDs and can drop the
-        protected (P) and auto-inherited (AI) control flags when it is parsed on another machine.
-        The binary form carries the raw SIDs and the exact control bits, so none of that happens.
+        machine-relative aliases (LA, DA, DU, DC) against the machine that parses it. Measured on a
+        workgroup host, LA silently became that host's own administrator SID, and DA, DU and DC
+        threw outright because there is no domain to resolve them against. The binary form carries
+        the raw SIDs and the exact control bits, so none of that happens.
 
         A caller that gets $null must not take ownership: without a capture there is nothing to put
         back, and an object left owned by SYSTEM with an extra FullControl ACE is a permanent change
@@ -998,9 +1001,9 @@ function Get-OfflinePathSecurity {
     .DESCRIPTION
         Returns the descriptor as an SDDL string, which is the form the scenarios that consume this
         capture expect. When -BinaryForm is supplied it is also set to the same descriptor's binary
-        form, which round-trips losslessly where an SDDL string can drop the protected (P) and
-        auto-inherited (AI) control flags and re-resolve machine-relative SIDs; the copy, rename and
-        delete paths in this file restore from that binary rather than from the SDDL.
+        form, which round-trips losslessly where an SDDL string re-resolves machine-relative aliases
+        against the machine parsing it; the copy, rename and delete paths in this file restore from
+        that binary rather than from the SDDL.
 
     .PARAMETER BinaryForm
         Optional [ref] set to the descriptor's Owner+Group+DACL binary form ([byte[]]), or $null on
@@ -1170,10 +1173,11 @@ function Restore-OfflinePathSecurity {
         WinSxS ends up quietly damaged by a repair that looked like it cleaned up after itself.
 
         When -BinaryDescriptor is supplied it is replayed in preference to the SDDL, because a binary
-        descriptor round-trips losslessly where an SDDL string can drop the protected (P) and
-        auto-inherited (AI) control flags and re-resolve machine-relative aliases against the rescue
-        VM's own SIDs. The internal copy, rename and delete paths capture and pass it; external
-        callers that hold only the SDDL still get the SDDL replay.
+        descriptor round-trips losslessly where an SDDL string re-resolves machine-relative aliases
+        (LA, DA, DU, DC) against the machine that parses it - measured on a workgroup host, LA
+        resolved to that host's own administrator and DA, DU and DC failed to parse at all. The
+        internal copy, rename and delete paths capture and pass it; external callers that hold only
+        the SDDL still get the SDDL replay.
 
         A binary restore is verified: the descriptor is read back and compared (owner, DACL and
         protection), and a restore that does not read back identically is reported and returns
