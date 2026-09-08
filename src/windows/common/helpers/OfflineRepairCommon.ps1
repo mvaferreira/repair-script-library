@@ -155,6 +155,17 @@ function Clear-OfflineRepairLog {
 
 $script:OfflineRootPattern = '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)$'
 
+# A repair ROOT must be a volume root, but a path built by Join-OfflinePath may be rooted
+# anywhere under one - 'E:\Windows' and 'E:\Windows\System32\config' are both ordinary
+# roots for a join. Reusing OfflineRootPattern for the join rejected every nested root and
+# returned $null, which Test-OfflinePath then read as "file not present": a repair would
+# find nothing to fix and report success. What actually has to be excluded is a root that
+# is not volume-qualified at all, because that resolves against the rescue VM's current
+# directory. ConvertTo-OfflineComparablePath already strips leading separators, so '\'
+# collapses to empty and is rejected before this pattern is reached; this catches the
+# residue, such as '\Windows' arriving as 'Windows'.
+$script:OfflineQualifiedPathPattern = '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)(\\[^\\]+)*$'
+
 function ConvertTo-OfflineComparablePath {
     <#
     .SYNOPSIS
@@ -453,12 +464,14 @@ function Join-OfflinePath {
         letters that are being mounted, are already unmounted, or are stale entries left
         on a partition, so the join is done as plain string composition instead.
 
-        The root has to be a real volume root. A root of '\' would otherwise pass the
-        emptiness check and produce a root-relative path, which resolves against whatever
-        drive the rescue VM's current directory happens to be on.
+        The root has to be volume-qualified. A root of '\' or a bare relative path would
+        otherwise produce a root-relative result, which resolves against whatever drive the
+        rescue VM's current directory happens to be on. It does NOT have to be a volume
+        root: 'E:\Windows\System32\config' is a perfectly ordinary root for a join.
 
     .PARAMETER Root
-        Root of the path, with or without a trailing backslash. For example 'D:' or 'D:\'.
+        Root of the path, with or without a trailing backslash. Must be drive- or
+        UNC-qualified, but may be at any depth. For example 'D:', 'D:\' or 'D:\Windows'.
 
     .PARAMETER ChildPath
         Relative path under the root, with or without a leading backslash.
@@ -472,7 +485,7 @@ function Join-OfflinePath {
     )
 
     $trimmedRoot = ConvertTo-OfflineComparablePath $Root
-    if (-not $trimmedRoot -or $trimmedRoot -notmatch $script:OfflineRootPattern) { return $null }
+    if (-not $trimmedRoot -or $trimmedRoot -notmatch $script:OfflineQualifiedPathPattern) { return $null }
 
     if ([string]::IsNullOrWhiteSpace($ChildPath)) { return "$trimmedRoot\" }
     return "$trimmedRoot\$($ChildPath.TrimStart('\'))"
