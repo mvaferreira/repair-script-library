@@ -354,7 +354,9 @@ function Get-NetworkServiceState {
     .SYNOPSIS
         Reads the Start value of every networking service. Must be called with SYSTEM mounted.
     #>
-    $root = Get-OfflineSystemRootPath
+    param([switch]$Strict)
+
+    $root = Get-OfflineSystemRootPath -Strict:$Strict
     $state = [System.Collections.Generic.List[object]]::new()
 
     foreach ($name in $script:NetworkService.Keys) {
@@ -423,7 +425,9 @@ function Get-InterfaceState {
         "EnableDhcp" on one of its interfaces and "EnableDHCP" on the rest, and a case-sensitive read
         reports the odd one out as unconfigured.
     #>
-    $root = Get-OfflineSystemRootPath
+    param([switch]$Strict)
+
+    $root = Get-OfflineSystemRootPath -Strict:$Strict
     $interfaceRoot = "$root\Services\Tcpip\Parameters\Interfaces"
     $state = [System.Collections.Generic.List[object]]::new()
 
@@ -474,7 +478,9 @@ function Get-GlobalNameServer {
     .SYNOPSIS
         Reads the DNS servers configured for the whole stack rather than one interface.
     #>
-    $root = Get-OfflineSystemRootPath
+    param([switch]$Strict)
+
+    $root = Get-OfflineSystemRootPath -Strict:$Strict
     $path = "$root\Services\Tcpip\Parameters"
     if (-not (Test-Path $path)) { return '' }
     $value = (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue).NameServer
@@ -496,9 +502,12 @@ function Get-NetworkProviderState {
         the offline disk, and that file is definitively absent. A provider with no ProviderPath at
         all, or one whose path cannot be resolved, is left alone.
     #>
-    param([Parameter(Mandatory = $true)][string]$WindowsPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [switch]$Strict
+    )
 
-    $root = Get-OfflineSystemRootPath
+    $root = Get-OfflineSystemRootPath -Strict:$Strict
     $orderPath = "$root\Control\NetworkProvider\Order"
     $result = [PSCustomObject]@{
         ProviderOrder = ''
@@ -779,7 +788,7 @@ try {
 
         if ($services.Count -gt 0 -or $interfaces.Count -gt 0 -or $dns.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($providerOrder)) {
             Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-                $root = Get-OfflineSystemRootPath
+                $root = Get-OfflineSystemRootPath -Strict
 
                 foreach ($entry in $services) {
                     $path = "$root\Services\$($entry.Service)"
@@ -875,10 +884,10 @@ try {
     # ---------------------------------------------------------------------------------------------
     $state = Invoke-WithHive -Hive @('SYSTEM', 'SOFTWARE') -WindowsPath $offline.WindowsPath -ScriptBlock {
         return [PSCustomObject]@{
-            Services         = @(Get-NetworkServiceState)
-            Interfaces       = @(Get-InterfaceState)
-            GlobalNameServer = (Get-GlobalNameServer)
-            Providers        = (Get-NetworkProviderState -WindowsPath $offline.WindowsPath)
+            Services         = @(Get-NetworkServiceState -Strict:(-not $isDetectOnly))
+            Interfaces       = @(Get-InterfaceState -Strict:(-not $isDetectOnly))
+            GlobalNameServer = (Get-GlobalNameServer -Strict:(-not $isDetectOnly))
+            Providers        = (Get-NetworkProviderState -WindowsPath $offline.WindowsPath -Strict:(-not $isDetectOnly))
             Proxy            = @(Get-ProxyState)
         }
     }
@@ -988,7 +997,7 @@ try {
         Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
 
         Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            $root = Get-OfflineSystemRootPath
+            $root = Get-OfflineSystemRootPath -Strict
 
             # Services -------------------------------------------------------------------------
             foreach ($service in $serviceFix) {
@@ -1152,9 +1161,9 @@ try {
     # Re-read, so the summary reports what the disk now says rather than what was intended.
     $after = Invoke-WithHive -Hive @('SYSTEM', 'SOFTWARE') -WindowsPath $offline.WindowsPath -ScriptBlock {
         return [PSCustomObject]@{
-            Services   = @(Get-NetworkServiceState)
-            Interfaces = @(Get-InterfaceState)
-            Providers  = (Get-NetworkProviderState -WindowsPath $offline.WindowsPath)
+            Services   = @(Get-NetworkServiceState -Strict)
+            Interfaces = @(Get-InterfaceState -Strict)
+            Providers  = (Get-NetworkProviderState -WindowsPath $offline.WindowsPath -Strict)
             Proxy      = @(Get-ProxyState)
         }
     }

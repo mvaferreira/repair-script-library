@@ -671,7 +671,7 @@ try {
     Log-Info "Target values follow $($script:DocUrl)" | Tee-Object -FilePath $logFile -Append
 
     $context = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $terminalServer = Get-TerminalServerState -SystemRoot $systemRoot
         $services = Get-RdpServiceState -SystemRoot $systemRoot
         $schannel = Get-SchannelState -SystemRoot $systemRoot
@@ -749,7 +749,7 @@ try {
 
     if ($repairable.Count -gt 0) {
         $repairOutcome = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            $systemRoot = Get-OfflineSystemRootPath
+            $systemRoot = Get-OfflineSystemRootPath -Strict
             $done = 0
             $errors = [System.Collections.Generic.List[string]]::new()
             foreach ($finding in $repairable) {
@@ -774,7 +774,7 @@ try {
 
     # Verify against freshly read state rather than trusting the writes above.
     $remaining = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         return @(Get-AllFinding `
                     -TerminalServer (Get-TerminalServerState -SystemRoot $systemRoot) `
                     -Services (Get-RdpServiceState -SystemRoot $systemRoot) `

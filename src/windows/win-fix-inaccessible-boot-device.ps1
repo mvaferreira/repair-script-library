@@ -442,7 +442,7 @@ try {
     $remaining = @()
 
     $result = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $controlSet = Split-Path -Path $systemRoot -Leaf
         Add-OfflineRepairLog -Message "Checking control set $controlSet"
 
@@ -495,7 +495,7 @@ try {
     Log-Info "SYSTEM hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
 
     $repairResult = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         $repaired = 0
         $failed = [System.Collections.Generic.List[string]]::new()
 

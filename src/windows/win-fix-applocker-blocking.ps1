@@ -1265,7 +1265,7 @@ try {
     $compiledCache = Get-AppLockerCompiledCacheState -WindowsPath $offline.WindowsPath
 
     $context = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:((-not $isDetectOnly) -and ($isEnforcementDisableAllowed -or $isLsaDisableAllowed))
         $policy = Get-AppLockerAppliedPolicy
         $gpoSource = @(Get-AppLockerGpoSource)
 
@@ -1409,12 +1409,12 @@ try {
 
             $enforcement = 0
             if ($isEnforcementDisableAllowed) {
-                $enforcement = Disable-AppLockerEnforcement -Policy (Get-AppLockerAppliedPolicy) -AppIdService (Get-AppIdServiceState -SystemRoot (Get-OfflineSystemRootPath))
+                $enforcement = Disable-AppLockerEnforcement -Policy (Get-AppLockerAppliedPolicy) -AppIdService (Get-AppIdServiceState -SystemRoot (Get-OfflineSystemRootPath -Strict))
             }
 
             $lsa = 0
             if ($isLsaDisableAllowed) {
-                $lsa = Disable-LsaProtection -Lsa (Get-LsaProtectionState -SystemRoot (Get-OfflineSystemRootPath))
+                $lsa = Disable-LsaProtection -Lsa (Get-LsaProtectionState -SystemRoot (Get-OfflineSystemRootPath -Strict))
             }
 
             return [PSCustomObject]@{ Repaired = $done; Errors = @($errors); Cleared = $cleared; Enforcement = $enforcement; Lsa = $lsa }

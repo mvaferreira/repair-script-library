@@ -696,7 +696,7 @@ try {
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
     $context = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $services = Get-CertificateServiceState -SystemRoot $systemRoot
 
         return [PSCustomObject]@{
@@ -781,6 +781,9 @@ try {
         Log-Info "SYSTEM hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
 
         $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            if ((Get-OfflineControlSetName -Strict) -ne $context.ControlSet) {
+                throw 'Select\Current changed since detection; refusing to write the previously captured registry paths.'
+            }
             $done = 0
             $errors = [System.Collections.Generic.List[string]]::new()
             foreach ($finding in $registryFindings) {
@@ -806,7 +809,7 @@ try {
     # Verify against freshly read state rather than trusting the writes above.
     $verifyKeyStore = Get-KeyStoreState -VolumeRoot $volumeRoot -BuildNumber $buildNumber
     $remaining = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         return @(Get-AllFinding -KeyStore $verifyKeyStore -Services (Get-CertificateServiceState -SystemRoot $systemRoot))
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append

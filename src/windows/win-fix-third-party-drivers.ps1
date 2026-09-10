@@ -854,7 +854,7 @@ try {
         Log-Info "SYSTEM hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
 
         $revertOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            return (Invoke-DriverRevert -SystemRoot (Get-OfflineSystemRootPath) -Entries $entries)
+            return (Invoke-DriverRevert -SystemRoot (Get-OfflineSystemRootPath -Strict) -Entries $entries)
         }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
@@ -873,7 +873,7 @@ try {
     }
 
     $context = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $topology = Get-DeviceTopology -SystemRoot $systemRoot
         $drivers = @(Get-DriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
         $findings = @(Get-AllFinding -Drivers $drivers -Topology $topology -TargetService $targetDriver)
@@ -960,7 +960,7 @@ try {
     Log-Info "SYSTEM hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
 
     $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         $controlSet = Split-Path -Path $systemRoot -Leaf
         $done = 0
         $entries = [System.Collections.Generic.List[object]]::new()
@@ -1007,7 +1007,7 @@ try {
 
     # Verify against freshly read state rather than trusting the writes above.
     $verification = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         $topology = Get-DeviceTopology -SystemRoot $systemRoot
         $drivers = @(Get-DriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
         return [PSCustomObject]@{
