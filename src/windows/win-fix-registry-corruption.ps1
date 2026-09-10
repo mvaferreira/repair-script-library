@@ -310,8 +310,8 @@ function Resolve-RegBackSource {
             return $result
         }
 
-        # Loading is not enough on its own: reg.exe loads a hive with damaged bins without
-        # complaining, so a backup has to pass chkreg before it is treated as a usable source.
+        # Opening with offreg is not a full structural check, so a backup must also pass
+        # chkreg before it is treated as a usable source.
         $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-check') -Repair $false
         if (-not $check.FoundProblem) {
             $result.IsUsable = $true
@@ -603,7 +603,7 @@ function Get-AllFinding {
         }
 
         if ($validation.IsValid) {
-            Add-OfflineRepairLog -Message "$($spec.Name): loads correctly ($($validation.Size) bytes)."
+            Add-OfflineRepairLog -Message "$($spec.Name): opens with offreg ($($validation.Size) bytes)."
 
             if ($ChkRegPath) {
                 $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $path -ScratchDir $ScratchDir -Repair $false
@@ -621,7 +621,7 @@ function Get-AllFinding {
 
         $cause = if ($validation.Size -eq 0) { 'HiveEmpty' } else { 'HiveUnloadable' }
         [void]$findings.Add((New-Finding -Cause $cause -Item $spec.Name `
-                    -Message "the $($spec.Name) hive cannot be loaded by Windows ($($validation.Reason)), which stops it providing $($spec.Description)" `
+                    -Message "the $($spec.Name) hive cannot be opened for offline validation ($($validation.Reason)); its recovery logs and structure must be checked before it can be verified for $($spec.Description)" `
                     -Data ([PSCustomObject]@{ Path = $path; Spec = $spec; Reason = $validation.Reason })))
     }
 
