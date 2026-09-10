@@ -475,13 +475,7 @@ function Get-SessionManagerState {
 
     $keyPath = "$SystemRoot\Control\Session Manager"
     $controlSet = Split-Path -Path $SystemRoot -Leaf
-    $select = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
-    $lastKnownGoodControlSet = if ($null -ne $select.LastKnownGood -and [int]$select.LastKnownGood -gt 0) {
-        'ControlSet{0:d3}' -f [int]$select.LastKnownGood
-    }
-    else {
-        ''
-    }
+    $lastKnownGoodControlSet = Get-OfflineSelectedControlSetName -Name LastKnownGood
 
     $state = [PSCustomObject]@{
         KeyPath              = $keyPath
@@ -507,8 +501,7 @@ function Get-SessionManagerState {
         ExcludeFromKnownDlls = @()
     }
 
-    if ($state.LastKnownGoodIsDistinct -and
-        (Test-Path "HKLM:\BROKENSYSTEM\$lastKnownGoodControlSet")) {
+    if ($state.LastKnownGoodIsDistinct) {
         $state.LastKnownGoodWindowsSubsystem = Get-WindowsSubsystemValueState `
             -ControlSet $lastKnownGoodControlSet `
             -WindowsPath $WindowsPath `
@@ -1171,7 +1164,7 @@ try {
     Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
 
     $context = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $winlogon = Get-WinlogonState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         $sessionManager = Get-SessionManagerState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         $setupMode = Get-SetupModeState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
@@ -1261,7 +1254,7 @@ try {
 
     if ($repairable.Count -gt 0) {
         $repairOutcome = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            $systemRoot = Get-OfflineSystemRootPath
+            $systemRoot = Get-OfflineSystemRootPath -Strict
             $done = 0
             $errors = [System.Collections.Generic.List[string]]::new()
             foreach ($finding in $repairable) {
@@ -1286,7 +1279,7 @@ try {
 
     # Verify against freshly read state rather than trusting the writes above.
     $remaining = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         return @(Get-AllFinding `
                 -Winlogon (Get-WinlogonState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
                 -SessionManager (Get-SessionManagerState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
