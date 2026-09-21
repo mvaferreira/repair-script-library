@@ -656,6 +656,135 @@ function Get-ProfileListState {
     return $state
 }
 
+function Get-RpcHostingState {
+    <#
+    .SYNOPSIS
+        Reads the RpcSs and RpcEptMapper command lines and reports whether they still share a host.
+
+    .DESCRIPTION
+        svchost groups services by the exact command line it is launched with, not by the -k tag
+        alone. So if RpcEptMapper's ImagePath stops being character-for-character what RpcSs has -
+        typically by being rewritten with a quoted, fully expanded path such as
+        "C:\Windows\system32\svchost.exe" -k rpcss - the two services land in separate processes.
+        The endpoint mapper then lives outside the RPC service's process, local RPC and COM
+        interface resolution stops working, and the visible result is DWM and LogonUI failing and
+        restarting in a loop with no desktop ever appearing.
+
+        The comparison is made after expanding the guest's own environment variables, because
+        %SystemRoot%\system32\svchost.exe and C:\Windows\system32\svchost.exe name the same file but
+        are not the same command line. Quotes and spacing are deliberately preserved: normalising
+        them away would hide the exact difference that causes the split.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SystemRoot,
+        [Parameter(Mandatory = $true)][string]$GuestSystemRoot,
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
+    )
+
+    $controlSet = Split-Path -Path $SystemRoot -Leaf
+    $state = [PSCustomObject]@{
+        ControlSet   = $controlSet
+        Available    = $false
+        Reason       = $null
+        RpcSs        = $null
+        RpcEptMapper = $null
+        HasMismatch  = $false
+        CanRepair    = $false
+    }
+
+    foreach ($name in @('RpcSs', 'RpcEptMapper')) {
+        $subKeyPath = "BROKENSYSTEM\$controlSet\Services\$name"
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath)
+        if ($null -eq $key) {
+            $state.Reason = "the $name service key is not present at HKLM:\$subKeyPath"
+            return $state
+        }
+        try {
+            $raw = $key.GetValue('ImagePath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($raw -isnot [string] -or [string]::IsNullOrWhiteSpace($raw)) {
+                $state.Reason = "$name has no usable ImagePath value"
+                return $state
+            }
+            $state.$name = [PSCustomObject]@{
+                Name       = $name
+                KeyPath    = "HKLM:\$subKeyPath"
+                ImagePath  = $raw
+                ValueKind  = $key.GetValueKind('ImagePath').ToString()
+                Effective  = ''
+                Type       = $key.GetValue('Type', $null)
+                Start      = $key.GetValue('Start', $null)
+                ObjectName = $key.GetValue('ObjectName', $null)
+                Group      = $key.GetValue('Group', $null)
+            }
+        }
+        finally { $key.Close() }
+    }
+    $state.Available = $true
+
+    # Expand with the guest's Windows directory, never this rescue VM's. The two disagree whenever
+    # the offline disk is mounted on a different letter, and using the wrong one would invent a
+    # mismatch that does not exist on the guest.
+    $guestDrive = $GuestSystemRoot.Substring(0, 2)
+    foreach ($service in @($state.RpcSs, $state.RpcEptMapper)) {
+        $expanded = $service.ImagePath
+        foreach ($pair in @(
+                @{ Pattern = '(?i)%SystemRoot%'; Value = $GuestSystemRoot },
+                @{ Pattern = '(?i)%windir%'; Value = $GuestSystemRoot },
+                @{ Pattern = '(?i)%SystemDrive%'; Value = $guestDrive })) {
+            $expanded = [regex]::Replace($expanded, $pair.Pattern, ($pair.Value -replace '\$', '$$$$'))
+        }
+        $service.Effective = $expanded
+    }
+
+    if (@($state.RpcSs, $state.RpcEptMapper | Where-Object { $_.Effective.Contains('%') }).Count -gt 0) {
+        $state.Reason = 'an RPC ImagePath still contains an environment variable this script cannot resolve offline'
+        return $state
+    }
+
+    $state.HasMismatch = -not [string]::Equals(
+        $state.RpcSs.Effective, $state.RpcEptMapper.Effective, [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $state.HasMismatch) {
+        $state.Reason = 'both RPC services name the same command line, so they share one svchost host process'
+        return $state
+    }
+
+    # Repair is copying RpcSs's value onto RpcEptMapper, so it is only safe when everything else
+    # about both services is still stock. Anything customised is reported and left alone.
+    foreach ($service in @($state.RpcSs, $state.RpcEptMapper)) {
+        if ($service.ValueKind -ne 'ExpandString' -and $service.Name -eq 'RpcSs') {
+            $state.Reason = 'RpcSs ImagePath is not REG_EXPAND_SZ, so it is not the stock value to copy from'
+            return $state
+        }
+        if ($service.Type -ne 32 -or $service.Start -ne 2 -or
+            $service.ObjectName -ine 'NT AUTHORITY\NetworkService' -or $service.Group -ine 'COM Infrastructure') {
+            $state.Reason = 'automatic repair needs both RPC services to keep their stock shared-process type, automatic start, NetworkService account and COM Infrastructure group'
+            return $state
+        }
+    }
+
+    $reference = [regex]::Match($state.RpcSs.ImagePath, '(?i)^%SystemRoot%\\system32\\svchost\.exe(?<Args> -k rpcss(?: -p)?)$')
+    $mapper = [regex]::Match($state.RpcEptMapper.Effective, '(?i)^(?:"(?<Exe>[^"]+)"|(?<Exe>[^\s"]+))(?<Args> -k rpcss(?: -p)?)$')
+    if (-not $reference.Success -or -not $mapper.Success -or $GuestSystemRoot -match '\s' -or
+        $mapper.Groups['Exe'].Value -ine "$GuestSystemRoot\system32\svchost.exe" -or
+        $mapper.Groups['Args'].Value -ine $reference.Groups['Args'].Value) {
+        # -p is the service-protection flag. Copying a value that drops it would silently lower the
+        # protection level of a service that had it, so a difference there is never auto-repaired.
+        $state.Reason = 'automatic repair needs RpcSs to hold the stock expandable svchost command and RpcEptMapper to name that same executable and arguments, including the -p protection flag when present'
+        return $state
+    }
+
+    $svchost = Resolve-LogonCommand -Command $state.RpcSs.ImagePath -WindowsPath $WindowsPath -WindowsDrive $WindowsDrive
+    if (-not $svchost.Exists -or $svchost.Length -eq 0) {
+        $state.Reason = 'the svchost.exe the RPC services name is missing or empty on the offline disk'
+        return $state
+    }
+
+    $state.CanRepair = $true
+    $state.Reason = 'RpcEptMapper can be given the same command line RpcSs already has'
+    return $state
+}
+
 function Get-AllFinding {
     <#
     .SYNOPSIS
@@ -671,7 +800,8 @@ function Get-AllFinding {
         [Parameter(Mandatory = $true)]$Winlogon,
         [Parameter(Mandatory = $true)]$SessionManager,
         [Parameter(Mandatory = $true)]$SetupMode,
-        [Parameter(Mandatory = $true)]$ProfileList
+        [Parameter(Mandatory = $true)]$ProfileList,
+        [Parameter(Mandatory = $true)]$RpcHosting
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -984,6 +1114,21 @@ function Get-AllFinding {
         }
     }
 
+    # -- RPC hosting, which the logon UI depends on ------------------------------------------------
+    if ($RpcHosting.Available -and $RpcHosting.HasMismatch) {
+        $detail = "RpcSs runs '$($RpcHosting.RpcSs.ImagePath)' and RpcEptMapper runs '$($RpcHosting.RpcEptMapper.ImagePath)'"
+        if ($RpcHosting.CanRepair) {
+            [void]$findings.Add((New-Finding -Cause 'RpcHostSplit' -Item 'RpcEptMapper' -Hive 'SYSTEM' `
+                        -Message "$detail, so svchost starts them in two separate processes instead of one shared RPC host. The endpoint mapper then sits outside the RPC service's process, local RPC and COM interface resolution fails, and DWM and LogonUI crash and restart in a loop with no desktop ever appearing. RpcEptMapper will be given the same command line RpcSs already has." `
+                        -Data $RpcHosting))
+        }
+        else {
+            [void]$findings.Add((New-Finding -Cause 'RpcHostSplit' -Item 'RpcEptMapper' -Hive 'SYSTEM' -Repairable $false `
+                        -Message "$detail, so svchost starts them in two separate processes instead of one shared RPC host, which can leave DWM and LogonUI crashing in a loop before any desktop appears. It is reported and not repaired: $($RpcHosting.Reason)." `
+                        -Data $RpcHosting))
+        }
+    }
+
     return @($findings)
 }
 
@@ -1150,6 +1295,38 @@ function Repair-Finding {
             return $true
         }
 
+        '^RpcHostSplit$' {
+            $data = $Finding.Data
+            $controlSet = Split-Path -Path $SystemRoot -Leaf
+            $subKeyPath = "BROKENSYSTEM\$controlSet\Services\RpcEptMapper"
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath, $true)
+            if ($null -eq $key) {
+                throw "The RpcEptMapper service key is no longer available: HKLM:\$subKeyPath"
+            }
+
+            try {
+                $before = [string]$key.GetValue(
+                    'ImagePath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $replacement = [string]$data.RpcSs.ImagePath
+
+                if ([string]::Equals($before, $replacement, [System.StringComparison]::Ordinal) -and
+                    $key.GetValueKind('ImagePath') -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                    return $false
+                }
+
+                # REG_EXPAND_SZ is required, not cosmetic: writing the same text as REG_SZ leaves
+                # %SystemRoot% unexpanded at boot and the service fails to start at all.
+                $key.SetValue('ImagePath', $replacement, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            }
+            finally {
+                $key.Close()
+            }
+
+            Add-OfflineRepairLog -Message "RpcEptMapper ImagePath: '$before' -> '$replacement' (REG_EXPAND_SZ), so it shares one svchost host process with RpcSs again."
+            Add-OfflineRepairLog -Message "RpcEptMapper: to undo this after the VM boots, run: reg add `"HKLM\SYSTEM\CurrentControlSet\Services\RpcEptMapper`" /v ImagePath /t REG_EXPAND_SZ /d `"$before`" /f"
+            return $true
+        }
+
         default { return $false }
     }
 }
@@ -1169,6 +1346,8 @@ try {
         $sessionManager = Get-SessionManagerState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         $setupMode = Get-SetupModeState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         $profileList = Get-ProfileListState -WindowsDrive $offline.WindowsDrive
+        $rpcHosting = Get-RpcHostingState -SystemRoot $systemRoot -GuestSystemRoot $winlogon.GuestSystemRoot `
+            -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
 
         return [PSCustomObject]@{
             ControlSet     = (Split-Path -Path $systemRoot -Leaf)
@@ -1176,7 +1355,8 @@ try {
             SessionManager = $sessionManager
             SetupMode      = $setupMode
             ProfileList    = $profileList
-            Findings       = @(Get-AllFinding -Winlogon $winlogon -SessionManager $sessionManager -SetupMode $setupMode -ProfileList $profileList)
+            RpcHosting     = $rpcHosting
+            Findings       = @(Get-AllFinding -Winlogon $winlogon -SessionManager $sessionManager -SetupMode $setupMode -ProfileList $profileList -RpcHosting $rpcHosting)
         }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -1214,6 +1394,12 @@ try {
         Log-Warning 'SYSTEM\Setup\SystemSetupInProgress is 1, so the guest believes Windows setup has not finished. That is normal only for a VM captured mid-Sysprep, and it was left alone.' | Tee-Object -FilePath $logFile -Append
     }
     Log-Info "Profile list: $(@($context.ProfileList.Profiles).Count) user profile(s)." | Tee-Object -FilePath $logFile -Append
+    if ($context.RpcHosting.Available) {
+        Log-Info "RPC hosting $($context.RpcHosting.ControlSet): RpcSs='$($context.RpcHosting.RpcSs.ImagePath)' ($($context.RpcHosting.RpcSs.ValueKind)), RpcEptMapper='$($context.RpcHosting.RpcEptMapper.ImagePath)' ($($context.RpcHosting.RpcEptMapper.ValueKind)); $($context.RpcHosting.Reason)." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Info "RPC hosting: not assessed because $($context.RpcHosting.Reason)." | Tee-Object -FilePath $logFile -Append
+    }
 
     $findings = @($context.Findings)
     foreach ($finding in $findings) {
@@ -1223,6 +1409,15 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
     $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
+    # Ahead of the detectOnly gate on purpose, so one affirmative line serves both modes. A detect
+    # run on a healthy disk that says nothing leaves it indistinguishable from one this script
+    # cannot judge, and the whole point of naming what was checked is to let the caller move on.
+    if ($findings.Count -eq 0) {
+        Log-Output 'No logon subsystem fault was found. The Windows subsystem and required logon binaries are non-zero, hash-readable Microsoft images; every optional command resolves; the RPC service and its endpoint mapper still share one svchost host process; and the VM is not held in setup mode. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_SUCCESS
+    }
+
     if ($isDetectOnly) {
         foreach ($finding in $findings) {
             Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
@@ -1231,12 +1426,6 @@ try {
         # keeps the tail, so a summary printed first is the first thing a long detect run loses -
         # which is how a run once reported every finding truncated away and still looked successful.
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($findings.Count -eq 0) {
-        Log-Output 'No logon subsystem fault was found. The Windows subsystem and required logon binaries are non-zero, hash-readable Microsoft images; every optional command resolves, and the VM is not held in setup mode. No changes were made.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -1280,11 +1469,14 @@ try {
     # Verify against freshly read state rather than trusting the writes above.
     $remaining = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath -Strict
+        $winlogonAfter = Get-WinlogonState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         return @(Get-AllFinding `
-                -Winlogon (Get-WinlogonState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
+                -Winlogon $winlogonAfter `
                 -SessionManager (Get-SessionManagerState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
                 -SetupMode (Get-SetupModeState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
-                -ProfileList (Get-ProfileListState -WindowsDrive $offline.WindowsDrive))
+                -ProfileList (Get-ProfileListState -WindowsDrive $offline.WindowsDrive) `
+                -RpcHosting (Get-RpcHostingState -SystemRoot $systemRoot -GuestSystemRoot $winlogonAfter.GuestSystemRoot `
+                    -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive))
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 

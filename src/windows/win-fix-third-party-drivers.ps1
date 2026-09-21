@@ -209,9 +209,14 @@ $script:ProtectedGroupPattern = @(
 # Vendors whose drivers an Azure VM can genuinely need for storage, networking or GPU. Mellanox in
 # particular is Accelerated Networking: disabling it offline produces a VM that boots and cannot be
 # reached. This is a backstop behind the structural checks, never the only reason to spare a driver.
+# Cavium sits between QLogic and Marvell in one acquisition chain (QLogic FastLinQ -> Cavium 2016 ->
+# Marvell 2018), so an inbox driver from that family can carry any of the three names. qefcoe.sys is
+# the measured case: it ships in the Windows Server 2019 image, is catalog-signed by Microsoft and
+# published as qefcoe.inf rather than oemNN.inf, but its CompanyName reads "Cavium, Inc." and it
+# declares no load order group, so nothing else here spared it.
 $script:PlatformVendorPattern = (@(
         'Mellanox', 'NVIDIA', 'Intel', 'Advanced Micro Devices', 'AMD', 'Chelsio', 'Marvell',
-        'Broadcom', 'QLogic', 'Emulex', 'Solarflare', 'Xilinx', 'Amazon', 'Google'
+        'Broadcom', 'QLogic', 'Cavium', 'Emulex', 'Solarflare', 'Xilinx', 'Amazon', 'Google'
     ) | ForEach-Object { [regex]::Escape($_) }) -join '|'
 
 $script:MicrosoftVendorPattern = 'Microsoft'
