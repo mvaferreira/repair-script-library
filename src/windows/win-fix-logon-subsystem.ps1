@@ -210,6 +210,7 @@ function Resolve-LogonCommand {
         IsMicrosoft     = $false
         IsLikelyMicrosoft = $false
         HashUnreadable  = $false
+        MetadataUnreadable = $false
         Reason          = $null
     }
 
@@ -268,8 +269,22 @@ function Resolve-LogonCommand {
         $signature = Test-OfflineFileSignature -FilePath $candidate
         if ($signature.Status -eq 'FileNotFound') { continue }
 
-        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+        $item = $null
+        $metadataUnreadable = $false
+        try { $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { $item = $null }
+        catch {
+            # -ErrorAction SilentlyContinue here used to return $null for ANY failure, so a file
+            # that is present but locked, ACL-denied or on a failing sector was reported as "the
+            # path is not a file" - and that reason drives four repairable causes that DELETE the
+            # entry from BootExecute, SetupExecute, Userinit or Shell, or clear SetupType. A failed
+            # read must not become authority for a write. Only ItemNotFoundException above is proof
+            # the file is absent; everything else is an unknown and is reported as one.
+            $metadataUnreadable = $true
+        }
+
         $result.Resolved = $candidate
+        $result.MetadataUnreadable = $metadataUnreadable
         $result.Present = ($null -ne $item -and -not $item.PSIsContainer)
         $result.Length = if ($result.Present) { [int64]$item.Length } else { [int64]0 }
         $result.SignatureStatus = $signature.Status
@@ -277,6 +292,10 @@ function Resolve-LogonCommand {
         $result.IsMicrosoft = $signature.IsMicrosoft
         $result.IsLikelyMicrosoft = $signature.IsLikelyMicrosoft
 
+        if ($metadataUnreadable) {
+            $result.Reason = "the file is there but could not be read, so whether it can start could not be established: $candidate"
+            return $result
+        }
         if (-not $result.Present) {
             $result.Reason = "the path is not a file: $candidate"
             return $result
@@ -463,7 +482,8 @@ function Get-WinlogonState {
                 Present       = ($null -ne $raw)
                 Raw           = "$raw"
                 Resolutions   = $resolutions
-                Dangling      = @($resolutions | Where-Object { -not $_.Exists })
+                Dangling      = @($resolutions | Where-Object { -not $_.Exists -and -not $_.MetadataUnreadable })
+                Unreadable    = @($resolutions | Where-Object { $_.MetadataUnreadable })
                 Good          = @($resolutions | Where-Object { $_.Exists })
                 HasRequired   = ($requiredResolution.Count -gt 0)
                 RequiredResolution = if ($requiredResolution.Count -gt 0) { $requiredResolution[0] } else { $null }
@@ -552,6 +572,7 @@ function Get-SessionManagerState {
                 IsDefault  = $isDefault
                 Resolution = $resolution
                 Exists     = $resolution.Exists
+                Unreadable = $resolution.MetadataUnreadable
                 Vendor     = if ($resolution.Exists) { (Get-Item -LiteralPath $resolution.Resolved -ErrorAction SilentlyContinue).VersionInfo.CompanyName } else { $null }
             }
         }
@@ -889,15 +910,15 @@ function Get-AllFinding {
                 ))
 
             # Evidence that could not be READ is not evidence of a fault. When the only thing
-            # against the active value is that its executable could not be hashed, the value may be
-            # perfectly correct and the disk perfectly healthy, so this reports and changes nothing.
-            # Without this gate an I/O error on a healthy csrss.exe overwrites the live value from
-            # LastKnownGood.
-            $subsystemHashUnreadable = (
+            # against the active value is that its executable could not be hashed, or could not be
+            # opened at all, the value may be perfectly correct and the disk perfectly healthy, so
+            # this reports and changes nothing. Without this gate an I/O error on a healthy
+            # csrss.exe overwrites the live value from LastKnownGood.
+            $subsystemEvidenceUnreadable = (
                 $null -ne $subsystem.Resolution -and
-                $subsystem.Resolution.HashUnreadable)
+                ($subsystem.Resolution.HashUnreadable -or $subsystem.Resolution.MetadataUnreadable))
 
-            if ($subsystem.KeyPresent -and $replacementDiffers -and -not $subsystemHashUnreadable) {
+            if ($subsystem.KeyPresent -and $replacementDiffers -and -not $subsystemEvidenceUnreadable) {
                 [void]$findings.Add((New-Finding -Cause 'WindowsSubsystemBroken' -Item 'SubSystems\Windows' -Hive 'SYSTEM' `
                             -Message "Session Manager SubSystems\Windows cannot start the Windows subsystem because $activeReason. LastKnownGood $($lastKnownGood.ControlSet) carries a REG_EXPAND_SZ value whose first executable is a non-zero, hash-readable Microsoft image at $($lastKnownGood.Resolution.Resolved). Its exact value will be copied to the active control set." `
                             -Data ([PSCustomObject]@{
@@ -906,8 +927,13 @@ function Get-AllFinding {
                                 })))
             }
             else {
-                $fallbackReason = if ($subsystemHashUnreadable) {
-                    "the active executable could not be SHA-256 read, which is a failure to gather evidence rather than proof the value is wrong, and an unreadable file is not authority to overwrite a live value"
+                $fallbackReason = if ($subsystemEvidenceUnreadable) {
+                    if ($subsystem.Resolution.MetadataUnreadable) {
+                        "the active executable could not be opened to establish anything about it, which is a failure to gather evidence rather than proof the value is wrong, and an unreadable file is not authority to overwrite a live value"
+                    }
+                    else {
+                        "the active executable could not be SHA-256 read, which is a failure to gather evidence rather than proof the value is wrong, and an unreadable file is not authority to overwrite a live value"
+                    }
                 }
                 elseif (-not $subsystem.KeyPresent) {
                     "the active $($subsystem.KeyPath) key does not exist, so there is nowhere to write the value"
@@ -942,19 +968,29 @@ function Get-AllFinding {
 
         foreach ($valueName in @('BootExecute', 'SetupExecute')) {
             $entries = @($SessionManager.$valueName)
+
+            # An entry whose file could not be read is neither dangling nor good. It is excluded
+            # from the removal set so a failed read cannot delete it, and included in the keep set
+            # so the rewrite that removes a genuinely dangling sibling does not delete it either.
+            foreach ($unreadable in @($entries | Where-Object { $_.Unreadable })) {
+                [void]$findings.Add((New-Finding -Cause "${valueName}CommandUnreadable" -Item $unreadable.Entry -Hive 'SYSTEM' -Repairable $false `
+                            -Message "Session Manager $valueName runs '$($unreadable.Entry)' before Win32 starts, and $($unreadable.Resolution.Reason). It was left in place: a file that could not be read is not a file that is missing, and removing it on that evidence would break a boot that currently works. Check the disk for I/O errors or a restrictive ACL on that path." `
+                            -Data $unreadable))
+            }
+
             $dangling = if ($valueName -eq 'BootExecute') {
-                @($entries | Where-Object { -not $_.IsDefault -and -not $_.Exists })
+                @($entries | Where-Object { -not $_.IsDefault -and -not $_.Exists -and -not $_.Unreadable })
             }
             else {
-                @($entries | Where-Object { -not $_.Exists })
+                @($entries | Where-Object { -not $_.Exists -and -not $_.Unreadable })
             }
             if ($dangling.Count -eq 0) { continue }
 
             $keep = if ($valueName -eq 'BootExecute') {
-                @($entries | Where-Object { $_.IsDefault -or $_.Exists } | ForEach-Object { $_.Entry })
+                @($entries | Where-Object { $_.IsDefault -or $_.Exists -or $_.Unreadable } | ForEach-Object { $_.Entry })
             }
             else {
-                @($entries | Where-Object { $_.Exists } | ForEach-Object { $_.Entry })
+                @($entries | Where-Object { $_.Exists -or $_.Unreadable } | ForEach-Object { $_.Entry })
             }
             foreach ($bad in $dangling) {
                 [void]$findings.Add((New-Finding -Cause "${valueName}Dangling" -Item $bad.Entry -Hive 'SYSTEM' `
@@ -996,15 +1032,15 @@ function Get-AllFinding {
         # When every BootExecute entry is dangling, removing them would leave the value empty, so the
         # dangling repair writes the default back itself. Raising a separate finding here as well
         # would describe one write as two, and the second would find nothing left to do.
-        $repairableBootDangling = @($bootEntries | Where-Object { -not $_.IsDefault -and -not $_.Exists })
-        $bootSurvives = (@($bootEntries | Where-Object { $_.IsDefault -or $_.Exists }).Count -gt 0)
+        $repairableBootDangling = @($bootEntries | Where-Object { -not $_.IsDefault -and -not $_.Exists -and -not $_.Unreadable })
+        $bootSurvives = (@($bootEntries | Where-Object { $_.IsDefault -or $_.Exists -or $_.Unreadable }).Count -gt 0)
         $defaultRestoredByDanglingRepair = ($repairableBootDangling.Count -gt 0 -and -not $bootSurvives)
 
         if (-not $hasDefault -and $SessionManager.BootExecutePresent -and -not $defaultRestoredByDanglingRepair) {
             if (Test-ResolutionIntegrity -Resolution $SessionManager.DefaultBootExecuteResolution -RequireMicrosoft) {
                 [void]$findings.Add((New-Finding -Cause 'BootExecuteDefaultMissing' -Item 'BootExecute' -Hive 'SYSTEM' `
                             -Message "Session Manager BootExecute does not run the Windows default '$($script:DefaultBootExecute)', so autochk never runs and a volume left dirty by the failure is mounted without being checked. The default will be restored; autochk.exe is a non-zero, hash-readable Microsoft image." `
-                            -Data ([PSCustomObject]@{ ValueName = 'BootExecute'; Keep = @($bootEntries | Where-Object { $_.Exists } | ForEach-Object { $_.Entry }) })))
+                            -Data ([PSCustomObject]@{ ValueName = 'BootExecute'; Keep = @($bootEntries | Where-Object { $_.Exists -or $_.Unreadable } | ForEach-Object { $_.Entry }) })))
             }
             else {
                 [void]$findings.Add((New-Finding -Cause 'BootExecuteDefaultUnavailable' -Item 'BootExecute' -Hive 'SYSTEM' -Repairable $false `
@@ -1028,6 +1064,11 @@ function Get-AllFinding {
         if ([string]::IsNullOrWhiteSpace($SetupMode.CmdLine)) {
             [void]$findings.Add((New-Finding -Cause 'SetupTypeWithoutCommand' -Item 'SetupType' -Hive 'SYSTEM' `
                         -Message "SYSTEM\Setup\SetupType is $($SetupMode.SetupType) but CmdLine is empty, so the VM enters setup mode at boot and has nothing to run there. SetupType will be set back to 0." `
+                        -Data $SetupMode))
+        }
+        elseif ($null -ne $SetupMode.Resolution -and $SetupMode.Resolution.MetadataUnreadable) {
+            [void]$findings.Add((New-Finding -Cause 'SetupModeCommandUnreadable' -Item 'CmdLine' -Hive 'SYSTEM' -Repairable $false `
+                        -Message "SYSTEM\Setup\SetupType is $($SetupMode.SetupType) and CmdLine runs '$($SetupMode.CmdLine)' before the logon UI, and $($SetupMode.Resolution.Reason). SetupType was NOT cleared: a command that could not be read is not a command that is missing, and clearing setup mode on that evidence would abandon a servicing or provisioning step that is genuinely meant to run. Check the disk for I/O errors or a restrictive ACL on that path." `
                         -Data $SetupMode))
         }
         elseif ($null -ne $SetupMode.Resolution -and -not $SetupMode.Resolution.Exists) {
@@ -1086,6 +1127,12 @@ function Get-AllFinding {
                 continue
             }
 
+            foreach ($unreadable in @($value.Unreadable)) {
+                [void]$findings.Add((New-Finding -Cause 'WinlogonCommandUnreadable' -Item "$($value.Name) $($unreadable.Command)" -Hive 'SOFTWARE' -Repairable $false `
+                            -Message "Winlogon $($value.Name) runs '$($unreadable.Command)', and $($unreadable.Reason). It was neither removed nor counted as working: a file that could not be read is not a file that is missing, and removing it on that evidence would break a logon that currently works. It is kept in the value if $($value.Name) is rewritten. Check the disk for I/O errors or a restrictive ACL on that path." `
+                            -Data $unreadable))
+            }
+
             # One finding per value, not per broken entry. The repair rewrites the whole value in a
             # single write, so splitting this into several findings would report repairs that never
             # happened: the first write already corrects everything the others would have asked for.
@@ -1098,7 +1145,7 @@ function Get-AllFinding {
                     [void]$reasons.Add("it never runs $($value.Required), which $($value.Purpose)")
                 }
 
-                $plan = if ($value.Dangling.Count -gt 0) { "The $($value.Dangling.Count) broken entry(s) will be removed and the $($value.Good.Count) working one(s) kept" } else { 'The working entries will be kept' }
+                $plan = if ($value.Dangling.Count -gt 0) { "The $($value.Dangling.Count) broken entry(s) will be removed and the $($value.Good.Count + $value.Unreadable.Count) other(s) kept" } else { 'The working entries will be kept' }
                 if (-not $value.HasRequired) { $plan += ", and '$($value.Default)' added ahead of them" }
 
                 [void]$findings.Add((New-Finding -Cause 'WinlogonValueBroken' -Item $value.Name -Hive 'SOFTWARE' `
@@ -1268,7 +1315,12 @@ function Repair-Finding {
             $value = $Finding.Data
             $keyPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 
-            $keep = @($value.Good | ForEach-Object { $_.Command })
+            # Entries whose file could not be read are kept alongside the ones that resolved. They
+            # are not in Good, because nothing about them was proven, but dropping them here would
+            # delete them from the value just as surely as the dangling repair does - the write is
+            # the whole value, not a removal. Filtering Resolutions rather than concatenating Good
+            # and Unreadable also preserves the operator's original ordering.
+            $keep = @($value.Resolutions | Where-Object { $_.Exists -or $_.MetadataUnreadable } | ForEach-Object { $_.Command })
             $parts = if ($value.HasRequired) { $keep } else { @($value.Default) + $keep }
             if ($parts.Count -eq 0) { $parts = @($value.Default) }
 

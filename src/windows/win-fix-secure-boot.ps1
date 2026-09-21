@@ -287,8 +287,18 @@ function Get-EfiFallbackBootFileName {
         0x8664 { return 'bootx64.efi' }
         0x014C { return 'bootia32.efi' }
         default {
-            Add-OfflineRepairLog -Level Info -Message ("Could not read an architecture from $kernel (PE machine 0x{0:X4}). Assuming x64, which is what every Azure Gen2 Windows image except the ARM64 sizes uses." -f $machine)
-            return 'bootx64.efi'
+            # Machine 0 covers four different outcomes - the kernel is absent, too short to hold a
+            # PE header, not a PE image at all, or could not be read - and none of them is evidence
+            # of an architecture. This name becomes the Destination of a copy, so assuming x64 here
+            # lets a failed read pick a write target: on an ARM64 guest it writes an ARM64 boot
+            # manager to the x64 name, leaves the real bootaa64.efi unexamined, and reports the run
+            # as repaired on a VM that still will not boot. The trigger is self-referential, since a
+            # corrupt ntoskrnl.exe is one of the faults this script exists to report.
+            #
+            # An empty name is returned instead, and Get-EspFinding turns it into a non-repairable
+            # ArchitectureUnknown finding.
+            Add-OfflineRepairLog -Level Warning -Message ("The architecture could not be read from $kernel (PE machine 0x{0:X4}), so the EFI fallback loader name for this installation is unknown." -f $machine)
+            return ''
         }
     }
 }
@@ -399,8 +409,9 @@ function Get-EspArtifactSpec {
         }
         @{
             Item        = 'fallback'
-            Label       = "EFI fallback boot manager ($fallbackName)"
-            Destination = Join-OfflinePath -Root $BootDrive -ChildPath "EFI\Boot\$fallbackName"
+            Label       = if ($fallbackName) { "EFI fallback boot manager ($fallbackName)" } else { 'EFI fallback boot manager' }
+            Destination = if ($fallbackName) { Join-OfflinePath -Root $BootDrive -ChildPath "EFI\Boot\$fallbackName" } else { '' }
+            ArchitectureUnknown = (-not $fallbackName)
         }
     )
 }
@@ -444,6 +455,15 @@ function Get-EspFinding {
     $espBootManagerOk = (Get-SignatureState -Path $espBootManager).Intact
 
     foreach ($spec in $Specs) {
+        # Checked before anything reads or writes the destination, because on this path there is no
+        # destination to speak of: the architecture that names the file could not be established.
+        if ($spec.ArchitectureUnknown) {
+            [void]$findings.Add((New-Finding -Cause 'ArchitectureUnknown' -Item $spec.Item -Repairable $false `
+                        -Message "The EFI fallback boot manager was not checked because this installation's architecture could not be read from Windows\System32\ntoskrnl.exe, and the fallback loader is named after it (bootx64.efi, bootaa64.efi or bootia32.efi). Guessing the name would write a loader to a file the firmware never reads and report the run as repaired. Repair the kernel first - win-fix-code-integrity or win-sfc-sf-corruption - then run this again." `
+                        -Data $spec))
+            continue
+        }
+
         $signature = Get-SignatureState -Path $spec.Destination
 
         if ($signature.Verdict -eq 'Intact') {

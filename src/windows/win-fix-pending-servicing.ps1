@@ -322,7 +322,19 @@ function Get-IncompleteServicingSession {
 
     $incomplete = [System.Collections.Generic.List[object]]::new()
     foreach ($child in @(Get-ChildItem $SessionsKeyPath -ErrorAction SilentlyContinue)) {
-        $props = Get-ItemProperty -LiteralPath $child.PSPath -ErrorAction SilentlyContinue
+        $props = $null
+        try { $props = Get-ItemProperty -LiteralPath $child.PSPath -ErrorAction Stop }
+        catch {
+            # A session record that cannot be READ is not a session that failed to complete. The
+            # test below is "Complete is not 1", so a null from a failed read reports a COMPLETED
+            # session as incomplete - a finding fabricated out of an I/O error, which is enough on
+            # its own to pass the repair gate and write hive backups to a healthy customer disk.
+            # Under-reporting is the safe direction here: a genuinely stuck session still shows up
+            # through the COMPONENTS markers and the CBS pending keys.
+            Add-OfflineRepairLog -Level Warning -Message "The servicing session record $($child.PSChildName) could not be read ($($_.Exception.Message)), so it was not counted either way."
+            continue
+        }
+
         $complete = if ($props) { $props.Complete } else { $null }
         if ("$complete" -eq '1') { continue }
 

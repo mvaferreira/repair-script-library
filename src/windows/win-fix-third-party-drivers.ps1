@@ -382,6 +382,8 @@ function Get-DriverInventory {
         $resolved = ''
         $exists = $false
         $vendor = ''
+        $vendorUnreadable = $false
+        $imageUnreadable = $false
 
         if (-not [string]::IsNullOrWhiteSpace($imagePath)) {
             $resolved = Resolve-OfflineImagePath -ImagePath $imagePath -WindowsDrive $WindowsDrive
@@ -393,7 +395,35 @@ function Get-DriverInventory {
 
         if (Test-OfflinePath $resolved) {
             $exists = $true
-            try { $vendor = (Get-Item -LiteralPath $resolved -ErrorAction Stop).VersionInfo.CompanyName } catch { $vendor = '' }
+            # A publisher that cannot be READ is not evidence that the driver is third party.
+            # An empty $vendor here is consumed twice as if it were: it leaves $isMicrosoft false,
+            # and it short-circuits the platform-vendor test in Test-DriverProtected, so both
+            # protections come off and the driver is disabled on the strength of an I/O error.
+            # A driver that legitimately carries no CompanyName is a different case and must stay
+            # exposed - that is the set this scenario exists to find - so only the throw sets the
+            # flag, never an empty-but-readable CompanyName.
+            try { $vendor = (Get-Item -LiteralPath $resolved -ErrorAction Stop).VersionInfo.CompanyName }
+            catch { $vendor = ''; $vendorUnreadable = $true }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($resolved)) {
+            # Test-OfflinePath is Test-Path wrapped in a try/catch that returns $false on error, so
+            # a path it could not READ is indistinguishable here from one that is not there - while
+            # the MissingDriverImage finding states the absence as fact and disables the driver on
+            # it. Confirm the absence instead of inferring it: only ItemNotFoundException proves
+            # the image is gone. An ImagePath that resolved to nothing at all skips this entirely
+            # and stays a MissingDriverImage, which is what a dangling ImagePath genuinely is.
+            try {
+                # Test-OfflinePath disagreeing with a successful Get-Item means the earlier failure
+                # was transient, so judge the driver on the evidence now in hand rather than on the
+                # stale negative.
+                $vendor = (Get-Item -LiteralPath $resolved -Force -ErrorAction Stop).VersionInfo.CompanyName
+                $exists = $true
+            }
+            catch [System.Management.Automation.ItemNotFoundException] {
+                # The only outcome that proves the image is genuinely gone.
+                $exists = $false
+            }
+            catch { $imageUnreadable = $true }
         }
 
         $isMicrosoft = $false
@@ -409,6 +439,8 @@ function Get-DriverInventory {
                 FileName     = $(if ($resolved) { Split-Path -Path $resolved -Leaf } else { '' })
                 Exists       = $exists
                 Vendor       = $vendor
+                VendorUnreadable = $vendorUnreadable
+                ImageUnreadable = $imageUnreadable
                 IsMicrosoft  = $isMicrosoft
             })
     }
@@ -456,6 +488,17 @@ function Test-DriverProtected {
 
     if ($Driver.Vendor -and $Driver.Vendor -match $script:PlatformVendorPattern) {
         return "its binary is published by $($Driver.Vendor), a vendor whose drivers an Azure VM can need for storage, networking or GPU"
+    }
+
+    # An unreadable publisher is the one case where absence of evidence must not be read as
+    # evidence of absence. Every check above needs something it could read; these two fire when
+    # nothing could be read at all, which is the only state in which disabling the driver would be
+    # a guess. They sit last so a driver whose evidence IS readable is still judged on its merits.
+    if ($Driver.ImageUnreadable) {
+        return 'its image could not be read from the disk, so whether it is even present could not be established'
+    }
+    if ($Driver.VendorUnreadable) {
+        return 'its publisher could not be read from the disk, so there is no evidence it is safe to disable'
     }
 
     return ''
