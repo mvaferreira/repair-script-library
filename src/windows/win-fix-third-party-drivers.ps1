@@ -214,12 +214,17 @@ $script:ProtectedGroupPattern = @(
 # the measured case: it ships in the Windows Server 2019 image, is catalog-signed by Microsoft and
 # published as qefcoe.inf rather than oemNN.inf, but its CompanyName reads "Cavium, Inc." and it
 # declares no load order group, so nothing else here spared it.
+#
+# Each name is matched on word boundaries, so "Intelligent Backup Inc" is not read as Intel. Measured
+# against the 32 distinct CompanyName values on a Windows 11 26200 host: anchored and unanchored
+# matching agreed on every one, including "Intel(R) Corporation" and a bare "Mellanox", so the
+# anchors remove the false spare without narrowing any real vendor.
 $script:PlatformVendorPattern = (@(
         'Mellanox', 'NVIDIA', 'Intel', 'Advanced Micro Devices', 'AMD', 'Chelsio', 'Marvell',
         'Broadcom', 'QLogic', 'Cavium', 'Emulex', 'Solarflare', 'Xilinx', 'Amazon', 'Google'
-    ) | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    ) | ForEach-Object { '\b' + [regex]::Escape($_) + '\b' }) -join '|'
 
-$script:MicrosoftVendorPattern = 'Microsoft'
+$script:MicrosoftVendorPattern = '\bMicrosoft\b'
 
 function New-Finding {
     <#
@@ -473,8 +478,18 @@ function Get-AllFinding {
         if ($TargetService -and $driver.Service -ne $TargetService) { continue }
 
         # Microsoft drivers are not what this scenario is for. win-fix-code-integrity
-        # and win-fix-inaccessible-boot-device handle the inbox ones.
-        if ($driver.IsMicrosoft) { continue }
+        # and win-fix-inaccessible-boot-device handle the inbox ones. Reported only when the
+        # operator named this driver explicitly, because every inbox driver would otherwise be
+        # printed. CompanyName is unsigned metadata, so an operator who disagrees with the call
+        # needs to be told it was made rather than being met with silence.
+        if ($driver.IsMicrosoft) {
+            if ($TargetService) {
+                [void]$findings.Add((New-Finding -Cause 'MicrosoftDriver' -Item $driver.Service -Repairable $false `
+                            -Message "$($driver.Service) ($(if ($driver.FileName) { $driver.FileName } else { 'no image path' })) was NOT disabled because its binary reports '$($driver.Vendor)' as its publisher, so it is an inbox Microsoft driver rather than the third-party kind this script is for. win-fix-code-integrity and win-fix-inaccessible-boot-device cover the inbox drivers." `
+                            -Data $driver))
+            }
+            continue
+        }
 
         $protectedReason = Test-DriverProtected -Driver $driver -Topology $Topology
         if ($protectedReason) {
@@ -1052,4 +1067,13 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # A dependency may have failed to load before these functions became available.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog
+    }
 }

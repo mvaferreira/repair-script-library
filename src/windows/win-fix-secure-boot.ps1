@@ -317,6 +317,15 @@ function Get-SignatureState {
                                                 trusted HERE. That is a statement about the rescue
                                                 VM, not about the guest, so it is reported and never
                                                 repaired.
+          Unreadable                            the signature could not be evaluated at all because
+                                                the call threw. That is a statement about the read,
+                                                not about the file, so it is reported and never
+                                                repaired.
+
+        UnknownError is a verdict the trust provider RETURNS, and it is repairable because a zeroed
+        3 MB file produces exactly that. A call that THROWS is a different thing and must not be
+        collapsed into it: an I/O error or a sharing violation is no evidence about the bytes, and
+        treating it as such would let a failed read authorise overwriting a serviced boot manager.
 
         A zeroed 3 MB file reports UnknownError with "The form specified for the subject is not one
         supported or known by the specified trust provider"; a file with corrupted bytes over its
@@ -342,8 +351,16 @@ function Get-SignatureState {
         $state.Message = "$($signature.StatusMessage)"
     }
     catch {
-        $state.Status = 'UnknownError'
+        # A verdict the trust provider RETURNED is evidence about the file. A call that THREW is
+        # not: a sharing violation or an I/O error says nothing about the bytes. Both used to land
+        # on UnknownError, so a transient read failure became authority to overwrite a serviced
+        # boot manager with the older staged copy - the exact rollback this script's .NOTES warns
+        # can self-revoke a VM that currently boots. Unreadable is now its own verdict and is
+        # reported, never repaired.
+        $state.Status = 'ReadFailed'
         $state.Message = $_.Exception.Message
+        $state.Verdict = 'Unreadable'
+        return $state
     }
 
     switch ($state.Status) {
@@ -450,6 +467,13 @@ function Get-EspFinding {
             continue
         }
 
+        if ($signature.Verdict -eq 'Unreadable') {
+            [void]$findings.Add((New-Finding -Cause 'UnreadableEspArtifact' -Item $spec.Item -Repairable $false `
+                        -Message "The signature of the $($spec.Label) at $($spec.Destination) could not be evaluated at all ($($signature.Message)). That is a failure to read the file, not evidence about its contents, so nothing was changed. Replacing it on this evidence could roll a serviced boot manager back to an older staged copy. Re-run once the file is readable." `
+                        -Data $spec))
+            continue
+        }
+
         # Prefer the boot manager already on this EFI System Partition as the source for the
         # fallback: it is the one this VM has actually been booting, and on a serviced VM it is
         # newer than anything on the Windows partition.
@@ -526,6 +550,13 @@ function Get-BootChainFinding {
         if ($signature.Verdict -eq 'Untrusted') {
             [void]$findings.Add((New-Finding -Cause 'UntrustedBootChainFile' -Item $spec.RelativePath -Repairable $false `
                         -Message "The $($spec.Label) at $path carries a well formed signature that this rescue VM does not trust ($($signature.Status): $($signature.Message)). That describes the rescue VM's certificate store rather than the guest's file, so nothing was changed. Compare it with a VM of the same build before replacing it." `
+                        -Data $spec))
+            continue
+        }
+
+        if ($signature.Verdict -eq 'Unreadable') {
+            [void]$findings.Add((New-Finding -Cause 'UnreadableBootChainFile' -Item $spec.RelativePath -Repairable $false `
+                        -Message "The signature of the $($spec.Label) at $path could not be evaluated at all ($($signature.Message)). That is a failure to read the file, not evidence about its contents, so nothing was changed and no sfc repair was attempted. Re-run once the file is readable." `
                         -Data $spec))
             continue
         }
@@ -973,4 +1004,13 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # A dependency may have failed to load before these functions became available.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog
+    }
 }

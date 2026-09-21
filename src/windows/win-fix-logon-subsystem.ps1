@@ -28,6 +28,11 @@
 #        userinit.exe as a critical system process failure.
 #     6. ProfileList. A SID carrying a .bak twin, or the temporary-profile bit in State, is the
 #        "We can't sign in to your account" / "User Profile Service failed the logon" pattern.
+#     7. RPC hosting. RpcSs and RpcEptMapper are both -k rpcss services, so Windows starts them in
+#        one shared svchost process. Svchost groups services by their exact command line, so if
+#        RpcEptMapper's ImagePath stops being character-for-character what RpcSs has, the endpoint
+#        mapper lands in a process of its own. Local RPC and COM interface resolution then fails,
+#        and DWM and LogonUI crash and restart in a loop with no desktop ever appearing.
 #
 #   Repair changes only what detection found. Dangling list entries are dropped individually, the
 #   surviving entries are preserved in order, and the Windows default is written back only when
@@ -42,8 +47,9 @@
 # .RESOLVES
 #   Stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI,
 #   "The User Profile Service service failed the sign-in", "We can't sign in to your account" and
-#   logons that land in a temporary profile, and a VM that hangs on "Please wait" or re-enters setup
-#   on every boot.
+#   logons that land in a temporary profile, a VM that hangs on "Please wait" or re-enters setup
+#   on every boot, and a logon screen that never paints because DWM and LogonUI crash in a loop
+#   after the RPC endpoint mapper was split out of the shared RPC host process.
 #
 # .PARAMETER detectOnly
 #   "true" to report what would be changed and make no writes at all. Defaults to "false".
@@ -87,7 +93,16 @@
 #   started by userinit.exe and the shell after a successful logon, so they cannot stop a boot, and a
 #   VM affected by one is still reachable online where it can be fixed without a disk swap.
 #
+#   The RPC hosting repair only ever copies RpcSs's own ImagePath onto RpcEptMapper, and only when
+#   everything else about both services is still stock: shared-process type, automatic start, the
+#   NetworkService account, the COM Infrastructure group, RpcSs holding a REG_EXPAND_SZ
+#   %SystemRoot%\system32\svchost.exe -k rpcss command, and RpcEptMapper already naming that same
+#   executable and arguments including the -p protection flag when present. Anything else is
+#   reported and left alone, because a genuinely customised RPC configuration is not this script's
+#   to overwrite. No command line is invented.
+#
 # .VERSION
+#   v1.2: Detect and repair an RpcEptMapper ImagePath that no longer shares the RpcSs svchost host.
 #   v1.1: Validate every resolved executable and repair SubSystems\Windows from LastKnownGood.
 #   v1.0: Initial version.
 #
@@ -194,6 +209,7 @@ function Resolve-LogonCommand {
         IsSigned        = $false
         IsMicrosoft     = $false
         IsLikelyMicrosoft = $false
+        HashUnreadable  = $false
         Reason          = $null
     }
 
@@ -274,6 +290,11 @@ function Resolve-LogonCommand {
             $result.SHA256 = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256 -ErrorAction Stop).Hash
         }
         catch {
+            # A hash that cannot be READ is not evidence that the binary is bad. Without this flag
+            # the empty SHA256 below fails Test-ResolutionIntegrity exactly as a corrupt binary
+            # would, and for SubSystems\Windows that failure authorises overwriting the live value
+            # from LastKnownGood - a write driven by an I/O error on a healthy csrss.exe.
+            $result.HashUnreadable = $true
             $result.Reason = "the binary exists but its SHA-256 could not be read: $candidate"
         }
 
@@ -867,7 +888,16 @@ function Get-AllFinding {
                         [System.StringComparison]::Ordinal)
                 ))
 
-            if ($subsystem.KeyPresent -and $replacementDiffers) {
+            # Evidence that could not be READ is not evidence of a fault. When the only thing
+            # against the active value is that its executable could not be hashed, the value may be
+            # perfectly correct and the disk perfectly healthy, so this reports and changes nothing.
+            # Without this gate an I/O error on a healthy csrss.exe overwrites the live value from
+            # LastKnownGood.
+            $subsystemHashUnreadable = (
+                $null -ne $subsystem.Resolution -and
+                $subsystem.Resolution.HashUnreadable)
+
+            if ($subsystem.KeyPresent -and $replacementDiffers -and -not $subsystemHashUnreadable) {
                 [void]$findings.Add((New-Finding -Cause 'WindowsSubsystemBroken' -Item 'SubSystems\Windows' -Hive 'SYSTEM' `
                             -Message "Session Manager SubSystems\Windows cannot start the Windows subsystem because $activeReason. LastKnownGood $($lastKnownGood.ControlSet) carries a REG_EXPAND_SZ value whose first executable is a non-zero, hash-readable Microsoft image at $($lastKnownGood.Resolution.Resolved). Its exact value will be copied to the active control set." `
                             -Data ([PSCustomObject]@{
@@ -876,7 +906,10 @@ function Get-AllFinding {
                                 })))
             }
             else {
-                $fallbackReason = if (-not $subsystem.KeyPresent) {
+                $fallbackReason = if ($subsystemHashUnreadable) {
+                    "the active executable could not be SHA-256 read, which is a failure to gather evidence rather than proof the value is wrong, and an unreadable file is not authority to overwrite a live value"
+                }
+                elseif (-not $subsystem.KeyPresent) {
                     "the active $($subsystem.KeyPath) key does not exist, so there is nowhere to write the value"
                 }
                 elseif (-not $SessionManager.LastKnownGoodIsDistinct) {
@@ -1508,4 +1541,13 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # A dependency may have failed to load before these functions became available.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog
+    }
 }

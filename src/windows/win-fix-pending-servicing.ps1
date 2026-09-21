@@ -919,6 +919,11 @@ try {
         PendingXmlRenamedTo = ''
         TxRBackupFolder     = ''
         TxRBackupRecord     = @()
+        # Revert does not read these - it reverses each edit individually. They are recorded because
+        # the only other place they appear is the rescue VM's desktop log, which is destroyed by
+        # 'az vm repair restore'. An operator whose revert goes wrong would otherwise have a raw hive
+        # copy sitting on the OS disk with no way to find out where.
+        HiveBackups         = @()
     }
     $changes = 0
     $txrRemoved = 0
@@ -926,9 +931,11 @@ try {
     if ($findings.Count -gt 0) {
         $softwareBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
         Log-Info "SOFTWARE hive backed up to $softwareBackup" | Tee-Object -FilePath $logFile -Append
+        $manifest.HiveBackups += [PSCustomObject]@{ Hive = 'SOFTWARE'; Path = "$softwareBackup" }
         if ($hasComponentsHive) {
             $componentsBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'COMPONENTS'
             Log-Info "COMPONENTS hive backed up to $componentsBackup" | Tee-Object -FilePath $logFile -Append
+            $manifest.HiveBackups += [PSCustomObject]@{ Hive = 'COMPONENTS'; Path = "$componentsBackup" }
         }
 
         # DISM first: a successful revert consumes pending.xml itself, and there is no point renaming
@@ -1071,6 +1078,7 @@ try {
         if ($recorded.Count -gt 0) {
             $systemBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SYSTEM'
             Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
+            $manifest.HiveBackups += [PSCustomObject]@{ Hive = 'SYSTEM'; Path = "$systemBackup" }
 
             $script:ServiceChanges = 0
             Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
@@ -1183,4 +1191,13 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # A dependency may have failed to load before these functions became available.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog
+    }
 }
