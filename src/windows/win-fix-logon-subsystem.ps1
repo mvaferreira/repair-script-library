@@ -2,7 +2,7 @@
 #
 # .SYNOPSIS
 #   Repairs the logon subsystem of an offline Windows disk: Winlogon, Session Manager, the profile
-#   list and the setup-mode command.
+#   list, the setup-mode command and RPC service hosting.
 #
 # .DESCRIPTION
 #   Runs against the broken OS disk attached to a rescue VM by "az vm repair create". Every value the
@@ -28,11 +28,23 @@
 #        userinit.exe as a critical system process failure.
 #     6. ProfileList. A SID carrying a .bak twin, or the temporary-profile bit in State, is the
 #        "We can't sign in to your account" / "User Profile Service failed the logon" pattern.
+#     7. RPC service hosting. The Service Control Manager groups services into one svchost.exe by
+#        their ImagePath command line, matched as a string rather than as a resolved file. RpcSs
+#        and RpcEptMapper ship with the same one and have to share a host, so a difference in
+#        quoting alone - "C:\Windows\system32\svchost.exe" -k rpcss against
+#        %SystemRoot%\system32\svchost.exe -k rpcss -p - starts them in two processes. Local RPC
+#        then loses interfaces its callers expect, and DWM and LogonUI restart in a loop at a black
+#        screen. Both values are compared after the guest's own environment expansion, keeping
+#        quotes and spacing, and only RpcEptMapper is ever rewritten.
 #
 #   Repair changes only what detection found. Dangling list entries are dropped individually, the
 #   surviving entries are preserved in order, and the Windows default is written back only when
 #   removing the broken entries would otherwise leave the value empty. A customised shell or an
 #   extra Userinit command whose binary is present is reported and deliberately left alone.
+#
+#   A check that cannot read the evidence it needs raises its own non-repairable finding rather than
+#   returning quietly, so "no findings" always means the disk was examined and found healthy, never
+#   that the script could not look.
 #
 #   Every executable named by these values is checked for existence, non-zero length, SHA-256
 #   readability and signature state. Required Windows binaries must resolve to a trusted Microsoft
@@ -41,9 +53,10 @@
 #
 # .RESOLVES
 #   Stop error 0xC000021A STATUS_SYSTEM_PROCESS_TERMINATED, a black screen before the logon UI,
-#   "The User Profile Service service failed the sign-in", "We can't sign in to your account" and
-#   logons that land in a temporary profile, and a VM that hangs on "Please wait" or re-enters setup
-#   on every boot.
+#   a DWM and LogonUI crash loop caused by RpcSs and RpcEptMapper starting in separate service
+#   hosts, "The User Profile Service service failed the sign-in", "We can't sign in to your account"
+#   and logons that land in a temporary profile, and a VM that hangs on "Please wait" or re-enters
+#   setup on every boot.
 #
 # .PARAMETER detectOnly
 #   "true" to report what would be changed and make no writes at all. Defaults to "false".
@@ -622,10 +635,14 @@ function Get-ProfileListState {
         # Handle each SID once, from its primary key.
         if ($name -match '\.(bak|old)$') { continue }
 
-        $props = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+        $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
         $bakPath = "$basePath\$name.bak"
-        $hasBak = Test-Path $bakPath
-        $bakProps = if ($hasBak) { Get-ItemProperty $bakPath -ErrorAction SilentlyContinue } else { $null }
+        # -LiteralPath, because $name is a key name read off the broken hive. On the registry
+        # provider -Path expands wildcards, so a SID carrying [ or ] makes Test-Path return False
+        # for a key that is really there - and a .bak twin that is not seen is the headline
+        # "We can't sign in to your account" fault going unreported on a disk called healthy.
+        $hasBak = Test-Path -LiteralPath $bakPath
+        $bakProps = if ($hasBak) { Get-ItemProperty -LiteralPath $bakPath -ErrorAction SilentlyContinue } else { $null }
 
         # Resolve-OfflineImagePath is for binaries and trims its result at the file extension, so a
         # profile directory is translated here instead: swap the guest's drive letter for the one
@@ -656,6 +673,179 @@ function Get-ProfileListState {
     return $state
 }
 
+function Get-RpcHostingState {
+    <#
+    .SYNOPSIS
+        Reads the RpcSs and RpcEptMapper ImagePath command lines and decides whether they still
+        start in one shared service host.
+
+    .DESCRIPTION
+        The Service Control Manager decides which services share an svchost.exe process by their
+        ImagePath command line. RpcSs and RpcEptMapper ship with the same one and are meant to share
+        a host: the endpoint mapper answers for interfaces the RPC runtime registers in that same
+        process. The match is made on the string, not on the file it resolves to, so two values that
+        name one executable still split the host when they are written differently:
+
+            %SystemRoot%\system32\svchost.exe -k rpcss -p
+            "C:\Windows\system32\svchost.exe" -k rpcss
+
+        Once they are split, local RPC loses interfaces its callers assume are there, and the first
+        things to fail are the ones that run before anyone signs in. DWM and LogonUI restart in a
+        loop and the VM sits at a black screen with no error, which reads as a logon fault and not
+        as a service-configuration one. It is also close to invisible by eye, because an engineer
+        comparing the two values sees the same executable in both and moves on.
+
+        The comparison is made on the guest's own expansion of each value, never the rescue VM's,
+        and it keeps quotes and spacing. Resolving each value down to its executable would compare
+        the one thing that already matches and hide the fault.
+
+    .OUTPUTS
+        PSCustomObject with Available, Reason, ControlSet, RpcSs, RpcEptMapper, HasMismatch,
+        CanRepair and RepairReason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$SystemRoot,
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive,
+        [Parameter(Mandatory = $true)][string]$GuestSystemRoot
+    )
+
+    $state = [PSCustomObject]@{
+        Available    = $false
+        Reason       = ''
+        ControlSet   = (Split-Path -Path $SystemRoot -Leaf)
+        RpcSs        = $null
+        RpcEptMapper = $null
+        HasMismatch  = $false
+        CanRepair    = $false
+        RepairReason = ''
+        Resolution   = $null
+    }
+
+    foreach ($name in @('RpcSs', 'RpcEptMapper')) {
+        $subKeyPath = "BROKENSYSTEM\$($state.ControlSet)\Services\$name"
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath)
+        if ($null -eq $key) {
+            $state.Reason = "the offline $name service key is missing at HKLM:\$subKeyPath, so the two RPC command lines cannot be compared"
+            return $state
+        }
+
+        try {
+            $raw = $key.GetValue(
+                'ImagePath',
+                $null,
+                [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($raw -isnot [string] -or [string]::IsNullOrWhiteSpace($raw)) {
+                $state.Reason = "$name has no usable ImagePath value at HKLM:\$subKeyPath, so the two RPC command lines cannot be compared"
+                return $state
+            }
+
+            $state.$name = [PSCustomObject]@{
+                Name               = $name
+                KeyPath            = "HKLM:\$subKeyPath"
+                ImagePath          = [string]$raw
+                ValueKind          = $key.GetValueKind('ImagePath').ToString()
+                EffectiveImagePath = ''
+                Type               = $key.GetValue('Type', $null)
+                Start              = $key.GetValue('Start', $null)
+                ObjectName         = $key.GetValue('ObjectName', $null)
+                Group              = $key.GetValue('Group', $null)
+            }
+        }
+        finally {
+            $key.Close()
+        }
+    }
+
+    foreach ($service in @($state.RpcSs, $state.RpcEptMapper)) {
+        $service.EffectiveImagePath = [regex]::Replace(
+            $service.ImagePath,
+            '(?i)%(SystemRoot|windir|SystemDrive)%',
+            [System.Text.RegularExpressions.MatchEvaluator] {
+                param($match)
+                if ($match.Groups[1].Value -ieq 'SystemDrive') { return $GuestSystemRoot.Substring(0, 2) }
+                return $GuestSystemRoot
+            })
+
+        if ($service.EffectiveImagePath.Contains('%')) {
+            $state.Reason = "$($service.Name) ImagePath '$($service.ImagePath)' still carries an environment-variable token after the guest's own expansion, so the two command lines cannot be compared safely"
+            return $state
+        }
+    }
+
+    $state.Available = $true
+    $state.HasMismatch = -not [string]::Equals(
+        $state.RpcSs.EffectiveImagePath,
+        $state.RpcEptMapper.EffectiveImagePath,
+        [System.StringComparison]::OrdinalIgnoreCase)
+
+    if (-not $state.HasMismatch) {
+        $state.Reason = "both services resolve to the command line '$($state.RpcSs.EffectiveImagePath)', so the Service Control Manager starts them in one shared host"
+        return $state
+    }
+
+    $state.Reason = "RpcSs runs '$($state.RpcSs.EffectiveImagePath)' and RpcEptMapper runs '$($state.RpcEptMapper.EffectiveImagePath)' after the guest expansion"
+
+    # Everything below decides whether the difference is a plain path fault that can be rewritten,
+    # or a real configuration change that has to be left to a person. Each gate that fails is
+    # reported with the evidence that failed it, because "no automatic repair" is only useful to
+    # the engineer if it says what stopped it.
+    foreach ($service in @($state.RpcSs, $state.RpcEptMapper)) {
+        if ($service.Type -ne 32 -or $service.Start -ne 2 -or
+            "$($service.ObjectName)" -ine 'NT AUTHORITY\NetworkService' -or
+            "$($service.Group)" -ine 'COM Infrastructure') {
+            $state.RepairReason = "$($service.Name) no longer carries the shared-process type, automatic start, NetworkService account and COM Infrastructure group a standard RPC host has (Type=$($service.Type), Start=$($service.Start), ObjectName='$($service.ObjectName)', Group='$($service.Group)'), so the difference is more than a path and rewriting it could change what starts"
+            return $state
+        }
+    }
+
+    # The repair copies RpcSs onto RpcEptMapper, so RpcSs itself has to be the value Windows ships.
+    $reference = [regex]::Match(
+        $state.RpcSs.ImagePath,
+        '(?i)^%SystemRoot%\\system32\\svchost\.exe(?<Args> -k rpcss(?: -p)?)$')
+    if (-not $reference.Success -or $state.RpcSs.ValueKind -ne 'ExpandString') {
+        $state.RepairReason = "RpcSs ImagePath is $($state.RpcSs.ValueKind) '$($state.RpcSs.ImagePath)' rather than the REG_EXPAND_SZ svchost command line Windows ships, so there is no known-good value to copy from"
+        return $state
+    }
+
+    # With a space in the Windows directory a quoted and an unquoted command line are not
+    # interchangeable, so the difference cannot be judged on the string alone.
+    if ($GuestSystemRoot -match '\s') {
+        $state.RepairReason = "the guest Windows directory '$GuestSystemRoot' contains a space, so quoting is significant and the difference between the two command lines cannot be treated as cosmetic"
+        return $state
+    }
+
+    $mapper = [regex]::Match(
+        $state.RpcEptMapper.EffectiveImagePath,
+        '(?i)^(?:"(?<Exe>[^"]+)"|(?<Exe>[^\s"]+))(?<Args> -k rpcss(?: -p)?)$')
+    if (-not $mapper.Success -or
+        $mapper.Groups['Exe'].Value -ine "$GuestSystemRoot\system32\svchost.exe" -or
+        $mapper.Groups['Args'].Value -ine $reference.Groups['Args'].Value) {
+        $state.RepairReason = "RpcEptMapper ImagePath '$($state.RpcEptMapper.ImagePath)' does not name the same svchost.exe and the same -k rpcss arguments as RpcSs, including the -p protection flag when it is present, so the two are not the same command written differently"
+        return $state
+    }
+
+    # Read against the offline disk, because a value naming an svchost.exe the guest no longer has
+    # would be copied onto a second service and split the host for a different reason.
+    $state.Resolution = Resolve-LogonCommand `
+        -Command $state.RpcSs.ImagePath `
+        -WindowsPath $WindowsPath `
+        -WindowsDrive $WindowsDrive
+    if (-not (Test-ResolutionIntegrity -Resolution $state.Resolution -RequireMicrosoft)) {
+        $detail = if ($null -eq $state.Resolution -or -not $state.Resolution.Exists) {
+            "$($state.Resolution.Reason)"
+        }
+        else {
+            "it is not a hash-readable trusted Microsoft image (signature $($state.Resolution.SignatureStatus), SHA-256 '$($state.Resolution.SHA256)')"
+        }
+        $state.RepairReason = "the svchost.exe both services would share cannot be trusted on this disk: $detail"
+        return $state
+    }
+
+    $state.CanRepair = $true
+    return $state
+}
+
 function Get-AllFinding {
     <#
     .SYNOPSIS
@@ -671,7 +861,8 @@ function Get-AllFinding {
         [Parameter(Mandatory = $true)]$Winlogon,
         [Parameter(Mandatory = $true)]$SessionManager,
         [Parameter(Mandatory = $true)]$SetupMode,
-        [Parameter(Mandatory = $true)]$ProfileList
+        [Parameter(Mandatory = $true)]$ProfileList,
+        [Parameter(Mandatory = $true)]$Rpc
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -961,6 +1152,23 @@ function Get-AllFinding {
                     -Message "$($Winlogon.Reason). The key itself being gone is registry damage rather than a logon fault: run win-fix-registry-corruption against this disk."))
     }
 
+    # -- RPC service hosting, which the logon UI depends on ---------------------------------------
+    if (-not $Rpc.Available) {
+        [void]$findings.Add((New-Finding -Cause 'RpcHostingUnavailable' -Item 'RpcSs/RpcEptMapper ImagePath' -Hive 'SYSTEM' -Repairable $false `
+                    -Message "RPC service hosting could not be assessed because $($Rpc.Reason). This check was not completed, so a shared-host fault cannot be ruled out on this disk. The values themselves being unreadable is registry damage rather than a logon fault: run win-fix-registry-corruption against this disk." `
+                    -Data $Rpc))
+    }
+    elseif ($Rpc.HasMismatch -and $Rpc.CanRepair) {
+        [void]$findings.Add((New-Finding -Cause 'RpcHostSplit' -Item 'RpcEptMapper ImagePath' -Hive 'SYSTEM' `
+                    -Message "RpcSs and RpcEptMapper do not carry the same ImagePath command line, so the Service Control Manager starts them in two svchost.exe processes instead of one shared RPC host: $($Rpc.Reason). The endpoint mapper then answers separately from the RPC runtime that registers the local interfaces, and the components that run before sign-in are the first to fail - DWM and LogonUI restart in a loop and the VM stays at a black screen. Both values name the same trusted svchost.exe at $($Rpc.Resolution.Resolved) and the same -k rpcss arguments, so this is one command written two ways. RpcEptMapper ImagePath will be set to the RpcSs value '$($Rpc.RpcSs.ImagePath)' as REG_EXPAND_SZ. RpcSs is not changed." `
+                    -Data $Rpc))
+    }
+    elseif ($Rpc.HasMismatch) {
+        [void]$findings.Add((New-Finding -Cause 'RpcHostSplitUnsafe' -Item 'RpcEptMapper ImagePath' -Hive 'SYSTEM' -Repairable $false `
+                    -Message "RpcSs and RpcEptMapper do not carry the same ImagePath command line, so they can start in two svchost.exe processes rather than one shared RPC host, which breaks the local RPC interfaces DWM and LogonUI need before sign-in: $($Rpc.Reason). It was reported and not repaired because $($Rpc.RepairReason)." `
+                    -Data $Rpc))
+    }
+
     # -- Profile list ------------------------------------------------------------------------------
     foreach ($userProfile in @($ProfileList.Profiles)) {
         if ($userProfile.HasBak) {
@@ -1039,6 +1247,73 @@ function Repair-Finding {
             return $true
         }
 
+        '^RpcHostSplit$' {
+            $data = $Finding.Data
+            $controlSet = Split-Path -Path $SystemRoot -Leaf
+            $replacement = [string]$data.RpcSs.ImagePath
+
+            # RpcSs is read again rather than trusted from the assessment. If anything moved
+            # between detection and now, copying a remembered value would write a command line
+            # that no longer matches the service it is supposed to join.
+            $sourceKeyPath = "BROKENSYSTEM\$controlSet\Services\RpcSs"
+            $sourceKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($sourceKeyPath)
+            if ($null -eq $sourceKey) {
+                throw "The RpcSs service key is no longer available: HKLM:\$sourceKeyPath"
+            }
+
+            try {
+                $liveSource = $sourceKey.GetValue(
+                    'ImagePath',
+                    $null,
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($liveSource -isnot [string] -or
+                    -not [string]::Equals([string]$liveSource, $replacement, [System.StringComparison]::Ordinal) -or
+                    $sourceKey.GetValueKind('ImagePath') -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                    throw 'RpcSs ImagePath changed after it was assessed. Nothing was written; rerun this script against the disk.'
+                }
+            }
+            finally {
+                $sourceKey.Close()
+            }
+
+            $subKeyPath = "BROKENSYSTEM\$controlSet\Services\RpcEptMapper"
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath, $true)
+            if ($null -eq $key) {
+                throw "The RpcEptMapper service key is no longer available: HKLM:\$subKeyPath"
+            }
+
+            try {
+                $present = ($key.GetValueNames() -contains 'ImagePath')
+                $existing = if ($present) {
+                    [string]$key.GetValue(
+                        'ImagePath',
+                        $null,
+                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                }
+                else {
+                    ''
+                }
+                $kind = if ($present) { $key.GetValueKind('ImagePath') } else { $null }
+
+                if ($present -and
+                    $kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString -and
+                    [string]::Equals($existing, $replacement, [System.StringComparison]::Ordinal)) {
+                    return $false
+                }
+
+                $key.SetValue(
+                    'ImagePath',
+                    $replacement,
+                    [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            }
+            finally {
+                $key.Close()
+            }
+
+            Add-OfflineRepairLog -Message "RpcEptMapper ImagePath in $controlSet : replaced '$existing' with the RpcSs command line '$replacement' as REG_EXPAND_SZ, so both services start in one shared RPC host again. RpcSs was not changed."
+            return $true
+        }
+
         '^(BootExecute|SetupExecute)Dangling$' {
             $data = $Finding.Data
             $keyPath = "$SystemRoot\Control\Session Manager"
@@ -1110,24 +1385,33 @@ function Repair-Finding {
             $basePath = Split-Path -Path $userProfile.KeyPath -Parent
             $oldPath = "$($userProfile.KeyPath).old"
 
-            if (-not (Test-Path $userProfile.BakKeyPath)) { return $false }
-            if (Test-Path $oldPath) { Remove-Item -Path $oldPath -Recurse -Force -ErrorAction Stop }
+            # Every path below carries the profile SID read off the broken hive, so all of them are
+            # literal. -Path would wildcard-expand a SID containing * or ?, and the Remove-Item on
+            # the next line would then delete every .old key it matched rather than this one.
+            if (-not (Test-Path -LiteralPath $userProfile.BakKeyPath)) { return $false }
+            if (Test-Path -LiteralPath $oldPath) { Remove-Item -LiteralPath $oldPath -Recurse -Force -ErrorAction Stop }
 
-            Rename-Item -Path $userProfile.KeyPath -NewName "$($userProfile.Sid).old" -Force -ErrorAction Stop
-            Rename-Item -Path $userProfile.BakKeyPath -NewName $userProfile.Sid -Force -ErrorAction Stop
+            Rename-Item -LiteralPath $userProfile.KeyPath -NewName "$($userProfile.Sid).old" -Force -ErrorAction Stop
+            Rename-Item -LiteralPath $userProfile.BakKeyPath -NewName $userProfile.Sid -Force -ErrorAction Stop
             Add-OfflineRepairLog -Message "$($userProfile.Sid): the replacement profile entry was renamed to .old and the .bak entry restored as the primary one."
 
             $restored = "$basePath\$($userProfile.Sid)"
-            $props = Get-ItemProperty $restored -ErrorAction SilentlyContinue
+            $props = Get-ItemProperty -LiteralPath $restored -ErrorAction SilentlyContinue
+            if ($null -eq $props) {
+                # The renames above succeeded, so this key has to be readable. Reporting the profile
+                # as repaired here would claim the State and RefCount work below was done when it
+                # was silently skipped.
+                throw "The restored profile key could not be read back after the rename: $restored"
+            }
 
             $state = if ($null -ne $props.State) { [int]$props.State } else { 0 }
             if (($state -band 0x8) -ne 0) {
                 $newState = $state -band (-bnot 0x8)
-                Set-ItemProperty -Path $restored -Name 'State' -Value $newState -Type DWord -Force -ErrorAction Stop
+                Set-ItemProperty -LiteralPath $restored -Name 'State' -Value $newState -Type DWord -Force -ErrorAction Stop
                 Add-OfflineRepairLog -Message "$($userProfile.Sid): State $state -> $newState (temporary-profile bit cleared)."
             }
             if ($null -ne $props.RefCount -and [int]$props.RefCount -ne 0) {
-                Set-ItemProperty -Path $restored -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction Stop
+                Set-ItemProperty -LiteralPath $restored -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction Stop
                 Add-OfflineRepairLog -Message "$($userProfile.Sid): RefCount $($props.RefCount) -> 0, so the profile is not treated as still loaded."
             }
             return $true
@@ -1135,16 +1419,16 @@ function Repair-Finding {
 
         '^ProfileTemporaryFlag$' {
             $userProfile = $Finding.Data
-            $props = Get-ItemProperty $userProfile.KeyPath -ErrorAction SilentlyContinue
+            $props = Get-ItemProperty -LiteralPath $userProfile.KeyPath -ErrorAction SilentlyContinue
             $state = if ($null -ne $props.State) { [int]$props.State } else { 0 }
             if (($state -band 0x8) -eq 0) { return $false }
 
             $newState = $state -band (-bnot 0x8)
-            Set-ItemProperty -Path $userProfile.KeyPath -Name 'State' -Value $newState -Type DWord -Force -ErrorAction Stop
+            Set-ItemProperty -LiteralPath $userProfile.KeyPath -Name 'State' -Value $newState -Type DWord -Force -ErrorAction Stop
             Add-OfflineRepairLog -Message "$($userProfile.Sid): State $state -> $newState (temporary-profile bit cleared)."
 
             if ($null -ne $props.RefCount -and [int]$props.RefCount -ne 0) {
-                Set-ItemProperty -Path $userProfile.KeyPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction Stop
+                Set-ItemProperty -LiteralPath $userProfile.KeyPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction Stop
                 Add-OfflineRepairLog -Message "$($userProfile.Sid): RefCount $($props.RefCount) -> 0."
             }
             return $true
@@ -1169,6 +1453,7 @@ try {
         $sessionManager = Get-SessionManagerState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         $setupMode = Get-SetupModeState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive
         $profileList = Get-ProfileListState -WindowsDrive $offline.WindowsDrive
+        $rpc = Get-RpcHostingState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive -GuestSystemRoot (Get-GuestSystemRoot)
 
         return [PSCustomObject]@{
             ControlSet     = (Split-Path -Path $systemRoot -Leaf)
@@ -1176,7 +1461,8 @@ try {
             SessionManager = $sessionManager
             SetupMode      = $setupMode
             ProfileList    = $profileList
-            Findings       = @(Get-AllFinding -Winlogon $winlogon -SessionManager $sessionManager -SetupMode $setupMode -ProfileList $profileList)
+            Rpc            = $rpc
+            Findings       = @(Get-AllFinding -Winlogon $winlogon -SessionManager $sessionManager -SetupMode $setupMode -ProfileList $profileList -Rpc $rpc)
         }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -1214,6 +1500,12 @@ try {
         Log-Warning 'SYSTEM\Setup\SystemSetupInProgress is 1, so the guest believes Windows setup has not finished. That is normal only for a VM captured mid-Sysprep, and it was left alone.' | Tee-Object -FilePath $logFile -Append
     }
     Log-Info "Profile list: $(@($context.ProfileList.Profiles).Count) user profile(s)." | Tee-Object -FilePath $logFile -Append
+    if ($context.Rpc.Available) {
+        Log-Info "RPC hosting $($context.Rpc.ControlSet): RpcSs ImagePath '$($context.Rpc.RpcSs.ImagePath)' ($($context.Rpc.RpcSs.ValueKind)) resolves to '$($context.Rpc.RpcSs.EffectiveImagePath)'; RpcEptMapper ImagePath '$($context.Rpc.RpcEptMapper.ImagePath)' ($($context.Rpc.RpcEptMapper.ValueKind)) resolves to '$($context.Rpc.RpcEptMapper.EffectiveImagePath)'; shared host = $(-not $context.Rpc.HasMismatch)." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Warning "RPC service hosting could not be assessed because $($context.Rpc.Reason)." | Tee-Object -FilePath $logFile -Append
+    }
 
     $findings = @($context.Findings)
     foreach ($finding in $findings) {
@@ -1223,6 +1515,18 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
     $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
+    # This runs ahead of the detect-only gate on purpose, so one affirmative line serves both modes.
+    # A detect run that printed only "found 0 issue(s)" would read the same whether the script
+    # examined everything and found it healthy or never managed to look, and those are the two
+    # outcomes an engineer most needs to tell apart. Every check that cannot complete raises its own
+    # non-repairable finding instead of staying silent, so reaching this line with no findings does
+    # mean each item named below was read and found good.
+    if ($findings.Count -eq 0) {
+        Log-Output 'No logon subsystem fault was found. The Windows subsystem and required logon binaries are non-zero, hash-readable Microsoft images; every optional command resolves; RpcSs and RpcEptMapper carry one ImagePath command line, so RPC starts in a single shared host; and the VM is not held in setup mode. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_SUCCESS
+    }
+
     if ($isDetectOnly) {
         foreach ($finding in $findings) {
             Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
@@ -1231,12 +1535,6 @@ try {
         # keeps the tail, so a summary printed first is the first thing a long detect run loses -
         # which is how a run once reported every finding truncated away and still looked successful.
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($findings.Count -eq 0) {
-        Log-Output 'No logon subsystem fault was found. The Windows subsystem and required logon binaries are non-zero, hash-readable Microsoft images; every optional command resolves, and the VM is not held in setup mode. No changes were made.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -1284,7 +1582,8 @@ try {
                 -Winlogon (Get-WinlogonState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
                 -SessionManager (Get-SessionManagerState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
                 -SetupMode (Get-SetupModeState -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive) `
-                -ProfileList (Get-ProfileListState -WindowsDrive $offline.WindowsDrive))
+                -ProfileList (Get-ProfileListState -WindowsDrive $offline.WindowsDrive) `
+            -Rpc (Get-RpcHostingState -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive -GuestSystemRoot (Get-GuestSystemRoot)))
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 

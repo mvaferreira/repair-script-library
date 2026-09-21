@@ -273,24 +273,38 @@ function Get-EfiFallbackBootFileName {
         architecture specific, and writing an x64 loader to the ARM64 name leaves the firmware
         refusing it just as firmly as if there were no loader at all.
 
-        The architecture is read from the Machine field of the kernel's own PE header rather than
+        The architecture is read from the Machine field of a boot binary's own PE header rather than
         from the rescue VM, which may be a different architecture than the disk attached to it, and
         rather than from the registry, which would need a hive mount for two bytes.
+
+        Several binaries are tried, because the kernel is one of the files this very script reports
+        as missing or corrupt. They all carry the same architecture, so the first one that parses
+        answers the question. When none of them parse the answer is not x64 by default: on an ARM64
+        disk that guess writes bootx64.efi, reports the fallback restored, and leaves bootaa64.efi -
+        the name the firmware actually looks for - still missing, which is a broken disk declared
+        fixed. An empty string is returned instead and the caller reports it.
     #>
     param([Parameter(Mandatory = $true)][string]$WindowsDrive)
 
-    $kernel = Join-OfflinePath -Root $WindowsDrive -ChildPath 'Windows\System32\ntoskrnl.exe'
-    $machine = (Get-PeImageInfo -Path $kernel).Machine
+    $candidates = @(
+        'Windows\System32\ntoskrnl.exe'
+        'Windows\System32\winload.efi'
+        'Windows\Boot\EFI\bootmgfw.efi'
+        'Windows\System32\ntdll.dll'
+    )
 
-    switch ($machine) {
-        0xAA64 { return 'bootaa64.efi' }
-        0x8664 { return 'bootx64.efi' }
-        0x014C { return 'bootia32.efi' }
-        default {
-            Add-OfflineRepairLog -Level Info -Message ("Could not read an architecture from $kernel (PE machine 0x{0:X4}). Assuming x64, which is what every Azure Gen2 Windows image except the ARM64 sizes uses." -f $machine)
-            return 'bootx64.efi'
+    foreach ($relative in $candidates) {
+        $path = Join-OfflinePath -Root $WindowsDrive -ChildPath $relative
+        $machine = (Get-PeImageInfo -Path $path).Machine
+        switch ($machine) {
+            0xAA64 { return 'bootaa64.efi' }
+            0x8664 { return 'bootx64.efi' }
+            0x014C { return 'bootia32.efi' }
         }
     }
+
+    Add-OfflineRepairLog -Level Warning -Message "Could not read an architecture from any of $($candidates -join ', ') on $WindowsDrive, so the fallback loader name for this installation is unknown."
+    return ''
 }
 
 function Get-SignatureState {
@@ -310,20 +324,33 @@ function Get-SignatureState {
         while its signature had already stopped verifying.
 
         Verdicts:
-          Valid                                 the file is intact and is the file Microsoft signed
-          HashMismatch, NotSigned, UnknownError the bytes no longer match the signature, or the
-                                                signature is gone with them - repairable
-          NotTrusted                            the signature is well formed but its chain is not
-                                                trusted HERE. That is a statement about the rescue
-                                                VM, not about the guest, so it is reported and never
-                                                repaired.
+          Valid          the file is intact and is the file Microsoft signed
+          HashMismatch   a signature is present and the bytes no longer match it. Definitive
+                         evidence of corruption, so it is repairable.
+          NotTrusted     the signature is well formed but its chain is not trusted HERE. That is a
+                         statement about the rescue VM, not about the guest, so it is reported and
+                         never repaired.
+          NotSigned,     these are what a perfectly HEALTHY Windows boot file reports when it is
+          UnknownError,  read from a rescue VM. Every boot chain binary is catalog signed rather
+          other          than embedded signed, and the catalogs live on the offline disk, which the
+                         rescue VM cannot consult - see Test-OfflineFileSignature in
+                         OfflineRepairCommon.ps1, which documents the same behaviour. So the
+                         signature alone cannot separate a healthy file from a destroyed one here.
 
-        A zeroed 3 MB file reports UnknownError with "The form specified for the subject is not one
-        supported or known by the specified trust provider"; a file with corrupted bytes over its
-        header reports NotSigned. Both mean the same thing for this purpose.
+                         The PE header can, and it needs no catalog. A zeroed, truncated or header
+                         smashed file is not a parseable image, and that is proof of corruption on
+                         its own evidence. A file that still parses is reported as Unverifiable and
+                         left alone: not proven good, but not proven bad either, and replacing a
+                         boot manager on a guess is how a VM that boots becomes one that does not.
 
-        No network is needed. A second pass over the same thirteen files returned identical verdicts
-        in 0.26s, so nothing here depends on reaching a revocation list.
+        Measured: bootmgfw.efi, bootmgr.efi, winload.efi and ntoskrnl.exe all report
+        SignatureType=Catalog, so none of them can be verified without the guest's own catalog
+        store. A zeroed 3 MB file, a file with its first 512 bytes overwritten and a 201 byte
+        truncation all report UnknownError and all fail the PE header test, while an untouched copy
+        passes it - which is what makes the header the usable signal offline.
+
+        Note IsPe is the test, not IsEfi: bootmgr.efi and winload.efi are subsystem 16 (Windows boot
+        application), not an EFI subsystem, so requiring IsEfi would condemn healthy files.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -332,9 +359,12 @@ function Get-SignatureState {
         Intact  = $false
         Verdict = 'Missing'
         Message = ''
+        IsPe    = $false
     }
 
     if (-not (Test-OfflinePath $Path)) { return $state }
+
+    $state.IsPe = (Get-PeImageInfo -Path $Path).IsPe
 
     try {
         $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
@@ -349,7 +379,11 @@ function Get-SignatureState {
     switch ($state.Status) {
         'Valid' { $state.Intact = $true; $state.Verdict = 'Intact' }
         'NotTrusted' { $state.Verdict = 'Untrusted' }
-        default { $state.Verdict = 'Broken' }
+        'HashMismatch' { $state.Verdict = 'Broken' }
+        default {
+            if ($state.IsPe) { $state.Verdict = 'Unverifiable' }
+            else { $state.Verdict = 'Broken' }
+        }
     }
 
     return $state
@@ -374,18 +408,25 @@ function Get-EspArtifactSpec {
 
     $fallbackName = Get-EfiFallbackBootFileName -WindowsDrive $WindowsDrive
 
-    return @(
+    $specs = @(
         @{
             Item        = 'bootmgfw'
             Label       = 'EFI boot manager'
             Destination = Join-OfflinePath -Root $BootDrive -ChildPath 'EFI\Microsoft\Boot\bootmgfw.efi'
         }
-        @{
+    )
+
+    # No architecture, no fallback spec. Writing the wrong name is worse than writing nothing,
+    # because it reports a repair that leaves the firmware exactly as unable to boot as before.
+    if ($fallbackName) {
+        $specs += @{
             Item        = 'fallback'
             Label       = "EFI fallback boot manager ($fallbackName)"
             Destination = Join-OfflinePath -Root $BootDrive -ChildPath "EFI\Boot\$fallbackName"
         }
-    )
+    }
+
+    return @($specs)
 }
 
 function Get-EspFinding {
@@ -450,6 +491,13 @@ function Get-EspFinding {
             continue
         }
 
+        if ($signature.Verdict -eq 'Unverifiable') {
+            [void]$findings.Add((New-Finding -Cause 'EspSignatureUnavailable' -Item $spec.Item -Repairable $false `
+                        -Message "The $($spec.Label) at $($spec.Destination) is a structurally valid image whose signature could not be checked from here ($($signature.Status)). Boot files are catalog signed and the catalogs are on the offline disk, so this is also what a perfectly healthy file reports to a rescue VM of a different build. It is therefore not evidence of corruption and nothing was changed. Replacing it on this evidence could roll the boot manager back to an older build and leave the VM refused by its own firmware. If the VM still stops at a Secure Boot error, compare this file against a VM of the same build, or reapply the servicing update." `
+                        -Data $spec))
+            continue
+        }
+
         # Prefer the boot manager already on this EFI System Partition as the source for the
         # fallback: it is the one this VM has actually been booting, and on a serviced VM it is
         # newer than anything on the Windows partition.
@@ -471,7 +519,7 @@ function Get-EspFinding {
 
         if ($signature.Status -ne 'Missing') {
             [void]$findings.Add((New-Finding -Cause 'CorruptEspArtifact' -Item $spec.Item `
-                        -Message "The $($spec.Label) at $($spec.Destination) is present but its signature does not verify ($($signature.Status)), so the firmware will refuse it. It will be replaced from $sourceNote" `
+                        -Message "The $($spec.Label) at $($spec.Destination) is corrupt$(if ($signature.IsPe) { " - a signature is present and the bytes no longer match it ($($signature.Status))" } else { ' - it is not a parseable image at all, which needs no signature check to establish' }), so the firmware will refuse it. It will be replaced from $sourceNote" `
                         -Data $spec))
         }
         else {
@@ -530,8 +578,15 @@ function Get-BootChainFinding {
             continue
         }
 
+        if ($signature.Verdict -eq 'Unverifiable') {
+            [void]$findings.Add((New-Finding -Cause 'BootChainSignatureUnavailable' -Item $spec.RelativePath -Repairable $false `
+                        -Message "The $($spec.Label) at $path is a structurally valid image whose signature could not be checked from here ($($signature.Status)). Boot chain files are catalog signed and their catalogs are on the offline disk, so a healthy file reports exactly this to a rescue VM of a different build. It is not evidence of corruption and nothing was changed. If this file really is suspect, compare it against a VM of the same build." `
+                        -Data $spec))
+            continue
+        }
+
         [void]$findings.Add((New-Finding -Cause 'CorruptBootChainFile' -Item $spec.RelativePath `
-                    -Message "The $($spec.Label) at $path is present but its signature does not verify ($($signature.Status)), so it is not the file Microsoft signed and the boot chain will refuse it. It will be repaired from the component store." `
+                    -Message "The $($spec.Label) at $path is corrupt$(if ($signature.IsPe) { " - a signature is present and the bytes no longer match it ($($signature.Status))" } else { ' - it is not a parseable image at all, which needs no signature check to establish' }), so the boot chain will refuse it. It will be repaired from the component store." `
                     -Data $spec))
     }
 
@@ -735,11 +790,21 @@ function Repair-Finding {
             # already be correct, and sfc then truthfully reports having repaired nothing. Treating
             # that as a failure reported an error on a disk that was in fact fully repaired.
             $after = Get-SignatureState -Path $path
+
             if ($after.Intact) {
                 return [PSCustomObject]@{ Repaired = $true; Detail = "$path is present and its signature verifies." }
             }
 
-            return [PSCustomObject]@{ Repaired = $false; Detail = "$($sfc.Detail) The signature of $path still does not verify ($($after.Status))." }
+            # A repaired file is catalog signed like every other boot file, so on a rescue VM that
+            # cannot read the guest's catalogs it comes back Unverifiable no matter how well the
+            # repair went. Requiring a verifying signature here reported a successful restore as a
+            # failure. What this path did prove is structural: the file was missing or was not a
+            # parseable image, and now it is one.
+            if ($after.Verdict -eq 'Unverifiable') {
+                return [PSCustomObject]@{ Repaired = $true; Detail = "$path was restored and is a structurally valid image again. Its signature could not be confirmed from this rescue VM ($($after.Status)), which is what any catalog signed boot file reports here." }
+            }
+
+            return [PSCustomObject]@{ Repaired = $false; Detail = "$($sfc.Detail) $path is still not a valid image ($($after.Status))." }
         }
 
         default {
@@ -893,6 +958,16 @@ try {
     $espSpecs = @(Get-EspArtifactSpec -WindowsDrive $offline.WindowsDrive -BootDrive $offline.BootDrive)
 
     $findings = @()
+
+    # Get-EspArtifactSpec drops the fallback spec when it cannot read the architecture. Saying so
+    # matters: without this line the run simply examines one artifact instead of two and still
+    # prints the intact verdict below, which would be a disk reported healthy on half a check.
+    if (-not ($espSpecs | Where-Object { $_.Item -eq 'fallback' })) {
+        $findings += @(New-Finding -Cause 'BootArchitectureUnavailable' -Item 'EFI\Boot' -Repairable $false `
+                -Message "The architecture of this installation could not be read from any boot binary on $($offline.WindowsDrive), so the name of the fallback loader the firmware looks for is unknown and it was not examined or repaired. Guessing it would write an x64 loader to an ARM64 disk and report a repair that leaves the firmware exactly as unable to boot. The boot manager itself was still checked. Repair the boot chain files first, then run this again." `
+                -Data $null)
+    }
+
     $findings += @(Get-EspFinding -Specs $espSpecs -WindowsDrive $offline.WindowsDrive)
     $findings += @(Get-BootChainFinding -WindowsDrive $offline.WindowsDrive)
 

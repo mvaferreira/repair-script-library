@@ -278,6 +278,9 @@ function Get-DeviceTopology {
     $classFilter = @{}
     $instanceFilter = @{}
     $criticalDevice = @{}
+    $available = $true
+    $unavailableReason = ''
+    $instancesRead = 0
 
     $record = {
         param($Table, $Service, $Reason)
@@ -290,24 +293,50 @@ function Get-DeviceTopology {
     # 1. Function drivers. Enum\<enumerator>\<device>\<instance> holds Service and ClassGUID, which
     #    is how Windows itself decides what a driver is for. Depth 2 from Enum reaches the instance
     #    keys without walking the whole tree.
+    #
+    #    Enum is the only source for protection checks 2 and 5, so an Enum we cannot read in full is
+    #    not a device tree with nothing in it - it is no evidence at all. Saying so matters more here
+    #    than anywhere else in this script, because an empty map does not make the run go quiet: it
+    #    makes every third party driver look unprotected, and the repair writes Start=4 on the one
+    #    holding the boot disk. Silence would turn a read failure into 0x7B.
     $enumRoot = "$SystemRoot\Enum"
-    if (Test-Path -LiteralPath $enumRoot) {
-        foreach ($instance in (Get-ChildItem -LiteralPath $enumRoot -Recurse -Depth 2 -ErrorAction SilentlyContinue)) {
-            $properties = Get-ItemProperty -LiteralPath $instance.PSPath -ErrorAction SilentlyContinue
-            if ($null -eq $properties) { continue }
+    if (-not (Test-Path -LiteralPath $enumRoot)) {
+        $available = $false
+        $unavailableReason = "the device tree key $enumRoot is not present in this control set"
+    }
+    else {
+        $enumErrors = $null
+        $instances = @(Get-ChildItem -LiteralPath $enumRoot -Recurse -Depth 2 -ErrorAction SilentlyContinue -ErrorVariable enumErrors)
+        $instancesRead = $instances.Count
 
-            $classGuid = $properties.ClassGUID
-            if ([string]::IsNullOrWhiteSpace($classGuid)) { continue }
-            $className = $script:ProtectedDeviceClass[$classGuid.Trim().ToLowerInvariant()]
-            if (-not $className) { continue }
+        if (@($enumErrors).Count -gt 0) {
+            $available = $false
+            $unavailableReason = "$(@($enumErrors).Count) key(s) under $enumRoot could not be enumerated, so the device tree read is incomplete"
+        }
+        elseif ($instancesRead -eq 0) {
+            $available = $false
+            $unavailableReason = "$enumRoot enumerated to nothing, which no booting Windows installation does"
+        }
+        else {
+            foreach ($instance in $instances) {
+                # A valueless intermediate key (the enumerator and device levels, such as Enum\ACPI)
+                # reads back as $null here. That is the normal shape of the tree, not a read failure.
+                $properties = Get-ItemProperty -LiteralPath $instance.PSPath -ErrorAction SilentlyContinue
+                if ($null -eq $properties) { continue }
 
-            $deviceId = $instance.PSPath -replace '^.*\\Enum\\', ''
-            if ($properties.Service) {
-                & $record $serviceClass $properties.Service "it is the driver for $deviceId, a device in the protected $className class"
-            }
-            foreach ($filterName in @('UpperFilters', 'LowerFilters')) {
-                foreach ($filter in (Get-MultiStringValue -Path $instance.PSPath -Name $filterName)) {
-                    & $record $instanceFilter $filter "it is a $filterName entry on $deviceId, a device in the protected $className class"
+                $classGuid = $properties.ClassGUID
+                if ([string]::IsNullOrWhiteSpace($classGuid)) { continue }
+                $className = $script:ProtectedDeviceClass[$classGuid.Trim().ToLowerInvariant()]
+                if (-not $className) { continue }
+
+                $deviceId = $instance.PSPath -replace '^.*\\Enum\\', ''
+                if ($properties.Service) {
+                    & $record $serviceClass $properties.Service "it is the driver for $deviceId, a device in the protected $className class"
+                }
+                foreach ($filterName in @('UpperFilters', 'LowerFilters')) {
+                    foreach ($filter in (Get-MultiStringValue -Path $instance.PSPath -Name $filterName)) {
+                        & $record $instanceFilter $filter "it is a $filterName entry on $deviceId, a device in the protected $className class"
+                    }
                 }
             }
         }
@@ -338,6 +367,9 @@ function Get-DeviceTopology {
     }
 
     return [PSCustomObject]@{
+        Available      = $available
+        Reason         = $unavailableReason
+        InstancesRead  = $instancesRead
         ServiceClass   = $serviceClass
         ClassFilter    = $classFilter
         InstanceFilter = $instanceFilter
@@ -459,10 +491,32 @@ function Get-AllFinding {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Drivers,
         [Parameter(Mandatory = $true)]$Topology,
+        [Parameter(Mandatory = $true)][bool]$ServicesAvailable,
         [Parameter(Mandatory = $false)][AllowEmptyString()][string]$TargetService = ''
     )
 
     $findings = [System.Collections.Generic.List[object]]::new()
+
+    # An unreadable Services key produces an empty inventory, which walks the loop below zero times
+    # and leaves the run reporting a clean disk. A SYSTEM hive that cannot list its own services is
+    # the opposite of clean, so it is stated outright rather than inferred from an empty list.
+    if (-not $ServicesAvailable) {
+        [void]$findings.Add((New-Finding -Cause 'ServicesKeyUnavailable' -Item 'Services' -Repairable $false `
+                    -Message 'The Services key could not be read in this control set, so no driver could be inventoried and nothing on this disk was actually checked. This is a damaged SYSTEM hive, not a healthy one: repair it with win-fix-registry-corruption and run this script again.' `
+                    -Data $null))
+    }
+
+    # Checks 2 and 5 in Test-DriverProtected are the only ones that can vouch for a function driver,
+    # and both are built from Enum. Without it every third party driver looks unprotected, so nothing
+    # here may be marked repairable: the script must not disable what it cannot prove is safe to
+    # disable. The findings are still reported, because the engineer needs to see what was on the
+    # disk - they are just not offered as a repair.
+    $topologyUsable = [bool]$Topology.Available
+    if (-not $topologyUsable) {
+        [void]$findings.Add((New-Finding -Cause 'DeviceTopologyUnavailable' -Item 'Enum' -Repairable $false `
+                    -Message "The device tree could not be read, because $($Topology.Reason). Every protection check that depends on it is therefore blind, so no driver was offered for disabling on this run - disabling a boot critical storage or network driver would replace this fault with 0x7B INACCESSIBLE_BOOT_DEVICE. Repair the SYSTEM hive first (win-fix-registry-corruption), then run this script again." `
+                    -Data $Topology))
+    }
 
     foreach ($driver in $Drivers) {
         if ($TargetService -and $driver.Service -ne $TargetService) { continue }
@@ -491,14 +545,14 @@ function Get-AllFinding {
         }
 
         if (-not $driver.Exists) {
-            [void]$findings.Add((New-Finding -Cause 'MissingDriverImage' -Item $driver.Service `
-                        -Message "$($driver.Service) is configured to load at $(if ($driver.Start -eq 0) { 'Boot' } else { 'System' }) start but its image is missing from the disk ($($driver.ResolvedPath)). Windows bugchecks on a Boot start driver it cannot load." `
+            [void]$findings.Add((New-Finding -Cause 'MissingDriverImage' -Item $driver.Service -Repairable $topologyUsable `
+                        -Message "$($driver.Service) is configured to load at $(if ($driver.Start -eq 0) { 'Boot' } else { 'System' }) start but its image is missing from the disk ($($driver.ResolvedPath)). Windows bugchecks on a Boot start driver it cannot load.$(if (-not $topologyUsable) { ' It was NOT offered for disabling, because the device tree could not be read and this driver cannot be proved to be off the boot path.' })" `
                         -Data $driver))
             continue
         }
 
-        [void]$findings.Add((New-Finding -Cause 'ThirdPartyBootDriver' -Item $driver.Service `
-                    -Message "$($driver.Service) ($($driver.FileName), $(if ($driver.Vendor) { $driver.Vendor } else { 'unknown vendor' })) is a third party driver loading at $(if ($driver.Start -eq 0) { 'Boot' } else { 'System' }) start and is on no protected path." `
+        [void]$findings.Add((New-Finding -Cause 'ThirdPartyBootDriver' -Item $driver.Service -Repairable $topologyUsable `
+                    -Message "$($driver.Service) ($($driver.FileName), $(if ($driver.Vendor) { $driver.Vendor } else { 'unknown vendor' })) is a third party driver loading at $(if ($driver.Start -eq 0) { 'Boot' } else { 'System' }) start and is on no protected path.$(if (-not $topologyUsable) { ' It was NOT offered for disabling, because the device tree could not be read, so being on no protected path is unproven here rather than checked.' })" `
                     -Data $driver))
     }
 
@@ -873,10 +927,14 @@ try {
     }
 
     $context = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
+        # -Strict in both modes. The tolerant fallback silently reads ControlSet001, which may not be
+        # the control set that boots, and a verdict delivered from the wrong control set is worse in
+        # detect than in repair: the engineer acts on it believing the disk was examined.
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         $topology = Get-DeviceTopology -SystemRoot $systemRoot
+        $servicesAvailable = Test-Path -LiteralPath "$systemRoot\Services"
         $drivers = @(Get-DriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
-        $findings = @(Get-AllFinding -Drivers $drivers -Topology $topology -TargetService $targetDriver)
+        $findings = @(Get-AllFinding -Drivers $drivers -Topology $topology -ServicesAvailable $servicesAvailable -TargetService $targetDriver)
 
         return [PSCustomObject]@{
             SystemRoot = $systemRoot
@@ -924,6 +982,19 @@ try {
     }
     foreach ($finding in $repairable) {
         Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+    }
+
+    # Evidence the protection map is built from. Without it no driver can be judged, so this is
+    # settled before the clean verdict below - otherwise a hive too damaged to enumerate its own
+    # services reads out as "nothing was changed", which is true and completely misleading.
+    $blocked = @($findings | Where-Object { $_.Cause -in @('DeviceTopologyUnavailable', 'ServicesKeyUnavailable') })
+    foreach ($finding in $blocked) {
+        Log-Warning "BLOCKED [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+    }
+    if ($blocked.Count -gt 0) {
+        Log-Error "This disk was NOT examined. The evidence that tells a removable third party driver from a boot critical one could not be read, so no driver was disabled and nothing above is a clean result. Repair the SYSTEM hive first, then run this script again." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_ERROR
     }
 
     if ($repairable.Count -eq 0 -and -not $verifierPending) {
@@ -1009,9 +1080,10 @@ try {
     $verification = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath -Strict
         $topology = Get-DeviceTopology -SystemRoot $systemRoot
+        $servicesAvailable = Test-Path -LiteralPath "$systemRoot\Services"
         $drivers = @(Get-DriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
         return [PSCustomObject]@{
-            Findings = @(Get-AllFinding -Drivers $drivers -Topology $topology -TargetService $targetDriver)
+            Findings = @(Get-AllFinding -Drivers $drivers -Topology $topology -ServicesAvailable $servicesAvailable -TargetService $targetDriver)
             Verifier = (Get-DriverVerifierState -SystemRoot $systemRoot)
         }
     }

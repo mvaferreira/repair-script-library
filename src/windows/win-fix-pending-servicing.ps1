@@ -275,12 +275,17 @@ function Get-ServicingRegistryState {
         which is not evidence, and the CBS keys in SOFTWARE are still checked.
     #>
     $cbs = @{}
+    # The three child keys below are only meaningful if their parent is readable. Without this probe
+    # a SOFTWARE hive with no Component Based Servicing key at all reads back as three absent
+    # markers, which is indistinguishable from a healthy machine with nothing pending.
+    $cbsKeyPresent = [bool](Test-Path -LiteralPath $script:CbsSoftwareKey)
+
     foreach ($key in $script:PendingCbsKey) {
         $path = Join-Path $script:CbsSoftwareKey $key
-        $cbs[$key] = if (Test-Path $path) {
+        $cbs[$key] = if (Test-Path -LiteralPath $path) {
             [PSCustomObject]@{
                 Present    = $true
-                ChildCount = @(Get-ChildItem $path -ErrorAction SilentlyContinue).Count
+                ChildCount = @(Get-ChildItem -LiteralPath $path -ErrorAction SilentlyContinue).Count
             }
         }
         else {
@@ -289,7 +294,7 @@ function Get-ServicingRegistryState {
     }
 
     $componentValues = @{}
-    $props = Get-ItemProperty $script:ComponentsKey -ErrorAction SilentlyContinue
+    $props = Get-ItemProperty -LiteralPath $script:ComponentsKey -ErrorAction SilentlyContinue
     foreach ($name in $script:PendingComponentValue) {
         $value = if ($props) { $props.$name } else { $null }
         $componentValues[$name] = $value
@@ -297,6 +302,7 @@ function Get-ServicingRegistryState {
 
     return [PSCustomObject]@{
         Cbs                = $cbs
+        CbsKeyPresent      = $cbsKeyPresent
         ComponentValues    = $componentValues
         ComponentsFound    = ($null -ne $props)
         IncompleteSessions = @(Get-IncompleteServicingSession -SessionsKeyPath (Join-Path $script:CbsSoftwareKey $script:SessionsPendingKey))
@@ -408,25 +414,40 @@ function Get-LogExhaustionEvidence {
     param([Parameter(Mandatory = $true)][string]$WindowsPath)
 
     $cbsFolder = Join-Path $WindowsPath 'Logs\CBS'
-    $result = [PSCustomObject]@{ Found = $false; Source = ''; Line = ''; LogsRead = 0 }
+    $result = [PSCustomObject]@{
+        Found         = $false
+        Source        = ''
+        Line          = ''
+        LogsRead      = 0
+        LogsFailed    = 0
+        FolderPresent = $false
+        LogsFound     = 0
+    }
 
     if (-not (Test-Path -LiteralPath $cbsFolder)) { return $result }
+    $result.FolderPresent = $true
 
     # CbsPersist_*.log are the rolled-over generations of CBS.log. A transaction that filled the log
     # some time ago has its record in one of those rather than in the current file.
     $logs = @(Get-ChildItem -LiteralPath $cbsFolder -File -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -eq 'CBS.log' -or $_.Name -like 'CbsPersist_*.log' } |
             Sort-Object LastWriteTimeUtc -Descending)
+    $result.LogsFound = $logs.Count
 
     foreach ($log in $logs) {
-        $result.LogsRead++
         try {
             $tail = @(Get-Content -LiteralPath $log.FullName -Tail $script:CbsTailLine -ErrorAction Stop)
         }
         catch {
+            # Counted as failed, not as read. Incrementing LogsRead before the read could fail let
+            # the caller state that N logs contained no ERROR_LOG_FULL entry having opened none of
+            # them, which is an assertion the evidence does not support.
+            $result.LogsFailed++
             Add-OfflineRepairLog -Level Info -Message "Could not read $($log.Name) ($($_.Exception.Message))."
             continue
         }
+
+        $result.LogsRead++
 
         $hit = @($tail | Where-Object { $_ -match $script:LogFullPattern }) | Select-Object -Last 1
         if ($hit) {
@@ -716,13 +737,22 @@ try {
             Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
                 $root = Get-OfflineSystemRootPath -Strict
                 foreach ($entry in $services) {
+                    # The manifest is written by this script from the hardcoded service list, so a
+                    # name outside that list means the file was corrupted or tampered with. Acting on
+                    # it would let an attacker-supplied name - or a wildcard, which -Path would
+                    # expand across every matching service key - set Start on something this script
+                    # never touched.
+                    if ($script:WindowsUpdateService -notcontains $entry.Service) {
+                        Add-OfflineRepairLog -Level Warning -Message "$($entry.Service): not one of the services this script disables, so the manifest entry was ignored."
+                        continue
+                    }
                     $path = "$root\Services\$($entry.Service)"
-                    if (-not (Test-Path $path)) {
+                    if (-not (Test-Path -LiteralPath $path)) {
                         Add-OfflineRepairLog -Level Warning -Message "$($entry.Service): the service key is no longer present, so it was not restored."
                         continue
                     }
-                    $current = (Get-ItemProperty $path -ErrorAction SilentlyContinue).Start
-                    Set-ItemProperty -Path $path -Name Start -Value ([int]$entry.OriginalStart) -Type DWord -Force
+                    $current = (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue).Start
+                    Set-ItemProperty -LiteralPath $path -Name Start -Value ([int]$entry.OriginalStart) -Type DWord -Force
                     Add-OfflineRepairLog -Level Info -Message "$($entry.Service): Start $current -> $($entry.OriginalStart) (restored)."
                     $script:RevertCount++
                 }
@@ -821,6 +851,38 @@ try {
         Log-Info "No ERROR_LOG_FULL entry was found in the last $($script:CbsTailLine) lines of $($logFull.LogsRead) CBS log(s)." | Tee-Object -FilePath $logFile -Append
     }
 
+    # Everything this script could not examine, named out loud. A marker that was never looked for is
+    # not the same as a marker that was looked for and found absent, and only the second of those
+    # justifies telling the engineer that servicing is healthy. None of these authorise a repair;
+    # they withhold the clean verdict.
+    $blindSpot = [System.Collections.Generic.List[string]]::new()
+
+    if (-not $registryState.CbsKeyPresent) {
+        [void]$blindSpot.Add("The Component Based Servicing key was not found in the SOFTWARE hive, so the three CBS pending markers could not be checked. On a normal installation that key always exists.")
+    }
+    if (-not $registryState.ComponentsFound) {
+        [void]$blindSpot.Add("The COMPONENTS transaction values could not be read$(if ($hasComponentsHive) { ' even though the hive was mounted' } else { ' because the COMPONENTS hive is not present on this disk' }), so an interrupted transaction recorded only there would not be seen.")
+    }
+    if (-not $logFull.FolderPresent) {
+        [void]$blindSpot.Add("The CBS log folder is not present, so log exhaustion could not be ruled out.")
+    }
+    elseif ($logFull.LogsFound -eq 0) {
+        [void]$blindSpot.Add("The CBS log folder holds no CBS.log or CbsPersist_*.log, so log exhaustion could not be ruled out.")
+    }
+    elseif ($logFull.LogsRead -eq 0) {
+        [void]$blindSpot.Add("None of the $($logFull.LogsFound) CBS log(s) could be read, so log exhaustion could not be ruled out.")
+    }
+    elseif ($logFull.LogsFailed -gt 0) {
+        [void]$blindSpot.Add("$($logFull.LogsFailed) of $($logFull.LogsFound) CBS log(s) could not be read. The ERROR_LOG_FULL result above covers only the $($logFull.LogsRead) that were.")
+    }
+    if ($txr.Present -and -not $txr.Snapshot.Accessible) {
+        [void]$blindSpot.Add("config\TxR exists but could not be enumerated, so a stuck CLFS transaction there could neither be seen nor cleared.")
+    }
+
+    foreach ($gap in $blindSpot) {
+        Log-Warning $gap | Tee-Object -FilePath $logFile -Append
+    }
+
     # Two separate authorisations, each tied to its own evidence. The servicing markers authorise the
     # DISM revert, the pending.xml rename and the CBS registry edits. Either the markers or log
     # exhaustion authorise clearing config\TxR. Clearing the logs on log exhaustion alone is the whole
@@ -834,11 +896,24 @@ try {
             Log-Info "  $($finding.Marker): $($finding.Detail)" | Tee-Object -FilePath $logFile -Append
         }
     }
+    elseif ($blindSpot.Count -gt 0) {
+        Log-Info 'No servicing pending marker was found among the sources that could be read, but the gaps listed above mean that is not the same as proving this disk healthy.' | Tee-Object -FilePath $logFile -Append
+    }
     else {
         Log-Info 'No servicing pending markers are present: pending.xml is absent, the CBS pending keys do not exist, every recorded servicing session completed, and the COMPONENTS transaction values are unset or zero.' | Tee-Object -FilePath $logFile -Append
     }
 
-    if ($txr.Present) {
+    if (-not $txr.Present) {
+        Log-Info 'config\TxR is not present on this disk. Nothing there can be holding a stuck transaction open.' | Tee-Object -FilePath $logFile -Append
+    }
+    elseif (-not $txr.Snapshot.Accessible) {
+        # Present and Accessible are separate properties. A folder that exists but cannot be
+        # enumerated returns an empty MatchedFile list, which the branch below would have rendered as
+        # "config\TxR holds 0 transaction file(s)" - an empty folder and an unreadable one reported
+        # with the same sentence.
+        Log-Warning "config\TxR exists but could not be enumerated$(if ($txr.Snapshot.AccessError) { ": $($txr.Snapshot.AccessError)" } else { '.' }) Transaction files there, if any, are left alone." | Tee-Object -FilePath $logFile -Append
+    }
+    else {
         # Built as whole sentences rather than by splicing a reason into "cleared only because ...".
         # That phrasing rendered, in the no-evidence branch, as "are cleared only because neither a
         # servicing marker nor log exhaustion was found, so they are left alone" - stating both that
@@ -892,7 +967,12 @@ try {
             Log-Output "$(@($txr.Files).Count) TxR transaction file(s) would be backed up and removed, and the removal verified before the run is called a success." | Tee-Object -FilePath $logFile -Append
         }
         if ($findings.Count -eq 0 -and -not $clearTxR) {
-            Log-Output 'Nothing would be changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
+            if ($blindSpot.Count -gt 0) {
+                Log-Output "Nothing would be changed, but $($blindSpot.Count) part(s) of the servicing state could not be examined (listed above). This disk is not confirmed healthy; treat the result as inconclusive." | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Output 'Nothing would be changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
+            }
         }
         if ($doDisableWindowsUpdate) {
             Log-Output "$(@($updateServices).Count) Windows Update service(s) would be disabled." | Tee-Object -FilePath $logFile -Append
@@ -903,6 +983,14 @@ try {
     }
 
     if ($findings.Count -eq 0 -and -not $clearTxR -and -not $doDisableWindowsUpdate) {
+        if ($blindSpot.Count -gt 0) {
+            # Not a clean bill of health. Returning success here would tell the engineer to go and
+            # look elsewhere on the strength of markers this run never managed to read.
+            Log-Output "Nothing was changed. No servicing marker was found, but $($blindSpot.Count) part(s) of the servicing state could not be examined (listed above), so an unfinished transaction has not been ruled out." | Tee-Object -FilePath $logFile -Append
+            Log-Output 'Confirm the disk is attached and readable and re-run. If the gaps persist, the SOFTWARE hive or the servicing folders are themselves damaged, which win-fix-registry-corruption and win-sfc-sf-corruption cover.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
+        }
         Log-Output 'Nothing was changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
         Log-Output 'win-fix-inaccessible-boot-device covers a stop 0x7B, win-fix-registry-corruption covers a damaged hive, and win-sfc-sf-corruption covers damaged system files.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -1022,6 +1110,20 @@ try {
     # clean removal and one that silently took a file it should not have.
     # ---------------------------------------------------------------------------------------------
     if ($clearTxR) {
+        # Rebuilt here rather than reusing the plan taken during detection. Use-OfflineFileRemoval's
+        # contract is that the folder is enumerated once into a plan and nothing is re-enumerated
+        # between deciding and deleting - which means a plan built before the DISM revert is stale if
+        # the revert legitimately consumed or rewrote a CLFS log in between. The hash-verified backup
+        # would then fail, the helper would roll back, and the run would be failed on a repair whose
+        # marker clearing had actually succeeded.
+        $txr = Get-TxRState -WindowsPath $offline.WindowsPath
+        if (-not $txr.Actionable) {
+            Log-Info 'config\TxR holds no transaction file to clear after the DISM revert; the revert consumed them. Nothing further to remove.' | Tee-Object -FilePath $logFile -Append
+            $clearTxR = $false
+        }
+    }
+
+    if ($clearTxR) {
         $backupRoot = Join-Path $offline.WindowsPath "Temp\$scriptName\$scriptStartTime"
         $outcome = Invoke-OfflineRemovalPlan -Plan $txr -BackupRoot $backupRoot
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -1077,8 +1179,8 @@ try {
                 $root = Get-OfflineSystemRootPath -Strict
                 foreach ($entry in $recorded) {
                     $path = "$root\Services\$($entry.Service)"
-                    if (-not (Test-Path $path)) { continue }
-                    Set-ItemProperty -Path $path -Name Start -Value 4 -Type DWord -Force
+                    if (-not (Test-Path -LiteralPath $path)) { continue }
+                    Set-ItemProperty -LiteralPath $path -Name Start -Value 4 -Type DWord -Force
                     Add-OfflineRepairLog -Level Info -Message "reg add `"$($path -replace '^HKLM:\\BROKENSYSTEM', 'HKLM\SYSTEM')`" /v Start /t REG_DWORD /d 4 /f   # was $($entry.OriginalStart)"
                     $script:ServiceChanges++
                 }
@@ -1123,6 +1225,16 @@ try {
         if (Test-PendingComponentValue -Value $after.ComponentValues[$name]) { [void]$remaining.Add("COMPONENTS\$name") }
     }
 
+    # Incomplete sessions are counted separately, not folded into $remaining. This script never
+    # rewrites a session record - that is history, and DISM resolves it - so a session still being
+    # listed is not a failed edit. It is still tracked, because a session finding authorises the
+    # whole repair on its own: without this the one disk whose only marker is an incomplete session
+    # would reach $remaining.Count -eq 0 every time and be told the stuck transaction was cleared,
+    # a verdict the completion check had structurally no way to disprove.
+    $sessionsBefore = @($findings | Where-Object { $_.Kind -eq 'Session' }).Count
+    $sessionsAfter = @($after.IncompleteSessions).Count
+    $sessionsOnly = ($sessionsBefore -gt 0 -and $sessionsBefore -eq $findings.Count)
+
     # Report what was actually done rather than infer it from one condition. Three things can change
     # this disk independently - the servicing markers, the transaction logs, and the Windows Update
     # services - and any combination of them is possible, because the markers and log exhaustion are
@@ -1138,7 +1250,12 @@ try {
 
     $did = [System.Collections.Generic.List[string]]::new()
     if ($findings.Count -gt 0) {
-        if ($remaining.Count -eq 0) {
+        if ($sessionsOnly -and $sessionsAfter -gt 0) {
+            # The only evidence was a session record, and it is still incomplete. DISM was asked to
+            # revert; whether it did is not something this disk can be made to confirm from here.
+            [void]$did.Add('asked DISM to revert the pending actions behind the incomplete servicing session')
+        }
+        elseif ($remaining.Count -eq 0) {
             # Either the edits landed, or the DISM revert consumed pending.xml on its own - that one
             # leaves nothing for this script to count, so trust the re-read rather than the counter.
             [void]$did.Add('cleared the stuck servicing transaction')
@@ -1166,6 +1283,12 @@ try {
     }
     else {
         Log-Output 'No servicing pending markers remain on this disk.' | Tee-Object -FilePath $logFile -Append
+    }
+
+    if ($sessionsAfter -gt 0) {
+        # Stated explicitly, because the line above deliberately does not count sessions and would
+        # otherwise read as a clean bill of health on a disk that still has one outstanding.
+        Log-Output "$sessionsAfter servicing session(s) are still recorded as incomplete. This script does not rewrite session records; DISM resolves them as the VM boots. If the VM still loops on 'Undoing changes', the component store itself is damaged and win-sfc-sf-corruption is the next step." | Tee-Object -FilePath $logFile -Append
     }
 
     if (@($manifest.Services).Count -gt 0) {

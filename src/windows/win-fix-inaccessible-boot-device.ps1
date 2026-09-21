@@ -223,10 +223,28 @@ function Get-ClassFilterFinding {
 
     foreach ($classSpec in (Get-StorageClassFilterSpec)) {
         $classPath = "$SystemRoot\Control\Class\$($classSpec.GUID)"
-        if (-not (Test-Path $classPath)) { continue }
+        if (-not (Test-Path -LiteralPath $classPath)) {
+            # Every one of these class keys exists on a working Windows installation, so an absent
+            # one is damage, not a configuration. Skipping silently let a disk whose DiskDrive class
+            # key was gone reach the "no 0x7B causes were found" headline with that whole class
+            # never examined.
+            [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item "$($classSpec.Name) class key" `
+                        -Message "$classPath is not present, so the $($classSpec.Name) class filters could not be examined. This key exists on every working installation." `
+                        -Repairable $false))
+            continue
+        }
 
         foreach ($filterType in @('UpperFilters', 'LowerFilters')) {
-            $raw = (Get-ItemProperty -Path $classPath -ErrorAction SilentlyContinue).$filterType
+            $classProps = Get-ItemProperty -LiteralPath $classPath -ErrorAction SilentlyContinue -ErrorVariable classReadError
+            if ($classReadError) {
+                # A read that failed and a class with no filters configured both produce an empty
+                # $current below. Only the second of those is evidence of a healthy class.
+                [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item "$($classSpec.Name) $filterType" `
+                            -Message "$filterType could not be read from $classPath ($($classReadError[0].Exception.Message)), so this class filter list was not examined." `
+                            -Repairable $false))
+                continue
+            }
+            $raw = $classProps.$filterType
             $current = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
             if ($current.Count -eq 0) { continue }
 
@@ -234,7 +252,11 @@ function Get-ClassFilterFinding {
             $drop = [System.Collections.Generic.List[object]]::new()
 
             foreach ($filter in $current) {
-                $imagePathRaw = (Get-ItemProperty -Path "$SystemRoot\Services\$filter" -ErrorAction SilentlyContinue).ImagePath
+                # -LiteralPath, not -Path. $filter is a name read out of a REG_MULTI_SZ on the broken
+                # disk. With -Path a name holding [ ] * or ? is a wildcard pattern that matches no
+                # key, returns nothing and raises nothing - and the dangling-filter branch below
+                # would then strip a filter whose service key exists and is perfectly healthy.
+                $imagePathRaw = (Get-ItemProperty -LiteralPath "$SystemRoot\Services\$filter" -ErrorAction SilentlyContinue).ImagePath
                 $resolved = if ($imagePathRaw) { Resolve-OfflineImagePath -ImagePath $imagePathRaw -WindowsDrive $WindowsDrive } else { $null }
                 $item = if ($resolved) { Get-Item -LiteralPath $resolved -Force -ErrorAction SilentlyContinue } else { $null }
 
@@ -280,11 +302,30 @@ function Get-DeviceInstanceFilterFinding {
     $findings = [System.Collections.Generic.List[object]]::new()
     $bootBusServices = [string[]]@('pci', 'vmbus')
     $enumRoot = "$SystemRoot\Enum\ACPI"
-    if (-not (Test-Path $enumRoot)) { return @($findings) }
+    if (-not (Test-Path -LiteralPath $enumRoot)) {
+        # Enum\ACPI missing is itself a boot-blocking fault. Returning an empty finding list for it
+        # told the operator there were no device instance filters to worry about, on a disk where
+        # the device tree the check reads had gone.
+        [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item 'Enum\ACPI' `
+                    -Message "$enumRoot is not present, so device instance filters could not be examined. The ACPI device tree is required for boot bus enumeration, so its absence is itself a fault." `
+                    -Repairable $false))
+        return @($findings)
+    }
 
-    foreach ($device in @(Get-ChildItem -Path $enumRoot -ErrorAction SilentlyContinue)) {
-        foreach ($instance in @(Get-ChildItem -Path $device.PSPath -ErrorAction SilentlyContinue)) {
-            $props = Get-ItemProperty -Path $instance.PSPath -ErrorAction SilentlyContinue
+    $devices = @(Get-ChildItem -LiteralPath $enumRoot -ErrorAction SilentlyContinue -ErrorVariable enumError)
+    if ($enumError) {
+        [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item 'Enum\ACPI' `
+                    -Message "$enumRoot could not be enumerated ($($enumError[0].Exception.Message)), so device instance filters could not be examined." `
+                    -Repairable $false))
+        return @($findings)
+    }
+
+    foreach ($device in $devices) {
+        # -LiteralPath on PSPath throughout. These provider paths are built from key names read off
+        # the broken disk, and a bracket in one would make -Path treat it as a wildcard pattern that
+        # matches nothing, dropping the subtree without a word.
+        foreach ($instance in @(Get-ChildItem -LiteralPath $device.PSPath -ErrorAction SilentlyContinue)) {
+            $props = Get-ItemProperty -LiteralPath $instance.PSPath -ErrorAction SilentlyContinue
             if ($null -eq $props -or $bootBusServices -inotcontains $props.Service) { continue }
 
             foreach ($filterType in @('UpperFilters', 'LowerFilters')) {
@@ -399,16 +440,16 @@ function Repair-Finding {
         }
         'ClassFilter' {
             if (@($data.Keep).Count -gt 0) {
-                Set-ItemProperty -Path $data.ClassPath -Name $data.FilterType -Value ([string[]]@($data.Keep)) -Type MultiString -Force
+                Set-ItemProperty -LiteralPath $data.ClassPath -Name $data.FilterType -Value ([string[]]@($data.Keep)) -Type MultiString -Force
             }
             else {
                 # Leaving an empty MultiString behind is not the same as having no filters at all.
-                Remove-ItemProperty -Path $data.ClassPath -Name $data.FilterType -Force
+                Remove-ItemProperty -LiteralPath $data.ClassPath -Name $data.FilterType -Force
             }
             Add-OfflineRepairLog -Message "$($Finding.Item): removed $((@($data.Drop) | ForEach-Object { $_.Filter }) -join ', '), kept $(if (@($data.Keep).Count) { @($data.Keep) -join ', ' } else { '(none)' })"
         }
         'DeviceInstanceFilter' {
-            Remove-ItemProperty -Path $data.RegistryPath -Name $data.FilterType -Force
+            Remove-ItemProperty -LiteralPath $data.RegistryPath -Name $data.FilterType -Force
             Add-OfflineRepairLog -Message "$($Finding.Item): removed $($data.Filters -join ', ')"
         }
         'AcpiEnumMapping' {
@@ -416,11 +457,11 @@ function Repair-Finding {
             $sourceReg = "$regRoot\Enum\ACPI\$($data.Source)"
             $targetReg = "$regRoot\Enum\ACPI\$($data.Target)"
             $output = reg.exe copy "$sourceReg" "$targetReg" /s /f 2>&1 | Out-String
-            if (-not (Test-Path $data.TargetPath)) { throw "reg copy did not create $targetReg. $($output.Trim())" }
+            if (-not (Test-Path -LiteralPath $data.TargetPath)) { throw "reg copy did not create $targetReg. $($output.Trim())" }
             Add-OfflineRepairLog -Message "Copied ACPI enumeration key $($data.Source) to $($data.Target)"
         }
         'SanPolicy' {
-            Set-ItemProperty -Path $data.RegistryPath -Name SanPolicy -Value 1 -Type DWord -Force
+            Set-ItemProperty -LiteralPath $data.RegistryPath -Name SanPolicy -Value 1 -Type DWord -Force
             Add-OfflineRepairLog -Message "SAN policy: $($data.Current) -> 1 (OnlineAll)"
         }
         default { throw "No repair is implemented for cause '$($Finding.Cause)'." }
@@ -442,11 +483,23 @@ try {
     $remaining = @()
 
     $result = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+        # Asked tolerantly first, purely to learn whether the answer is trustworthy. In detect-only
+        # Get-OfflineSystemRootPath falls back to ControlSet001 when Select\Current cannot be
+        # resolved, which made the script report on a set the firmware may not boot - and then print
+        # "No 0x7B causes were found in control set ControlSet001" on a VM whose active set is
+        # ControlSet002 with broken drivers. Repair mode passes -Strict and throws instead.
+        $selected = Get-OfflineSelectedControlSetName -Name 'Current'
         $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $controlSet = Split-Path -Path $systemRoot -Leaf
         Add-OfflineRepairLog -Message "Checking control set $controlSet"
 
         $findings = @(Get-AllFinding -SystemRoot $systemRoot -WindowsPath $offline.WindowsPath -WindowsDrive $offline.WindowsDrive -Strict $isStrict)
+
+        if (-not $selected) {
+            $findings = @(@(New-Finding -Cause 'EvidenceUnavailable' -Item 'Select\Current' `
+                        -Message "Select\Current could not be resolved to a control set, so $controlSet was read as a tolerant fallback rather than as the set this disk actually boots. Anything reported below - including a clean result - describes $controlSet only." `
+                        -Repairable $false)) + $findings
+        }
 
         return [PSCustomObject]@{
             SystemRoot = $systemRoot
@@ -485,6 +538,14 @@ try {
         Log-Warning "Found $($findings.Count) issue(s) but none can be repaired by this script." | Tee-Object -FilePath $logFile -Append
         foreach ($finding in $unrepairable) {
             Log-Warning "  $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+        $blocked = @($findings | Where-Object { $_.Cause -eq 'EvidenceUnavailable' })
+        if ($blocked.Count -gt 0) {
+            # Not success. Every finding here is a source this run could not read, so "none can be
+            # repaired" would otherwise exit 0 and read as a disk that was examined and found sound.
+            Log-Output "$($blocked.Count) source(s) of 0x7B evidence could not be read, so this disk has not been cleared. Confirm it is attached and readable and re-run." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
         }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS

@@ -492,7 +492,14 @@ function Get-BootPartitionFlagFinding {
 
     $bootPartition = Get-BootPartitionObject -Offline $Offline
     if (-not $bootPartition) {
-        Add-OfflineRepairLog -Level Warning -Message 'The boot partition object could not be resolved, so the Active flag was not checked.'
+        # A buffered warning was the whole response here, so a Gen1 VM whose only fault was a
+        # cleared Active flag reached "No boot configuration fault was found" and exited 0 with the
+        # flag never examined. Reported as a finding instead - Tier 'None' and not repairable,
+        # because the partition object this repair needs is exactly what could not be resolved.
+        # win-fix-boot-partition raises a real ActiveFlagMissing finding for the same condition.
+        [void]$findings.Add((New-Finding -Cause 'BootPartitionActive' -Item "Disk $($Offline.DiskNumber)" `
+                    -Message "The boot partition object could not be resolved from boot drive '$($Offline.BootDrive)', so the Active flag was not checked. On a Gen1 VM a cleared Active flag stops the BIOS reading any boot sector; run win-fix-boot-partition, which resolves the partition differently." `
+                    -Repairable $false -Tier 'None'))
         return @($findings)
     }
 

@@ -234,6 +234,16 @@ function Invoke-ChkReg {
 
     $working = Join-Path $ScratchDir (Split-Path -Path $HivePath -Leaf)
     if (-not (Test-OfflinePath $ScratchDir)) { New-Item -Path $ScratchDir -ItemType Directory -Force | Out-Null }
+
+    # Cleared before the copies, not after. The hive is copied unconditionally but its logs only if
+    # they still sit beside the source, and Repair-HiveInPlace moves the on-disk .LOG* aside once a
+    # repair succeeds. The scratch leaf name is the same on every pass, so without this the verify
+    # pass overwrote <scratch>\SYSTEM with the repaired hive and left the PRE-repair SYSTEM.LOG1 and
+    # .LOG2 beside it - a mismatched sibling log presented to chkreg as this hive's own recovery log.
+    foreach ($stale in @($working) + @('.LOG', '.LOG1', '.LOG2' | ForEach-Object { "$working$_" })) {
+        if (Test-OfflinePath $stale) { Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue }
+    }
+
     Copy-Item -LiteralPath $HivePath -Destination $working -Force -ErrorAction Stop
     foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
         if (Test-OfflinePath "$HivePath$suffix") {
@@ -479,9 +489,28 @@ function Test-RegBackMaintained {
         if ($LASTEXITCODE -ne 0) { return $false }
         $mounted = $true
 
-        $current = (Get-ItemProperty -Path "HKLM:\$mountKey\Select" -ErrorAction SilentlyContinue).Current
-        $controlSet = if ($current) { 'ControlSet{0:d3}' -f [int]$current } else { 'ControlSet001' }
-        $value = (Get-ItemProperty -Path "HKLM:\$mountKey\$controlSet\Control\Session Manager\Configuration Manager" -ErrorAction SilentlyContinue).EnablePeriodicBackup
+        # Resolved with the same validation Get-OfflineSelectedControlSetName applies, rather than
+        # the loose 'if ($current) ... else ControlSet001' this used to carry. That fallback made a
+        # damaged Select key return whatever a stale ControlSet001 happened to say - so a disk whose
+        # active set is ControlSet002, with a years-old ControlSet001 EnablePeriodicBackup=1, was
+        # told its RegBack set was maintained and offered it as a repair. The helper itself cannot be
+        # called here because it is hardcoded to the BROKENSYSTEM mount, so its two validated
+        # primitives are used directly against this private mount instead.
+        #
+        # Every failure below returns $false, which is this function's documented contract:
+        # "Anything that stops the value being read counts as not maintained."
+        $number = Get-OfflineRegistryDword -Key "HKLM\$mountKey\Select" -Name 'Current'
+        if ($null -eq $number -or $number -isnot [uint32] -or $number -lt 1 -or $number -gt 999) {
+            Add-OfflineRepairLog -Message 'SYSTEM\Select\Current is missing or is not a DWORD in 1..999, so the active control set could not be identified and RegBack is treated as not maintained.'
+            return $false
+        }
+        $controlSet = 'ControlSet{0:d3}' -f $number
+        if ((Get-OfflineHiveKeyState -HiveKey "HKLM\$mountKey\$controlSet") -ne 'Present') {
+            Add-OfflineRepairLog -Message "SYSTEM\Select\Current references $controlSet, which is not present, so RegBack is treated as not maintained."
+            return $false
+        }
+
+        $value = (Get-ItemProperty -LiteralPath "HKLM:\$mountKey\$controlSet\Control\Session Manager\Configuration Manager" -ErrorAction SilentlyContinue).EnablePeriodicBackup
         if ($null -eq $value) { return $false }
         return ([int]$value -eq 1)
     }

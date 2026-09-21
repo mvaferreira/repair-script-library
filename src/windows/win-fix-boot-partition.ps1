@@ -714,6 +714,18 @@ function Get-PartitionFilesystemFinding {
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
     if ($Offline.Generation -ne 2 -or -not $Resolved.Partition) { return @($findings) }
 
+    if ($null -eq $State.VbrRaw) {
+        # FileSystem initialises to 'Unknown', which is not in the FAT list below, so a boot sector
+        # that could not be READ fell straight through to EspNotFormatted - a repairable finding
+        # whose repair formats the partition. An unreadable sector is not evidence that the
+        # filesystem is wrong, and it is certainly not authority to destroy it.
+        [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item "partition $($Resolved.Partition.PartitionNumber)" -Repairable $false -Tier 'None' -Message (
+                "The boot sector of partition $($Resolved.Partition.PartitionNumber) could not be read, so its filesystem could not be identified. " +
+                'It is NOT being formatted on that basis. ' +
+                "$(if (@($State.Errors).Count) { 'Read error: ' + (@($State.Errors) -join '; ') } else { 'No read error was recorded.' })")))
+        return @($findings)
+    }
+
     if ($State.FileSystem -in @('FAT32', 'FAT16', 'FAT12', 'FAT')) { return @($findings) }
 
     [void]$findings.Add((New-Finding -Cause 'EspNotFormatted' -Item "partition $($Resolved.Partition.PartitionNumber)" -Tier 'Partition' -Data $Resolved.Partition.PartitionNumber -Message (
@@ -737,7 +749,17 @@ function Get-MbrFinding {
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
-    if ($Offline.Generation -eq 2 -or -not $State.Mbr) { return @($findings) }
+    if ($Offline.Generation -eq 2) { return @($findings) }
+
+    if (-not $State.Mbr) {
+        # Sector 0 is the code the BIOS executes first. Returning nothing for a read that failed let
+        # the disk reach the "No system partition fault was found" headline with the MBR signature,
+        # the bootstrap and the Active-partition count all unexamined.
+        [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item "disk $($Offline.DiskNumber) sector 0" -Repairable $false -Tier 'None' -Message (
+                "Sector 0 of disk $($Offline.DiskNumber) could not be read, so the master boot record was not examined. " +
+                "$(if (@($State.Errors).Count) { 'Read error: ' + (@($State.Errors) -join '; ') } else { 'No read error was recorded.' })")))
+        return @($findings)
+    }
 
     if (-not $State.Mbr.HasSignature) {
         [void]$findings.Add((New-Finding -Cause 'MbrSignature' -Item 'sector 0' -Message (
@@ -798,7 +820,18 @@ function Get-VbrFinding {
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
-    if ($Offline.Generation -eq 2 -or -not $Resolved.Partition -or -not $State.Vbr) { return @($findings) }
+    if ($Offline.Generation -eq 2 -or -not $Resolved.Partition) { return @($findings) }
+
+    if (-not $State.Vbr) {
+        # The checks lost here include HiddenSectors, which this script's own comment calls its
+        # highest value check and which is the direct cause of the "A disk read error occurred"
+        # message in the scenario header. Silence on an unreadable VBR meant the headline fault
+        # went unreported on the very disks this script exists for.
+        [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item "partition $($Resolved.Partition.PartitionNumber)" -Repairable $false -Tier 'None' -Message (
+                "The volume boot record of partition $($Resolved.Partition.PartitionNumber) could not be read, so the boot signature, the bootstrap code, the BPB HiddenSectors field and the volume size were not examined. " +
+                "$(if (@($State.Errors).Count) { 'Read error: ' + (@($State.Errors) -join '; ') } else { 'No read error was recorded.' })")))
+        return @($findings)
+    }
 
     $label = "partition $($Resolved.Partition.PartitionNumber)"
 
