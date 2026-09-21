@@ -258,11 +258,14 @@ function Get-BootManagerFinding {
                     -Message "The boot manager binary is not a Microsoft file (status $($signature.Status)): $($Expected.BootMgrFile)." `
                     -Tier 'Rebuild'))
     }
-    elseif (-not $signature.IsLikelyMicrosoft) {
-        # No cryptographic answer and the file does not identify itself as Microsoft either.
-        [void]$findings.Add((New-Finding -Cause 'BootManagerBinary' -Item $Expected.BootMgrFile `
-                    -Message "The boot manager binary could not be identified as a Microsoft file (status $($signature.Status)): $($Expected.BootMgrFile)." `
-                    -Tier 'Rebuild'))
+    elseif ($signature.Confidence -eq 'None') {
+        # Nothing was established in either direction, so there is no evidence to act on. Gen1's
+        # bootmgr is a compressed boot stub that Authenticode cannot parse and that carries no
+        # version resource, so a perfectly healthy copy reports NotVerifiable on every Gen1 guest.
+        # Reading that silence as damage would report a fault on a healthy VM and rebuild the store
+        # on no evidence at all. A boot manager that is genuinely gone or emptied is already caught
+        # above by the FileNotFound and ZeroByte checks, neither of which needs a signature.
+        Add-OfflineRepairLog -Level Warning -Message "The boot manager binary at $($Expected.BootMgrFile) could not be verified in either direction (status $($signature.Status)). That is the ordinary result for a Gen1 compressed boot stub, so it is reported rather than treated as a fault. The binary is present and non-empty."
     }
     elseif ($signature.Confidence -ne 'High') {
         # The binary says it is Microsoft but nothing proved it. This is the ordinary result
