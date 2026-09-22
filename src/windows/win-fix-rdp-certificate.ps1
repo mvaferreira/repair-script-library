@@ -251,6 +251,11 @@ $script:RdpContainerPrefix = 'f686aace'
 # object taken cannot also report that it found nothing wrong.
 $script:UnrestoredPaths = @{}
 
+# Thumbprints of store entries this run deliberately did not judge against the machine key store,
+# reset on every detection pass. The affirmative healthy line is narrowed when this is non-empty,
+# so a certificate that was never examined is not covered by a statement that it is healthy.
+$script:UnjudgedCertificates = @()
+
 # NT SERVICE\SessionEnv. Service SIDs are derived from the service name rather than issued per
 # machine, so this value is the same on every Windows installation and is safe to write offline.
 $script:SessionEnvSid = 'S-1-5-80-4022436659-1090538466-1613889075-870485073-3428993833'
@@ -1041,6 +1046,10 @@ function Get-AllFinding {
 
     $findings = [System.Collections.Generic.List[object]]::new()
 
+    # Reset per call, because this function runs again to verify the repair and a stale entry would
+    # qualify the healthy line on a disk that no longer has anything unjudged on it.
+    $script:UnjudgedCertificates = @()
+
     # Raised first, because it describes damage this run itself is responsible for. A borrowed
     # descriptor that could not be handed back leaves a customer object owned by the rescue VM with
     # an extra FullControl entry on it, which is worse than the state the run started in and must
@@ -1215,6 +1224,10 @@ function Get-AllFinding {
                     'it records no key container name, so there is nothing to look for in the machine key store'
                 }
                 Add-OfflineRepairLog -Level Info -Message "Store entry $($certificate.Thumbprint) was not judged against the machine key store because $where. An empty MachineKeys folder is not evidence about this certificate, so it was left alone."
+                # Recorded, not just logged. The affirmative healthy line states that every
+                # certificate in the store has its private key, and that is a claim this run cannot
+                # make about a certificate it declined to judge.
+                $script:UnjudgedCertificates += $certificate.Thumbprint
             }
 
             if ($certificate.Expired -or $orphaned) {
@@ -1739,7 +1752,17 @@ try {
     # Ahead of the detect gate on purpose, so one affirmative line serves both modes. A healthy disk
     # and one this script cannot help must not produce the same silence.
     if ($findings.Count -eq 0) {
-        Log-Output 'No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, any certificate in it is in date and has its private key, and the services behind them are not disabled. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back.' | Tee-Object -FilePath $logFile -Append
+        # The claim about private keys is narrowed when a certificate was deliberately not judged -
+        # a CNG key, or a provider that could not be read. Saying "any certificate in it has its
+        # private key" in that case is an affirmative statement about a certificate this run
+        # explicitly declined to examine, which is the one thing the detection rules forbid.
+        $keyClaim = if (@($script:UnjudgedCertificates).Count -gt 0) {
+            "every certificate this script could judge is in date and has its private key - $(@($script:UnjudgedCertificates).Count) certificate(s) keep their key outside the store this script reads and were left alone, listed above"
+        }
+        else {
+            'any certificate in it is in date and has its private key'
+        }
+        Log-Output "No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, $keyClaim, and the services behind them are not disabled. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         $status = $STATUS_SUCCESS
         break main
