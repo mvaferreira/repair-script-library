@@ -93,6 +93,12 @@
 #       renewed either. This is the state behind TerminalServices-RemoteConnectionManager event 1057
 #       and 1058 "failed to create a new self-signed certificate ... the relevant status code was
 #       Object already exists": Windows will not create one while the old entry is in its way.
+#       Judged only for a certificate whose key would be in that folder at all. The provider
+#       recorded against each entry is read, and only a legacy CSP keeps its containers there - a
+#       CNG key lives under Crypto\Keys, so for that certificate an empty MachineKeys folder is the
+#       expected state rather than a missing key. A provider that cannot be read counts as unknown.
+#       Neither is treated as orphaned, because deleting on either would destroy a working
+#       certificate for having looked in the wrong place.
 #
 #   Removing the entry is the same measurement the rest of this script rests on - with no certificate
 #   present Windows generates one, and a key container with correct permissions with it, within
@@ -122,10 +128,12 @@
 #   decision, it is temporary by nature, and it is the thing win-fix-rdp-connectivity removes - so it
 #   is named here rather than done.
 #
-#   On the file system, access control entries are only ever ADDED. The existing descriptor is never
-#   replaced, so permissions someone added deliberately survive the repair, and the original SDDL of
-#   anything changed is written to the log so it can be put back by hand. The single removal this
-#   script performs is the SYSTEM deny described above.
+#   On the file system, an existing descriptor is never replaced wholesale: entries are added to it,
+#   so permissions someone added deliberately survive the repair, and the original SDDL of anything
+#   changed is written to the log so it can be put back by hand. Two kinds of entry are removed, and
+#   only these two: a deny for one of the accounts being granted, because a deny beats an allow
+#   whatever the order and leaving it would make the grant do nothing; and the SYSTEM deny on the
+#   certificate store key described above. A deny for any other account is left exactly as it is.
 #
 # .RESOLVES
 #   A VM that boots, whose Remote Desktop service is running and listening on 3389, and which
@@ -138,12 +146,27 @@
 #   exists.
 #
 # .PARAMETER detectOnly
-#   "true" to report what is wrong with the listener key permissions and change nothing at all.
-#   Defaults to "false".
+#   "true" to report what is wrong with the listener key permissions and repair nothing. No
+#   configuration is changed. It is not a pure read: an object whose descriptor refuses this rescue
+#   VM has to have that descriptor borrowed before it can be read at all, and each one is restored
+#   immediately afterwards in a finally. Defaults to "false".
 #
 # .PARAMETER windowsDrive
 #   The drive letter of the attached offline Windows installation. Detected automatically when not
 #   supplied.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-certificate --run-on-repair --parameters detectOnly=true
+#
+#   Reports the state of the listener's private key permissions, the Remote Desktop certificate
+#   store and the certificates in it, and changes nothing.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-certificate --run-on-repair
+#
+#   Restores NETWORK SERVICE's access to the listener key container, removes an explicit Deny for
+#   SYSTEM on the Remote Desktop store, and deletes an expired or key-less listener certificate so
+#   Windows mints a fresh one on the next start.
 #
 # .NOTES
 #   A VM that refuses RDP because remote connections are turned off, because the listener values are
@@ -226,9 +249,34 @@ $script:MaskFolderEveryone = 0x12019F   # read plus the write that lets a new co
 $script:MaskKeyCreate = 0x0006   # KEY_SET_VALUE | KEY_CREATE_SUB_KEY
 $script:MaskKeyFullControl = 0xF003F
 
+# The two masks are deliberately different sizes, and which one is used where matters:
+#
+#   - MaskKeyCreate is the DETECTION mask. Only a deny that actually blocks writing the certificate
+#     is evidence of this fault. A deny on some unrelated right is somebody's hardening decision,
+#     not a reason to rewrite a descriptor, so it raises nothing.
+#   - MaskKeyFullControl is the REPAIR and VERIFY mask, because the repair removes every explicit
+#     deny for the account rather than only the bits it tested, and a healthy image grants the
+#     account full control on this key.
+#
+# Verify is therefore strictly wider than detect: anything detect can find, verify also refuses to
+# call repaired. The asymmetry cannot produce a false success, only a stricter final check.
+
 # CERT_CERT_PROP_ID. A store blob is a run of (propId, encoding, cbData, data) records; this is the
 # one whose data is the DER encoded certificate itself.
 $script:CertPropIdCertificate = 32
+
+# CERT_KEY_PROV_INFO_PROP_ID. Its data is a serialised CRYPT_KEY_PROV_INFO, which names the key
+# container behind this certificate and the provider that holds it. Layout measured on a live
+# machine store rather than assumed: the first three DWORDs are the offset of the container name,
+# the offset of the provider name, and dwProvType.
+$script:CertPropIdKeyProvInfo = 2
+
+# dwProvType. A legacy CSP reports a non-zero provider type - the Remote Desktop listener
+# certificate measured as 1, PROV_RSA_FULL, holding container TSSecKeySet1 - and its key container
+# is a file under ProgramData\Microsoft\Crypto\RSA\MachineKeys, which is what this script reads.
+# CNG reports 0, and its keys live under Crypto\Keys instead, where this script does not look. That
+# distinction decides whether an empty MachineKeys folder is evidence of anything at all.
+$script:ProvTypeCng = 0
 
 # The build at which the third entry on the container swaps from Administrators to SessionEnv.
 $script:SessionEnvBuild = 17763
@@ -322,8 +370,21 @@ function Test-SddlGrant {
     if ($null -ne $raw.DiscretionaryAcl) {
         foreach ($ace in $raw.DiscretionaryAcl) {
             if ($ace.SecurityIdentifier.Value -ne $Sid) { continue }
-            if ($ace.AceType -eq 'AccessDenied' -and ($ace.AccessMask -band $Mask)) { $denied = $true }
-            if ($ace.AceType -eq 'AccessAllowed' -and (($ace.AccessMask -band $Mask) -eq $Mask)) { $granted = $true }
+            $type = $ace.AceType.ToString()
+
+            # Deny is matched on the whole family - AccessDenied, AccessDeniedObject and the
+            # callback (conditional) forms - the same way every other deny test in this file does.
+            # Matching only the plain type left an object or conditional deny looking like neither a
+            # grant nor a deny, so the entry was classed as Missing and the repair added an allow
+            # underneath a deny that still wins. That reports a successful repair on a VM that is
+            # still refusing connections.
+            if ($type -like '*Denied*' -and ($ace.AccessMask -band $Mask)) { $denied = $true }
+
+            # Grant stays strict on purpose. A conditional allow only applies when its condition
+            # holds, which cannot be evaluated here, so it is not counted as access already present.
+            # The cost of being wrong is one redundant explicit allow; the cost of the opposite is
+            # leaving the account without access.
+            if ($type -eq 'AccessAllowed' -and (($ace.AccessMask -band $Mask) -eq $Mask)) { $granted = $true }
         }
     }
 
@@ -530,6 +591,66 @@ function Get-StoreCertificate {
     return $null
 }
 
+function Get-StoreKeyProvInfo {
+    <#
+    .SYNOPSIS
+        The key provider recorded against one store entry, or $null when it cannot be read.
+
+    .DESCRIPTION
+        Returns the provider type and container name from the entry's CERT_KEY_PROV_INFO property,
+        which is what says WHERE this certificate's private key is kept.
+
+        That matters because this script looks for key containers in exactly one place -
+        ProgramData\Microsoft\Crypto\RSA\MachineKeys - and only a legacy CSP keeps them there. A
+        certificate whose key is held by CNG has no container in that folder by design, so an empty
+        folder is not evidence that its key is missing. Without this, "I looked in the only place I
+        know and found nothing" becomes "this certificate has no key", and a working certificate
+        gets deleted on the strength of having looked in the wrong place.
+
+        The layout was measured on a live machine store rather than taken from a header: the data
+        begins with the container name offset, the provider name offset and dwProvType, each a
+        DWORD, with the two names stored as null terminated UTF-16 at those offsets.
+
+        Anything that does not parse returns $null, which the caller treats as "unknown" and
+        therefore as a reason not to delete.
+    #>
+    param([Parameter(Mandatory = $true)][byte[]]$Blob)
+
+    $offset = 0
+    while ($offset + 12 -le $Blob.Length) {
+        $propId = [System.BitConverter]::ToUInt32($Blob, $offset)
+        $length = [System.BitConverter]::ToUInt32($Blob, $offset + 8)
+        $dataAt = $offset + 12
+
+        if ($length -gt [int]::MaxValue -or ($dataAt + $length) -gt $Blob.Length) { return $null }
+
+        if ($propId -eq $script:CertPropIdKeyProvInfo -and $length -ge 12) {
+            try {
+                $size = [int]$length
+                $data = [byte[]]::new($size)
+                [System.Array]::Copy($Blob, $dataAt, $data, 0, $size)
+
+                $containerAt = [int][System.BitConverter]::ToUInt32($data, 0)
+                $provType = [System.BitConverter]::ToUInt32($data, 8)
+
+                $container = $null
+                if ($containerAt -gt 0 -and $containerAt -lt $data.Length) {
+                    $text = [System.Text.Encoding]::Unicode.GetString($data, $containerAt, $data.Length - $containerAt)
+                    $end = $text.IndexOf([char]0)
+                    $container = $(if ($end -ge 0) { $text.Substring(0, $end) } else { $text })
+                }
+
+                return [PSCustomObject]@{ ProvType = $provType; Container = $container }
+            }
+            catch { return $null }
+        }
+
+        $offset = $dataAt + $length
+    }
+
+    return $null
+}
+
 function Get-RegistryKeyProbe {
     <#
     .SYNOPSIS
@@ -679,7 +800,11 @@ function Get-CertificateStoreState {
                 # give, so the bytes are rebuilt rather than type-tested.
                 $bytes = ConvertTo-CertificateBlobByte -Value $blob
                 $certificate = $null
-                if ($found -and $bytes -and $bytes.Length -gt 0) { $certificate = Get-StoreCertificate -Blob $bytes }
+                $provInfo = $null
+                if ($found -and $bytes -and $bytes.Length -gt 0) {
+                    $certificate = Get-StoreCertificate -Blob $bytes
+                    $provInfo = Get-StoreKeyProvInfo -Blob $bytes
+                }
 
                 $certificates += [PSCustomObject]@{
                     Thumbprint = $entry.PSChildName
@@ -688,6 +813,12 @@ function Get-CertificateStoreState {
                     Subject    = $(if ($certificate) { $certificate.Subject } else { $null })
                     NotAfter   = $(if ($certificate) { $certificate.NotAfter } else { $null })
                     Expired    = $(if ($certificate) { $certificate.NotAfter -lt (Get-Date) } else { $false })
+
+                    # Whether this certificate's private key would live in the folder this script
+                    # reads. $null means the property could not be read, which is treated as
+                    # unknown rather than as a legacy CSP.
+                    KeyInMachineKeys = $(if ($provInfo) { $provInfo.ProvType -ne $script:ProvTypeCng } else { $null })
+                    KeyContainer     = $(if ($provInfo) { $provInfo.Container } else { $null })
                 }
 
                 if ($certificate) { $certificate.Dispose() }
@@ -723,9 +854,16 @@ function Get-ListenerPinnedThumbprint {
 
     $found = $false
     $value = Get-OfflineProtectedRegistryValue -Path (Join-Path $SystemRoot $script:RdpTcpSubPath) -Name 'SSLCertificateSHA1Hash' -Found ([ref]$found)
-    if (-not $found -or $value -isnot [byte[]] -or $value.Length -eq 0) { return $null }
 
-    return (($value | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+    # Rebuilt rather than type-tested, for the same measured reason as the certificate blob above:
+    # the value arrives from the helper's scriptblock as Object[] of boxed bytes, so a plain
+    # -is [byte[]] test fails on every pin that exists. Testing the type here instead of converting
+    # made this function return $null unconditionally, which silently disarmed the guard below - a
+    # pinned certificate would have been deleted as though nothing pointed at it.
+    $bytes = ConvertTo-CertificateBlobByte -Value $value
+    if (-not $found -or -not $bytes -or $bytes.Length -eq 0) { return $null }
+
+    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
 }
 
 function Get-CertificateServiceState {
@@ -876,7 +1014,30 @@ function Get-AllFinding {
             # "Object already exists". Judged only when the key store was actually listed: a folder
             # that refused a listing tells us nothing about what is in it, and reading that silence
             # as "no container" would delete a perfectly good certificate.
-            $orphaned = $KeyStore.FolderExists -and $KeyStore.FolderListed -and (@($KeyStore.Containers).Count -eq 0)
+            #
+            # It is also judged only for a certificate whose key WOULD be in that folder. This
+            # script reads ProgramData\Microsoft\Crypto\RSA\MachineKeys, where a legacy CSP keeps
+            # its containers; a CNG key is kept under Crypto\Keys instead. For a CNG certificate an
+            # empty MachineKeys folder is the expected state, not evidence of a missing key, so
+            # treating it as orphaned would delete a certificate whose key is present and working -
+            # typically the custom certificate an administrator bound to the listener deliberately.
+            # A provider property that could not be read is unknown, and unknown does not authorise
+            # a deletion either.
+            $keyWouldBeHere = ($certificate.KeyInMachineKeys -eq $true)
+            $orphaned = $keyWouldBeHere -and $KeyStore.FolderExists -and $KeyStore.FolderListed -and (@($KeyStore.Containers).Count -eq 0)
+
+            # Stated rather than left silent: without this line, a certificate that was spared only
+            # because its key is kept somewhere this script does not read looks identical in the log
+            # to one that was examined and found healthy.
+            if (-not $keyWouldBeHere -and $KeyStore.FolderExists -and $KeyStore.FolderListed -and (@($KeyStore.Containers).Count -eq 0)) {
+                $where = if ($null -eq $certificate.KeyInMachineKeys) {
+                    'the key provider recorded against it could not be read'
+                }
+                else {
+                    "its private key is held by CNG, in Crypto\Keys rather than the RSA\MachineKeys folder this script reads$(if ($certificate.KeyContainer) { " (container $($certificate.KeyContainer))" })"
+                }
+                Add-OfflineRepairLog -Level Info -Message "Store entry $($certificate.Thumbprint) was not judged against the machine key store because $where. An empty MachineKeys folder is not evidence about this certificate, so it was left alone."
+            }
 
             if ($certificate.Expired -or $orphaned) {
                 $why = if ($certificate.Expired -and $orphaned) {
@@ -951,7 +1112,9 @@ function Add-OfflinePathAce {
             for ($i = 0; $i -lt $raw.DiscretionaryAcl.Count; $i++) { $existing += $raw.DiscretionaryAcl[$i] }
         }
 
-        # A deny beats an allow whatever the order, so any deny for these accounts goes first.
+        # A deny beats an allow whatever the order, so a deny for one of the accounts being granted
+        # would survive the repair and keep the access shut. Those entries - and only those - are
+        # dropped. Every other entry, including a deny for any other account, is carried through.
         $targets = @(@($Ace) | ForEach-Object { $_.Sid })
         $existing = @($existing | Where-Object { -not ($_.AceType.ToString() -like '*Denied*' -and $targets -contains $_.SecurityIdentifier.Value) })
 
@@ -1220,6 +1383,7 @@ function Remove-OfflineRegistryKeyDeny {
     # Hand the key back. Only the owner is replayed; the DACL just written is what must survive.
     $rawOriginal = [System.Security.AccessControl.RawSecurityDescriptor]::new($original, 0)
     if ($rawOriginal.Owner) {
+        $key = $null
         try {
             $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
             $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
@@ -1229,12 +1393,16 @@ function Remove-OfflineRegistryKeyDeny {
                 $ownerOnly = [System.Security.AccessControl.RegistrySecurity]::new()
                 $ownerOnly.SetOwner($rawOriginal.Owner)
                 $key.SetAccessControl($ownerOnly)
-                $key.Close()
             }
         }
         catch {
             Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $($rawOriginal.Owner). Restore it by hand with: subinacl /keyreg `"$(ConvertTo-OfflineNativeSubKey -Path $Path)`" /setowner=`"$($rawOriginal.Owner)`""
         }
+        # Closed in a finally, not on the success path. An open RegistryKey holds the mounted hive
+        # open, so a throw inside SetAccessControl used to leave a handle behind and the unload at
+        # the end of the run would fail - turning a cosmetic owner-handback failure into a disk that
+        # still has a hive mounted on it.
+        finally { if ($key) { $key.Close() } }
     }
 
     Add-OfflineRepairLog -Message "$Description Ownership was taken to do it. Original descriptor was $($rawOriginal.GetSddlForm('All'))"
@@ -1364,7 +1532,7 @@ try {
     # Ahead of the detect gate on purpose, so one affirmative line serves both modes. A healthy disk
     # and one this script cannot help must not produce the same silence.
     if ($findings.Count -eq 0) {
-        Log-Output 'No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, any certificate in it is in date and has its private key, and the services behind them are not disabled. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, any certificate in it is in date and has its private key, and the services behind them are not disabled. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -1375,7 +1543,7 @@ try {
         }
         # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
         # so a summary printed first is the first thing a long run loses.
-        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }

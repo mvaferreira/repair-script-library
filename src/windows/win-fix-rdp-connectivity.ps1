@@ -103,8 +103,10 @@
 #   was applied, and a VM whose Remote Desktop services were disabled by policy.
 #
 # .PARAMETER detectOnly
-#   "true" to report the Remote Desktop configuration and what would be changed, and make no changes
-#   at all. Defaults to "false".
+#   "true" to report the Remote Desktop configuration and what would be changed, and repair nothing.
+#   No configuration is changed. It is not a pure read: a key locked against this rescue VM has to
+#   have its descriptor borrowed before it can be read at all, and each one is restored immediately
+#   afterwards in a finally. Defaults to "false".
 #
 # .PARAMETER windowsDrive
 #   The drive letter of the attached offline Windows installation. Detected automatically when not
@@ -129,6 +131,24 @@
 #   "true" to remove the machine-wide SSL cipher suite policy. Defaults to "false", because this
 #   policy is present and correct on a healthy Azure VM. Pass this only when the configured suite
 #   list is known to exclude everything the RDP listener can offer.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters detectOnly=true
+#
+#   Reports the Remote Desktop configuration found on the attached disk and what would be changed.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair
+#
+#   Re-enables remote connections, starts Remote Desktop services that were disabled, brings
+#   out-of-range listener values back into their documented set, removes a pinned listener
+#   certificate and re-enables TLS 1.2 where it was explicitly turned off.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters applyAzureBaseline=true resetListenerPort=true
+#
+#   Also applies the document's full Remote Desktop registry configuration and moves the listener
+#   back to port 3389. Only pass resetListenerPort when the port was not moved deliberately.
 #
 # .NOTES
 #   A hive that will not load at all is a different problem and belongs to
@@ -230,6 +250,34 @@ $script:BaselineValueSpec = @(
     [PSCustomObject]@{ Name = 'fDisableAutoReconnect'; Value = 0; Hive = 'SOFTWARE'; Scope = 'Policy'; Purpose = 'automatic reconnect allowed' }
 )
 
+function ConvertTo-DwordInt32 {
+    <#
+    .SYNOPSIS
+        Reinterprets a DWORD as the Int32 the registry API actually stores.
+
+    .DESCRIPTION
+        A REG_DWORD is 32 bits with no sign, but .NET exposes it as Int32, and both
+        RegistryKey.SetValue(..., RegistryValueKind::DWord) and a plain [int] cast go through a
+        CHECKED conversion that throws OverflowException above 2147483647. MaxInstanceCount is
+        4294967295, so it could neither be written nor compared: the write threw, and reading the
+        documented value back returned -1, which never string-matched 4294967295. The finding was
+        therefore raised on every run and survived its own repair, failing the run.
+
+        Reinterpreting the bits rather than converting the number gives the value the registry
+        genuinely holds (4294967295 -> -1) and is an identity for everything that already fits.
+        Returns $null for anything that is not a number, so a value of an unexpected type is treated
+        as drift rather than throwing.
+    #>
+    param([Parameter(Mandatory = $false)][AllowNull()]$Value)
+
+    if ($null -eq $Value) { return $null }
+    $parsed = [int64]0
+    if (-not [int64]::TryParse([string]$Value, [ref]$parsed)) { return $null }
+    # 4294967295L, not 0xFFFFFFFF: PowerShell parses that hex literal as [int] -1, which masks to
+    # the wrong value and then fails the [uint32] conversion outright.
+    return [System.BitConverter]::ToInt32([System.BitConverter]::GetBytes([uint32]($parsed -band 4294967295L)), 0)
+}
+
 function New-Finding {
     <#
     .SYNOPSIS
@@ -240,6 +288,7 @@ function New-Finding {
         [Parameter(Mandatory = $true)][string]$Item,
         [Parameter(Mandatory = $true)][string]$Message,
         [Parameter(Mandatory = $true)][ValidateSet('SYSTEM', 'SOFTWARE')][string]$Hive,
+        [Parameter(Mandatory = $false)][ValidateSet('SYSTEM', 'SOFTWARE')][string[]]$AlsoHive = @(),
         [Parameter(Mandatory = $false)][bool]$Repairable = $true,
         [Parameter(Mandatory = $false)]$Data = $null
     )
@@ -249,6 +298,9 @@ function New-Finding {
         Item       = $Item
         Message    = $Message
         Hive       = $Hive
+        # Every hive this finding's repair may write, which is what the backup pass has to cover.
+        # Almost all findings write one hive; the Azure baseline writes both.
+        Hives      = @(@($Hive) + @($AlsoHive) | Sort-Object -Unique)
         Repairable = $Repairable
         Repaired   = $false
         Data       = $Data
@@ -299,12 +351,17 @@ function Get-TerminalServerState {
     if ($listenerPresent) {
         foreach ($spec in $script:ListenerValueSpec) {
             $read = Get-OfflineValueState -Path $rdpPath -Name $spec.Name
+            # A bare [int] cast throws on a value of the wrong type, and these keys are exactly the
+            # ones a broken machine may have the wrong type in. An uncastable value is not valid,
+            # which routes it to the normal "outside the documented set" repair.
+            $numeric = $null
+            $isNumeric = ($read.Found -and [int]::TryParse([string]$read.Value, [ref]$numeric))
             $listener += [PSCustomObject]@{
                 Spec    = $spec
                 Value   = $read.Value
                 Found   = $read.Found
                 Denied  = $read.Denied
-                IsValid = ((-not $read.Found) -or ($spec.Valid -contains [int]$read.Value))
+                IsValid = ((-not $read.Found) -or ($isNumeric -and ($spec.Valid -contains $numeric)))
             }
         }
     }
@@ -319,7 +376,11 @@ function Get-TerminalServerState {
             Path    = $path
             Value   = $read.Value
             Found   = $read.Found
-            Matches = ($read.Found -and ([string]$read.Value -eq [string]$spec.Value))
+            # Compared as the Int32 the registry stores, so a documented DWORD above 2147483647
+            # matches the value that was actually written instead of drifting forever. A value of
+            # an unexpected type converts to $null and counts as drift.
+            Matches = ($read.Found -and ($null -ne (ConvertTo-DwordInt32 -Value $read.Value)) -and
+                       ((ConvertTo-DwordInt32 -Value $read.Value) -eq (ConvertTo-DwordInt32 -Value $spec.Value)))
         }
     }
 
@@ -353,7 +414,8 @@ function Get-RdpServiceState {
         $denied = $false
         if ($exists) {
             $value = Get-OfflineValueState -Path $path -Name 'Start'
-            if ($value.Found) { $start = [int]$value.Value }
+            # $null rather than a cast, so a Start of an unexpected type cannot throw mid-scan.
+            if ($value.Found) { $start = ConvertTo-DwordInt32 -Value $value.Value }
             $denied = $value.Denied
         }
         [PSCustomObject]@{
@@ -394,8 +456,8 @@ function Get-SchannelState {
             Path              = $path
             Enabled           = $enabled
             DisabledByDefault = $disabledByDefault
-            IsDisabled        = (($enabled.Found -and [int]$enabled.Value -eq 0) -or
-                                 ($disabledByDefault.Found -and [int]$disabledByDefault.Value -eq 1))
+            IsDisabled        = (((ConvertTo-DwordInt32 -Value $enabled.Value) -eq 0 -and $enabled.Found) -or
+                                 ((ConvertTo-DwordInt32 -Value $disabledByDefault.Value) -eq 1 -and $disabledByDefault.Found))
         }
     }
 
@@ -429,11 +491,11 @@ function Get-AllFinding {
     $findings = [System.Collections.Generic.List[object]]::new()
 
     # --- RDP administratively denied -------------------------------------------------------------
-    if ($TerminalServer.BaseDeny.Found -and [int]$TerminalServer.BaseDeny.Value -ne 0) {
+    if ($TerminalServer.BaseDeny.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.BaseDeny.Value) -ne 0) {
         [void]$findings.Add((New-Finding -Cause 'RdpDeniedBase' -Item 'fDenyTSConnections' -Hive 'SYSTEM' `
                     -Message "Remote connections are turned off at $($TerminalServer.TerminalServerPath) (fDenyTSConnections=$($TerminalServer.BaseDeny.Value)). Nothing can connect until this is 0."))
     }
-    if ($TerminalServer.PolicyDeny -and $TerminalServer.PolicyDeny.Found -and [int]$TerminalServer.PolicyDeny.Value -ne 0) {
+    if ($TerminalServer.PolicyDeny -and $TerminalServer.PolicyDeny.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.PolicyDeny.Value) -ne 0) {
         [void]$findings.Add((New-Finding -Cause 'RdpDeniedPolicy' -Item 'fDenyTSConnections (policy)' -Hive 'SOFTWARE' `
                     -Message "Group Policy turns remote connections off (fDenyTSConnections=$($TerminalServer.PolicyDeny.Value) under Policies\Microsoft\Windows NT\Terminal Services). The policy copy overrides the Terminal Server key, so this alone refuses every connection."))
     }
@@ -445,7 +507,12 @@ function Get-AllFinding {
     }
     else {
         foreach ($value in @($TerminalServer.Listener)) {
-            if ($value.Denied) {
+            # Denied is set by the helper the moment the first plain read is refused, BEFORE it takes
+            # the key and reads again. A recovered read therefore arrives here with Denied true and
+            # Found true, and testing Denied alone threw that recovered value away and skipped a
+            # repair the script had the evidence to make. Only a read that was refused AND never
+            # recovered is genuinely unreadable.
+            if ($value.Denied -and -not $value.Found) {
                 [void]$findings.Add((New-Finding -Cause 'ListenerValueUnreadable' -Item $value.Spec.Name -Hive 'SYSTEM' -Repairable $false `
                             -Message "$($value.Spec.Name) could not be read even after taking the key. It was left alone rather than overwritten with a documented default."))
                 continue
@@ -463,20 +530,28 @@ function Get-AllFinding {
                         -Message "A certificate is pinned to the listener (SSLCertificateSHA1Hash). If its private key no longer resolves the TLS handshake fails before authentication and the client reports a generic internal error. The Azure guidance removes this value so Windows generates a fresh self-signed listener certificate on the next start. If RDP still fails afterwards, the certificate store or the private key permissions are the problem and win-fix-rdp-certificate owns those."))
         }
 
-        if ($TerminalServer.Port -and $TerminalServer.Port.Found -and [int]$TerminalServer.Port.Value -ne $script:StandardRdpPort) {
+        if ($TerminalServer.Port -and $TerminalServer.Port.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.Port.Value) -ne $script:StandardRdpPort) {
             $portFinding = New-Finding -Cause 'ListenerPortNonStandard' -Item 'PortNumber' -Hive 'SYSTEM' -Repairable $wantResetPort -Data $TerminalServer.Port `
                 -Message "The listener is on port $($TerminalServer.Port.Value) rather than the documented $($script:StandardRdpPort)."
             if ($wantResetPort) { $portFinding.Message += " -resetListenerPort was passed, so it will be reset to $($script:StandardRdpPort)." }
             else { $portFinding.Message += " This was left alone in case the port was moved deliberately. Be aware the built-in 'Remote Desktop - User Mode (TCP-In)' rule only allows $($script:StandardRdpPort), so a moved port needs its own Windows Firewall rule and a matching NSG rule; without both, the listener starts and connections are still refused. Re-run with -resetListenerPort true to move it back." }
             [void]$findings.Add($portFinding)
         }
+    }
 
-        if ($wantBaseline) {
-            $drift = @($TerminalServer.Baseline | Where-Object { -not $_.Matches })
-            if ($drift.Count -gt 0) {
-                [void]$findings.Add((New-Finding -Cause 'AzureBaselineRequested' -Item 'Azure RDP baseline' -Hive 'SYSTEM' -Data $drift `
-                            -Message "-applyAzureBaseline was passed. $($drift.Count) of $(@($TerminalServer.Baseline).Count) documented Remote Desktop value(s) do not match the guidance and will be set: $(@($drift | ForEach-Object { "$($_.Spec.Name)=$(if ($_.Found) { $_.Value } else { '(not set)' })->$($_.Spec.Value)" }) -join ', ')."))
-            }
+    # Outside the listener branch on purpose. Three of the documented values live under the policy
+    # key in SOFTWARE and do not need the RDP-Tcp listener to exist; nesting this inside the branch
+    # made -applyAzureBaseline silently do nothing on exactly the broken machine it was passed for.
+    # Get-TerminalServerState already drops the Listener-scoped specs when the listener is missing.
+    if ($wantBaseline) {
+        $drift = @($TerminalServer.Baseline | Where-Object { -not $_.Matches })
+        if ($drift.Count -gt 0) {
+            # The finding carries every hive it will write. The backup pass keys off that, and this
+            # is the one finding that spans both, so a single Hive left SOFTWARE modified with no
+            # backup taken of it.
+            $driftHives = @($drift | ForEach-Object { $_.Spec.Hive } | Sort-Object -Unique)
+            [void]$findings.Add((New-Finding -Cause 'AzureBaselineRequested' -Item 'Azure RDP baseline' -Hive $driftHives[0] -AlsoHive $driftHives -Data $drift `
+                        -Message "-applyAzureBaseline was passed. $($drift.Count) of $(@($TerminalServer.Baseline).Count) documented Remote Desktop value(s) do not match the guidance and will be set: $(@($drift | ForEach-Object { "$($_.Spec.Name)=$(if ($_.Found) { $_.Value } else { '(not set)' })->$($_.Spec.Value)" }) -join ', ')."))
         }
     }
 
@@ -489,6 +564,14 @@ function Get-AllFinding {
                 [void]$findings.Add((New-Finding -Cause 'RdpServiceMissing' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
                             -Message "The $($service.Name) service key is missing ($($service.Spec.Purpose)). That is a damaged installation rather than a configuration fault, and this script will not create one."))
             }
+            continue
+        }
+        # An unreadable Start is not a healthy Start. Without this the value silently defaulted to
+        # $null, Disabled evaluated false, and a service whose key is locked against Administrators
+        # was reported as fine. Same recovered-read rule as the listener values above.
+        if ($service.Denied -and $null -eq $service.Start) {
+            [void]$findings.Add((New-Finding -Cause 'RdpServiceStartUnreadable' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
+                        -Message "The Start value of $($service.Name) could not be read even after taking the key ($($service.Spec.Purpose)). Its state is unknown, so it was reported rather than assumed healthy or overwritten."))
             continue
         }
         if (-not $service.Disabled) { continue }
@@ -514,7 +597,11 @@ function Get-AllFinding {
         [void]$findings.Add((New-Finding -Cause 'CipherPolicyEmpty' -Item 'Functions' -Hive 'SOFTWARE' `
                     -Message 'The machine-wide SSL cipher suite policy is present but lists no cipher suites, which leaves nothing for the TLS handshake to agree on. The empty value will be removed so Windows uses its own list.'))
     }
-    elseif ($Schannel.CipherPresent -and $wantClearCiphers) {
+    elseif ($wantClearCiphers -and $Schannel.Functions -and $Schannel.Functions.Found) {
+        # Gated on the Functions VALUE, not on the key. The repair removes the value and leaves the
+        # key behind, so testing the key made this finding survive its own successful repair: the
+        # verification pass re-raised it and the run reported failure after doing exactly what was
+        # asked. Every finding has to be able to go away once it has been repaired.
         [void]$findings.Add((New-Finding -Cause 'CipherPolicyClearRequested' -Item 'Functions' -Hive 'SOFTWARE' `
                     -Message "-clearCipherSuitePolicy was passed, so the machine-wide SSL cipher suite policy ($($Schannel.FunctionCount) suite(s)) will be removed and Windows will use its own list."))
     }
@@ -523,7 +610,7 @@ function Get-AllFinding {
     # Never discovered. It only exists because the operator asked for it by name.
     if ($wantDisableNla -and $TerminalServer.ListenerPresent) {
         $nla = @($TerminalServer.Listener | Where-Object { $_.Spec.Name -eq 'UserAuthentication' })
-        if ($nla.Count -eq 0 -or -not $nla[0].Found -or [int]$nla[0].Value -ne 0) {
+        if ($nla.Count -eq 0 -or -not $nla[0].Found -or (ConvertTo-DwordInt32 -Value $nla[0].Value) -ne 0) {
             [void]$findings.Add((New-Finding -Cause 'NlaDisableRequested' -Item 'UserAuthentication' -Hive 'SYSTEM' `
                         -Message '-disableNla was passed, so Network Level Authentication will be turned off (UserAuthentication=0). The Azure guidance enables NLA, so this is a deliberate deviation from it: it lets a client reach the logon screen before authenticating. Turn it back on once the VM is reachable.'))
         }
@@ -550,8 +637,13 @@ function Set-OfflineRdpDword {
         [Parameter(Mandatory = $true)][string]$Message
     )
 
-    # MaxInstanceCount is 4294967295, which is a valid DWORD but not a valid Int32.
-    $typed = [uint32]$NewValue
+    # MaxInstanceCount is 4294967295, which is a valid DWORD but not a valid Int32, so it has to be
+    # reinterpreted rather than converted or Set-ItemProperty throws on the checked conversion.
+    $typed = ConvertTo-DwordInt32 -Value $NewValue
+    if ($null -eq $typed) {
+        Add-OfflineRepairLog -Level Warning -Message "$Name was not written: '$NewValue' is not a DWORD."
+        return $false
+    }
 
     $outcome = Invoke-OfflineProtectedRegistryWrite -Path $Path -Description $Name -Action {
         if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
@@ -693,7 +785,7 @@ try {
 
     if ($ts.ListenerPresent) {
         foreach ($value in @($ts.Listener)) {
-            $shown = if ($value.Denied) { '(unreadable)' } elseif ($value.Found) { $value.Value } else { '(not set, Windows default)' }
+            $shown = if ($value.Denied -and -not $value.Found) { '(unreadable)' } elseif ($value.Found) { $value.Value } else { '(not set, Windows default)' }
             Log-Info "  RDP-Tcp $($value.Spec.Name) = $shown - $($value.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
         }
         Log-Info "  RDP-Tcp PortNumber = $(if ($ts.Port.Found) { $ts.Port.Value } else { '(not set)' })." | Tee-Object -FilePath $logFile -Append
@@ -702,7 +794,7 @@ try {
     $disabledServices = @($context.Services | Where-Object { $_.Disabled })
     Log-Info "Services: $(@($context.Services | Where-Object { $_.Exists }).Count) of $(@($context.Services).Count) required service key(s) present, $($disabledServices.Count) disabled." | Tee-Object -FilePath $logFile -Append
     foreach ($service in @($context.Services)) {
-        $shown = if (-not $service.Exists) { 'no service key' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
+        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Denied -and $null -eq $service.Start) { '(unreadable)' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
         Log-Info "  $($service.Name): $shown, $($service.Spec.Source)." | Tee-Object -FilePath $logFile -Append
     }
 
@@ -723,7 +815,7 @@ try {
     # a healthy disk and one this script cannot help would both report nothing but a count, and the
     # reader could not tell which had happened.
     if ($findings.Count -eq 0) {
-        Log-Output 'No Remote Desktop fault was found. Remote connections are allowed, the listener and its services are configured for them, and TLS 1.2 is available. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output 'No Remote Desktop fault was found. Remote connections are allowed, the listener and its services are configured for them, and TLS 1.2 is available. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -734,13 +826,13 @@ try {
         }
         # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
         # so a summary printed first is the first thing a long run loses.
-        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
 
-    # Back up only the hives that are actually about to be written.
-    $hivesToWrite = @($repairable | ForEach-Object { $_.Hive } | Sort-Object -Unique)
+    # Back up every hive that is actually about to be written.
+    $hivesToWrite = @($repairable | ForEach-Object { $_.Hives } | Sort-Object -Unique)
     foreach ($hive in $hivesToWrite) {
         $backup = Backup-OfflineHiveFile -Hive $hive -WindowsPath $offline.WindowsPath
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
