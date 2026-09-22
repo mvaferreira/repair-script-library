@@ -800,7 +800,16 @@ try {
 
     # Presence is normal here and is stated as such, so nobody reads this line as a fault.
     if ($context.Schannel.CipherPresent) {
-        Log-Info "A machine-wide SSL cipher suite policy is configured with $($context.Schannel.FunctionCount) suite(s). That is normal on an Azure image and was not treated as a fault." | Tee-Object -FilePath $logFile -Append
+        # Distinguishes "the key is there but sets no list" from "the key lists N suites". Reporting
+        # 0 suite(s) for the first case read as an empty policy being ignored, which contradicts the
+        # rule above that an empty list IS a fault. Only a Functions value that exists and is empty
+        # is that fault.
+        if ($context.Schannel.Functions -and $context.Schannel.Functions.Found) {
+            Log-Info "A machine-wide SSL cipher suite policy is configured with $($context.Schannel.FunctionCount) suite(s). That is normal on an Azure image and was not treated as a fault." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Info 'The machine-wide SSL cipher suite policy key exists but sets no suite list, so Windows uses its own. That is normal on an Azure image and was not treated as a fault.' | Tee-Object -FilePath $logFile -Append
+        }
     }
 
     $findings = @($context.Findings)
