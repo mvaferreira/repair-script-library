@@ -131,10 +131,10 @@
 #########################################################################################################
 
 Param(
-    [Parameter(Mandatory = $false)][ValidateSet('true', 'false')][string]$detectOnly = 'false',
+    [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$detectOnly = 'false',
     [Parameter(Mandatory = $false)][string]$driverName = '',
-    [Parameter(Mandatory = $false)][ValidateSet('true', 'false')][string]$disableDriverVerifier = 'false',
-    [Parameter(Mandatory = $false)][ValidateSet('true', 'false')][string]$revert = 'false',
+    [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$disableDriverVerifier = 'false',
+    [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$revert = 'false',
     [Parameter(Mandatory = $false)][string]$windowsDrive = ''
 )
 
@@ -231,6 +231,10 @@ function New-Finding {
     .SYNOPSIS
         Builds one finding. Repairable=$false means the script reports it and changes nothing.
     #>
+    # This only builds an object in memory and touches nothing on the disk, so ShouldProcess would
+    # add a prompt with no console to answer it. Suppressed rather than implemented on purpose.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Scripts run non-interactively through Run Command; report-only is detectOnly. New-Finding builds an object and changes nothing.')]
     param(
         [Parameter(Mandatory = $true)][string]$Cause,
         [Parameter(Mandatory = $true)][string]$Item,

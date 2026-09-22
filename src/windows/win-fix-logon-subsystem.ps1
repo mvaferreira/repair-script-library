@@ -153,7 +153,8 @@ function New-Finding {
     #>
     # This only builds an object in memory and touches nothing on the disk, so ShouldProcess would
     # add a prompt with no console to answer it. Suppressed rather than implemented on purpose.
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Scripts run non-interactively through Run Command; report-only is detectOnly. New-Finding builds an object and changes nothing.')]
     param(
         [Parameter(Mandatory = $true)][string]$Cause,
         [Parameter(Mandatory = $true)][string]$Item,
