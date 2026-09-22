@@ -719,6 +719,15 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
     $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
+    # Ahead of the detectOnly gate on purpose, so one affirmative line serves both modes. Behind it,
+    # a healthy disk and one this script cannot help would both report nothing but a count, and the
+    # reader could not tell which had happened.
+    if ($findings.Count -eq 0) {
+        Log-Output 'No Remote Desktop fault was found. Remote connections are allowed, the listener and its services are configured for them, and TLS 1.2 is available. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_SUCCESS
+    }
+
     if ($isDetectOnly) {
         foreach ($finding in $findings) {
             Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
@@ -726,12 +735,6 @@ try {
         # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
         # so a summary printed first is the first thing a long run loses.
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($findings.Count -eq 0) {
-        Log-Output 'No Remote Desktop fault was found. Remote connections are allowed, the listener and its services are configured for them, and TLS 1.2 is available. No changes were made.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
