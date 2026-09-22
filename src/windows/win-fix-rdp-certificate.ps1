@@ -76,11 +76,23 @@
 #   through the provider, and this one reaches the same keys through the mounted SOFTWARE hive.
 #
 #   A Deny entry for SYSTEM on that key stops the self-signed certificate being created in the first
-#   place. It is the one case in this script where an access control entry is REMOVED rather than
-#   added, and that is deliberate: SYSTEM is the account that creates the listener certificate, so a
-#   deny against it on the store it is created in has no legitimate purpose. Only Deny entries for
-#   SYSTEM are removed, only on that key, and the descriptor that was there is written to the log.
-#   Everything else in it, including entries someone added on purpose, is left exactly as found.
+#   place. It is the registry half of the two cases in this script where an access control entry is
+#   REMOVED rather than added, and that is deliberate: SYSTEM is the account that creates the
+#   listener certificate, so a deny against it on the store it is created in has no legitimate
+#   purpose. Only Deny entries for SYSTEM are removed, only on that key, and the descriptor that was
+#   there is written to the log. Everything else in it, including entries someone added on purpose,
+#   is left exactly as found. The other case is on the file system, where granting an account access
+#   to a key container also drops the deny entries standing in the way of that same account. Every
+#   deny for an account being granted is removed, whatever rights it denied, because any of them can
+#   defeat the grant; a deliberately narrow deny against one of those accounts goes with the rest,
+#   and the descriptor that was there is written to the log first.
+#
+#   The two certificate store keys are judged on explicit Deny entries for SYSTEM only. A key that
+#   merely stops granting SYSTEM - a protected DACL listing only Administrators, say - blocks
+#   certificate creation just as effectively but is NOT reported, because on a healthy image these
+#   keys inherit their access rather than granting it explicitly, so requiring an explicit grant
+#   would fire on every machine. If RDP still fails after this script reports the store healthy,
+#   compare that key's descriptor against a known-good VM by hand.
 #
 #   The certificate itself is the third. Two states leave the listener with nothing usable and are
 #   repaired by removing the store entry, which is what makes Windows mint a fresh one:
@@ -391,6 +403,24 @@ function Test-SddlGrant {
     return [PSCustomObject]@{ Granted = $granted; Denied = $denied }
 }
 
+function Test-FolderEveryoneAccess {
+    <#
+    .SYNOPSIS
+        Whether the MachineKeys folder really gives Everyone the access the store needs.
+
+    .DESCRIPTION
+        Both halves of Test-SddlGrant have to be consumed. Reading only .Granted made a folder that
+        allows Everyone and then explicitly denies Everyone look healthy, because the allow was
+        found and the deny was thrown away - and a deny wins regardless of order. That is the exact
+        shape a hardening baseline produces when it "removes Everyone" by adding a deny rather than
+        stripping the allow, which is one of the configurations this script exists to repair.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Sddl)
+
+    $check = Test-SddlGrant -Sddl $Sddl -Sid $script:SidEveryone -Mask $script:MaskFolderEveryone
+    return ($check.Granted -and -not $check.Denied)
+}
+
 function Get-PathSddl {
     <#
     .SYNOPSIS
@@ -434,11 +464,18 @@ function Get-KeyStoreState {
     $folderExists = Test-Path -LiteralPath $folder
     $folderSddl = $null
     $folderOk = $true
+    # Kept apart from $folderOk so an unreadable descriptor cannot be reported as a healthy one.
+    # $folderOk starts true for the folder that does not exist; "exists but refused its descriptor"
+    # is a different answer and gets its own finding.
+    $folderSddlKnown = $true
 
     if ($folderExists) {
         $folderSddl = Get-PathSddl -Path $folder -IsDirectory
         if ($folderSddl) {
-            $folderOk = (Test-SddlGrant -Sddl $folderSddl -Sid $script:SidEveryone -Mask $script:MaskFolderEveryone).Granted
+            $folderOk = (Test-FolderEveryoneAccess -Sddl $folderSddl)
+        }
+        else {
+            $folderSddlKnown = $false
         }
     }
 
@@ -461,7 +498,8 @@ function Get-KeyStoreState {
             if ($captured) {
                 if (-not $folderSddl) {
                     $folderSddl = $captured
-                    $folderOk = (Test-SddlGrant -Sddl $captured -Sid $script:SidEveryone -Mask $script:MaskFolderEveryone).Granted
+                    $folderSddlKnown = $true
+                    $folderOk = (Test-FolderEveryoneAccess -Sddl $captured)
                 }
                 try { $files = @(Get-ChildItem -LiteralPath $folder -Force -File -ErrorAction Stop | Where-Object $filter) }
                 catch { $folderListed = $false }
@@ -511,13 +549,14 @@ function Get-KeyStoreState {
     }
 
     return [PSCustomObject]@{
-        FolderPath   = $folder
-        FolderExists = $folderExists
-        FolderSddl   = $folderSddl
-        FolderOk     = $folderOk
-        FolderListed = $folderListed
-        Required     = @($required)
-        Containers   = @($containers)
+        FolderPath      = $folder
+        FolderExists    = $folderExists
+        FolderSddl      = $folderSddl
+        FolderOk        = $folderOk
+        FolderSddlKnown = $folderSddlKnown
+        FolderListed    = $folderListed
+        Required        = @($required)
+        Containers      = @($containers)
     }
 }
 
@@ -878,7 +917,12 @@ function Get-CertificateServiceState {
         if ($exists) {
             $found = $false
             $value = Get-OfflineProtectedRegistryValue -Path $path -Name 'Start' -Found ([ref]$found) -Denied ([ref]$denied)
-            if ($found) { $start = [int]$value }
+            # TryParse, not [int]: a bare cast throws on a value of an unexpected type, and that
+            # throw happens inside the hive scriptblock and takes the whole run to STATUS_ERROR.
+            if ($found) {
+                $parsed = 0
+                if ([int]::TryParse("$value", [ref]$parsed)) { $start = $parsed }
+            }
         }
 
         [PSCustomObject]@{
@@ -888,6 +932,10 @@ function Get-CertificateServiceState {
             Exists   = $exists
             Start    = $start
             Denied   = $denied
+            # Denied is raised on the first refusal, before the helper takes the key and retries,
+            # and is not lowered when that retry succeeds. Only a read that was refused AND never
+            # recovered is genuinely unreadable.
+            Unreadable = ($exists -and $denied -and $null -eq $start)
             Disabled = ($exists -and $start -eq 4)
         }
     }
@@ -918,6 +966,13 @@ function Get-AllFinding {
         if (-not $KeyStore.FolderListed) {
             [void]$findings.Add((New-Finding -Cause 'MachineKeysFolderUnreadable' -Item 'MachineKeys' -Hive 'FILE' -Repairable $false `
                         -Message "$($KeyStore.FolderPath) could not be listed even after taking ownership of it, so whether the listener's key container is intact is unknown. Nothing was changed. Inspect it by hand before concluding the certificate is not the problem."))
+        }
+        # An unreadable descriptor is not a healthy one. FolderOk defaults to true, so without this
+        # a folder that refused its own descriptor was reported as correctly permissioned - the
+        # mirror image of the mistake the container reads are careful to avoid.
+        if (-not $KeyStore.FolderSddlKnown) {
+            [void]$findings.Add((New-Finding -Cause 'MachineKeysFolderSecurityUnreadable' -Item 'MachineKeys' -Hive 'FILE' -Repairable $false `
+                        -Message "The security descriptor of $($KeyStore.FolderPath) could not be read, so whether the store still grants Everyone the access every measured build ships with is unknown. It was left alone rather than rewritten from an assumption."))
         }
         foreach ($container in @($KeyStore.Containers)) {
             if (-not $container.Readable) {
@@ -954,6 +1009,13 @@ function Get-AllFinding {
                 [void]$findings.Add((New-Finding -Cause 'CertificateServiceMissing' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
                             -Message "The $($service.Name) service key is missing ($($service.Spec.Purpose)). That is a damaged installation rather than a configuration fault, and this script will not create one."))
             }
+            continue
+        }
+        # An unreadable Start is not a running service. Without this a genuinely disabled service
+        # whose key refuses to be read was reported as healthy, because Disabled is false either way.
+        if ($service.Unreadable) {
+            [void]$findings.Add((New-Finding -Cause 'CertificateServiceStartUnreadable' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
+                        -Message "The Start value of $($service.Name) could not be read even after taking the key ($($service.Spec.Purpose)), so whether it is disabled is unknown. It was left alone rather than overwritten with a documented default."))
             continue
         }
         if (-not $service.Disabled) { continue }
@@ -1172,7 +1234,7 @@ function Add-OfflinePathAce {
             $ownerOnly = if ($isDirectory) { [System.Security.AccessControl.DirectorySecurity]::new() } else { [System.Security.AccessControl.FileSecurity]::new() }
             $ownerOnly.SetOwner([System.Security.Principal.SecurityIdentifier]::new($ownerWas))
             try { Save-OfflinePathSecurity -Path $Path -Security $ownerOnly -IsDirectory:$isDirectory }
-            catch { Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $ownerWas. Restore it with: icacls `"$Path`" /setowner `"NT AUTHORITY\SYSTEM`"" }
+            catch { Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $ownerWas. Restore it with: icacls `"$Path`" /setowner `"*$ownerWas`"" }
         }
 
         Add-OfflineRepairLog -Message "$Description Ownership was taken to do it. Original descriptor was $original"
@@ -1245,8 +1307,9 @@ function Remove-OfflineRegistryKeyDeny {
         Removes the Deny entries for one SID from an offline hive key, leaving the rest as found.
 
     .DESCRIPTION
-        This is the one place in this script where an access control entry is taken away rather than
-        added, so it is deliberately narrow: only entries of type Deny, only for the SID it is given,
+        This is the registry half of the two places in this script where an access control entry is
+        taken away rather than added, so it is deliberately narrow: only entries of type Deny, only
+        for the SID it is given,
         only those written on the key itself, only on the key it is given. Inherited entries are left
         alone - they belong to a key above this one and are removed by repairing that key, not by
         stamping a copy of the parent's list here. Every other entry, including anything an
@@ -1396,7 +1459,7 @@ function Remove-OfflineRegistryKeyDeny {
             }
         }
         catch {
-            Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $($rawOriginal.Owner). Restore it by hand with: subinacl /keyreg `"$(ConvertTo-OfflineNativeSubKey -Path $Path)`" /setowner=`"$($rawOriginal.Owner)`""
+            Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $($rawOriginal.Owner). Restore it by hand while the hive is mounted: [Security.AccessControl.RegistrySecurity] owner set to $($rawOriginal.Owner) on `"$(ConvertTo-OfflineNativeSubKey -Path $Path)`". (subinacl is not suggested here - Microsoft retired it and no longer distributes it.)"
         }
         # Closed in a finally, not on the success path. An open RegistryKey holds the mounted hive
         # open, so a throw inside SetAccessControl used to leave a handle behind and the unload at
@@ -1484,7 +1547,7 @@ try {
     Log-Info "Control set $($context.ControlSet)." | Tee-Object -FilePath $logFile -Append
     Log-Info "Machine key store: $($keyStore.FolderPath) $(if ($keyStore.FolderExists) { 'present' } else { 'absent - not a fault, Windows recreates it and the key with it on the next start' })." | Tee-Object -FilePath $logFile -Append
     if ($keyStore.FolderExists) {
-        Log-Info "  Folder descriptor: $($keyStore.FolderSddl)" | Tee-Object -FilePath $logFile -Append
+        Log-Info "  Folder descriptor: $(if ($keyStore.FolderSddlKnown) { $keyStore.FolderSddl } else { '<descriptor refused>' })" | Tee-Object -FilePath $logFile -Append
     }
 
     Log-Info "Expected on build $($offline.BuildNumber): $(@($keyStore.Required | ForEach-Object { "$($_.Who)=$($_.Rights)" }) -join ', ')." | Tee-Object -FilePath $logFile -Append
@@ -1499,7 +1562,7 @@ try {
     }
 
     foreach ($service in @($context.Services)) {
-        $shown = if (-not $service.Exists) { 'no service key' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
+        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Unreadable) { '(unreadable)' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
         Log-Info "  $($service.Name): $shown - $($service.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
     }
 
@@ -1558,6 +1621,16 @@ try {
                 $finding.Repaired = $true
                 $repairedCount++
             }
+            else {
+                # Add-OfflinePathAce returns false rather than throwing when a descriptor cannot be
+                # read, ownership cannot be taken, or the retry apply fails. With no else branch
+                # that silent false was neither counted nor recorded, and for a finding the verify
+                # pass cannot re-raise - MachineKeysFolderHardened is gated on a broken container
+                # that the same run just repaired - the script reported success for a repair that
+                # did not happen.
+                [void]$failed.Add("$($finding.Item): the repair reported that it changed nothing.")
+                Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair reported no change."
+            }
         }
         catch {
             [void]$failed.Add("$($finding.Item): $($_.Exception.Message)")
@@ -1590,6 +1663,10 @@ try {
                         $done++
                         if ($finding.Cause -eq 'CertificateStoreAccessDenied') { $denyRepaired = $true }
                     }
+                    else {
+                        [void]$errors.Add("$($finding.Item): the repair reported that it changed nothing.")
+                        Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair reported no change."
+                    }
                 }
                 catch {
                     [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
@@ -1616,6 +1693,10 @@ try {
                         if (Repair-SoftwareFinding -Finding $finding) {
                             $finding.Repaired = $true
                             $done++
+                        }
+                        else {
+                            [void]$errors.Add("$($finding.Item): the repair reported that it changed nothing.")
+                            Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair reported no change."
                         }
                     }
                     catch {
@@ -1657,6 +1738,10 @@ try {
                     if (Repair-RegistryFinding -Finding $finding) {
                         $finding.Repaired = $true
                         $done++
+                    }
+                    else {
+                        [void]$errors.Add("$($finding.Item): the repair reported that it changed nothing.")
+                        Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair reported no change."
                     }
                 }
                 catch {
@@ -1712,4 +1797,16 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # The caller contract in common\helpers\README.md. On a throw the buffered helper entries are
+    # the ones that say WHY - which hive refused to unload, which file was missing - and without
+    # this they were discarded and only the exception survived. A dependency may have failed to
+    # load before either function existed, hence the guards.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    }
 }

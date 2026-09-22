@@ -84,6 +84,15 @@
 #       it on sight would strip working configuration off every machine this ran against. Only an
 #       EMPTY suite list is treated as a fault, because that genuinely leaves nothing to negotiate.
 #
+#   A certificate pinned to the listener (SSLCertificateSHA1Hash) is removed when it is present.
+#   Windows does not write that value for the self-signed certificate it generates on its own, so
+#   its presence means something deliberately pinned a specific certificate. Measured: absent on a
+#   clean Windows Server 2019 marketplace image, and absent on a running Windows 11 host that was
+#   serving RDP over TLS with SecurityLayer=2. Removing it therefore does not disturb a machine
+#   that never pinned one. Note this script cannot resolve the pinned certificate's private key
+#   offline - it removes the pin rather than proving the key is gone - so the value is restored
+#   from the hive backup if the pin turns out to have been wanted.
+#
 #   AllowEncryptionOracle is not written by this script under any parameter. Setting it to 2 makes
 #   CredSSP accept the CVE-2018-0886 downgrade again, and a repair script is not the place to
 #   reintroduce a remote code execution vulnerability on a machine about to go back into service.
@@ -93,6 +102,10 @@
 #   It is off by default because those values do not prevent a connection and one of them differs on
 #   a healthy image. Pass it when a VM's Terminal Server configuration has been edited enough that
 #   returning it wholesale to the documented state is quicker than reasoning about each value.
+#   Three of the documented values live under Policies\Microsoft\Windows NT\Terminal Services, so
+#   on a VM with no Terminal Services policy this creates that Group Policy key. Group Policy values
+#   override the local Terminal Server settings and persist until removed, which is a larger change
+#   than it appears; the SOFTWARE hive backup taken before the write is the way back.
 #
 #   The SYSTEM and SOFTWARE hives are backed up before either is written to.
 #
@@ -115,6 +128,8 @@
 # .PARAMETER applyAzureBaseline
 #   "true" to also apply the documented keep-alive, reconnect, LanAdapter and MaxInstanceCount
 #   values from "Prepare a Windows VHD to upload to Azure", whether or not they are currently wrong.
+#   Three of those values live under the Terminal Services Group Policy key, so on a VM that has no
+#   such policy this creates it, and Group Policy then overrides the local settings until removed.
 #   Defaults to "false" - see the note above.
 #
 # .PARAMETER disableNla
@@ -273,6 +288,10 @@ function ConvertTo-DwordInt32 {
     if ($null -eq $Value) { return $null }
     $parsed = [int64]0
     if (-not [int64]::TryParse([string]$Value, [ref]$parsed)) { return $null }
+    # Reject rather than silently truncate. A value outside the DWORD range is not a DWORD that was
+    # read back oddly, it is a value this script has no correct interpretation of, and masking it
+    # would write a number nobody chose (4294967296 would become 0).
+    if ($parsed -gt 4294967295L -or $parsed -lt -2147483648L) { return $null }
     # 4294967295L, not 0xFFFFFFFF: PowerShell parses that hex literal as [int] -1, which masks to
     # the wrong value and then fails the [uint32] conversion outright.
     return [System.BitConverter]::ToInt32([System.BitConverter]::GetBytes([uint32]($parsed -band 4294967295L)), 0)
@@ -336,6 +355,43 @@ function Get-OfflineValueState {
     }
 }
 
+function Test-ValueUnreadable {
+    <#
+    .SYNOPSIS
+        True only when a read was refused AND never recovered.
+
+    .DESCRIPTION
+        Get-OfflineProtectedRegistryValue raises Denied the moment the first plain read is refused,
+        before it takes the key and reads again, and it does not lower the flag when that retry
+        succeeds. Denied on its own therefore means "was locked at some point", not "unknown", and
+        testing it alone throws away values the script did in fact read.
+
+        Every read site must ask the question through here, because both mistakes are silent: a
+        recovered value treated as unreadable skips a repair, and an unreadable value treated as
+        "not set" lets the script report a healthy machine it never managed to look at.
+    #>
+    param([Parameter(Mandatory = $false)][AllowNull()]$State)
+
+    if ($null -eq $State) { return $false }
+    return ($State.Denied -and -not $State.Found)
+}
+
+function Format-ValueForLog {
+    <#
+    .SYNOPSIS
+        Renders a read value for the context log, keeping "unreadable" and "not set" apart.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$State,
+        [Parameter(Mandatory = $false)][string]$NotSet = '(not set)'
+    )
+
+    if ($null -eq $State) { return $NotSet }
+    if (Test-ValueUnreadable -State $State) { return '(unreadable)' }
+    if ($State.Found) { return "$($State.Value)" }
+    return $NotSet
+}
+
 function Get-TerminalServerState {
     <#
     .SYNOPSIS
@@ -381,6 +437,9 @@ function Get-TerminalServerState {
             # an unexpected type converts to $null and counts as drift.
             Matches = ($read.Found -and ($null -ne (ConvertTo-DwordInt32 -Value $read.Value)) -and
                        ((ConvertTo-DwordInt32 -Value $read.Value) -eq (ConvertTo-DwordInt32 -Value $spec.Value)))
+            # A value that was refused and never recovered is not drift. Counting it as drift made
+            # the script log "(not set)->N" about a value it never saw and then overwrite it.
+            Unreadable = (Test-ValueUnreadable -State $read)
         }
     }
 
@@ -458,6 +517,9 @@ function Get-SchannelState {
             DisabledByDefault = $disabledByDefault
             IsDisabled        = (((ConvertTo-DwordInt32 -Value $enabled.Value) -eq 0 -and $enabled.Found) -or
                                  ((ConvertTo-DwordInt32 -Value $disabledByDefault.Value) -eq 1 -and $disabledByDefault.Found))
+            # Neither value could be read, so "Windows decides" cannot be assumed. Reported, not
+            # repaired, for the same reason as every other unreadable value.
+            Unreadable        = ((Test-ValueUnreadable -State $enabled) -or (Test-ValueUnreadable -State $disabledByDefault))
         }
     }
 
@@ -491,11 +553,22 @@ function Get-AllFinding {
     $findings = [System.Collections.Generic.List[object]]::new()
 
     # --- RDP administratively denied -------------------------------------------------------------
-    if ($TerminalServer.BaseDeny.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.BaseDeny.Value) -ne 0) {
+    # The deny switch decides whether anything can connect at all, so an unreadable one must never
+    # fall through to the affirmative "no fault was found". Reported rather than repaired: writing a
+    # documented default over a value that was never read would be changing something unexamined.
+    if (Test-ValueUnreadable -State $TerminalServer.BaseDeny) {
+        [void]$findings.Add((New-Finding -Cause 'RdpDenyUnreadable' -Item 'fDenyTSConnections' -Hive 'SYSTEM' -Repairable $false `
+                    -Message "fDenyTSConnections could not be read at $($TerminalServer.TerminalServerPath) even after taking the key, so whether remote connections are allowed is unknown. It was left alone. Check the permissions on that key from the rescue VM."))
+    }
+    elseif ($TerminalServer.BaseDeny.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.BaseDeny.Value) -ne 0) {
         [void]$findings.Add((New-Finding -Cause 'RdpDeniedBase' -Item 'fDenyTSConnections' -Hive 'SYSTEM' `
                     -Message "Remote connections are turned off at $($TerminalServer.TerminalServerPath) (fDenyTSConnections=$($TerminalServer.BaseDeny.Value)). Nothing can connect until this is 0."))
     }
-    if ($TerminalServer.PolicyDeny -and $TerminalServer.PolicyDeny.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.PolicyDeny.Value) -ne 0) {
+    if (Test-ValueUnreadable -State $TerminalServer.PolicyDeny) {
+        [void]$findings.Add((New-Finding -Cause 'RdpDenyPolicyUnreadable' -Item 'fDenyTSConnections (policy)' -Hive 'SOFTWARE' -Repairable $false `
+                    -Message "The Group Policy copy of fDenyTSConnections could not be read even after taking the key. The policy copy overrides the Terminal Server key, so RDP may still be denied by it. It was left alone."))
+    }
+    elseif ($TerminalServer.PolicyDeny -and $TerminalServer.PolicyDeny.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.PolicyDeny.Value) -ne 0) {
         [void]$findings.Add((New-Finding -Cause 'RdpDeniedPolicy' -Item 'fDenyTSConnections (policy)' -Hive 'SOFTWARE' `
                     -Message "Group Policy turns remote connections off (fDenyTSConnections=$($TerminalServer.PolicyDeny.Value) under Policies\Microsoft\Windows NT\Terminal Services). The policy copy overrides the Terminal Server key, so this alone refuses every connection."))
     }
@@ -544,7 +617,12 @@ function Get-AllFinding {
     # made -applyAzureBaseline silently do nothing on exactly the broken machine it was passed for.
     # Get-TerminalServerState already drops the Listener-scoped specs when the listener is missing.
     if ($wantBaseline) {
-        $drift = @($TerminalServer.Baseline | Where-Object { -not $_.Matches })
+        $unreadable = @($TerminalServer.Baseline | Where-Object { $_.Unreadable })
+        foreach ($entry in $unreadable) {
+            [void]$findings.Add((New-Finding -Cause 'AzureBaselineUnreadable' -Item $entry.Spec.Name -Hive $entry.Spec.Hive -Repairable $false `
+                        -Message "$($entry.Spec.Name) could not be read at $($entry.Path) even after taking the key, so it was excluded from the baseline rather than overwritten with the documented $($entry.Spec.Value)."))
+        }
+        $drift = @($TerminalServer.Baseline | Where-Object { -not $_.Matches -and -not $_.Unreadable })
         if ($drift.Count -gt 0) {
             # The finding carries every hive it will write. The backup pass keys off that, and this
             # is the one finding that spans both, so a single Hive left SOFTWARE modified with no
@@ -587,6 +665,12 @@ function Get-AllFinding {
     }
 
     # --- SCHANNEL ---------------------------------------------------------------------------------
+    $unreadableSides = @($Schannel.Tls12 | Where-Object { $_.Unreadable -and -not $_.IsDisabled })
+    if ($unreadableSides.Count -gt 0) {
+        [void]$findings.Add((New-Finding -Cause 'Tls12Unreadable' -Item 'TLS 1.2' -Hive 'SYSTEM' -Repairable $false `
+                    -Message "The TLS 1.2 setting for $(@($unreadableSides | ForEach-Object { $_.Side }) -join ' and ') could not be read even after taking the key, so whether TLS 1.2 is available is unknown. It was left alone rather than enabled blindly."))
+    }
+
     $disabledSides = @($Schannel.Tls12 | Where-Object { $_.IsDisabled })
     if ($disabledSides.Count -gt 0) {
         [void]$findings.Add((New-Finding -Cause 'Tls12Disabled' -Item 'TLS 1.2' -Hive 'SYSTEM' -Data $disabledSides `
@@ -781,14 +865,14 @@ try {
     # Context. None of this is a fault by itself, so none of it appears in the findings list.
     $ts = $context.TerminalServer
     Log-Info "Control set $($context.ControlSet)." | Tee-Object -FilePath $logFile -Append
-    Log-Info "Terminal Server: fDenyTSConnections=$(if ($ts.BaseDeny.Found) { $ts.BaseDeny.Value } else { '(not set)' }), Group Policy copy $(if ($ts.PolicyDeny -and $ts.PolicyDeny.Found) { "= $($ts.PolicyDeny.Value)" } else { 'not configured' })." | Tee-Object -FilePath $logFile -Append
+    Log-Info "Terminal Server: fDenyTSConnections=$(Format-ValueForLog -State $ts.BaseDeny), Group Policy copy $(if (Test-ValueUnreadable -State $ts.PolicyDeny) { '(unreadable)' } elseif ($ts.PolicyDeny -and $ts.PolicyDeny.Found) { "= $($ts.PolicyDeny.Value)" } else { 'not configured' })." | Tee-Object -FilePath $logFile -Append
 
     if ($ts.ListenerPresent) {
         foreach ($value in @($ts.Listener)) {
-            $shown = if ($value.Denied -and -not $value.Found) { '(unreadable)' } elseif ($value.Found) { $value.Value } else { '(not set, Windows default)' }
+            $shown = if (Test-ValueUnreadable -State $value) { '(unreadable)' } elseif ($value.Found) { $value.Value } else { '(not set, Windows default)' }
             Log-Info "  RDP-Tcp $($value.Spec.Name) = $shown - $($value.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
         }
-        Log-Info "  RDP-Tcp PortNumber = $(if ($ts.Port.Found) { $ts.Port.Value } else { '(not set)' })." | Tee-Object -FilePath $logFile -Append
+        Log-Info "  RDP-Tcp PortNumber = $(Format-ValueForLog -State $ts.Port)." | Tee-Object -FilePath $logFile -Append
     }
 
     $disabledServices = @($context.Services | Where-Object { $_.Disabled })
@@ -862,6 +946,12 @@ try {
                         $finding.Repaired = $true
                         $done++
                     }
+                    else {
+                        # A repair that returns false rather than throwing was previously neither
+                        # counted nor recorded, so a run could report success for work it did not do.
+                        [void]$errors.Add("$($finding.Item): the repair reported that it changed nothing.")
+                        Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair reported no change."
+                    }
                 }
                 catch {
                     [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
@@ -914,4 +1004,16 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # The caller contract in common\helpers\README.md. On a throw the buffered helper entries are
+    # the ones that say WHY - which hive refused to unload, which file was missing - and without
+    # this they were discarded and only the exception survived. A dependency may have failed to
+    # load before either function existed, hence the guards.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    }
 }
