@@ -610,7 +610,7 @@ function Get-AllFinding {
             # Found true, and testing Denied alone threw that recovered value away and skipped a
             # repair the script had the evidence to make. Only a read that was refused AND never
             # recovered is genuinely unreadable.
-            if ($value.Denied -and -not $value.Found) {
+            if (Test-ValueUnreadable -State $value) {
                 [void]$findings.Add((New-Finding -Cause 'ListenerValueUnreadable' -Item $value.Spec.Name -Hive 'SYSTEM' -Repairable $false `
                             -Message "$($value.Spec.Name) could not be read even after taking the key. It was left alone rather than overwritten with a documented default."))
                 continue
@@ -886,6 +886,8 @@ Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-
 # log, so a status emitted before a long cleanup flush can be pushed out of the retained window.
 # A bare `return` inside the try would exit the script and skip that trailing return, hence the
 # labelled do/while: `break main` leaves the body, runs the finally, and falls through to it.
+# A bare `break` or `continue` written at this level binds to :main and would abandon the backup,
+# repair and verification passes, so any loop added inside this block must label its own exits.
 $status = $STATUS_ERROR
 
 try {
@@ -928,18 +930,23 @@ try {
     $disabledServices = @($context.Services | Where-Object { $_.Disabled })
     Log-Info "Services: $(@($context.Services | Where-Object { $_.Exists }).Count) of $(@($context.Services).Count) required service key(s) present, $($disabledServices.Count) disabled." | Tee-Object -FilePath $logFile -Append
     foreach ($service in @($context.Services)) {
-        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Unreadable) { '(unreadable)' } elseif ($service.Malformed) { "(Start is not a number: $(Format-ValueForLog -Value $service.Value))" } elseif (-not $service.Found) { '(Start not set)' } else { "Start=$($service.Start)" }
+        # The raw value, not Format-ValueForLog: that helper takes a read-state object and asks it
+        # whether the value was found, and the only thing worth printing here is the value itself.
+        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Unreadable) { '(unreadable)' } elseif ($service.Malformed) { "(Start is not a number: $($service.Value))" } elseif (-not $service.Found) { '(Start not set)' } else { "Start=$($service.Start)" }
         Log-Info "  $($service.Name): $shown, $($service.Spec.Source)." | Tee-Object -FilePath $logFile -Append
     }
 
     # Presence is normal here and is stated as such, so nobody reads this line as a fault.
     if ($context.Schannel.CipherPresent) {
-        # Distinguishes "the key is there but sets no list" from "the key lists N suites". Reporting
-        # 0 suite(s) for the first case read as an empty policy being ignored, which contradicts the
-        # rule above that an empty list IS a fault. Only a Functions value that exists and is empty
-        # is that fault.
-        if ($context.Schannel.Functions -and $context.Schannel.Functions.Found) {
+        # Distinguishes "the key is there but sets no list" from "the key lists N suites". Testing
+        # Found alone is not enough: a Functions value that exists and is empty satisfies it, and
+        # that case IS the CipherPolicyEmpty fault, so the healthy sentence was printed a few lines
+        # above the finding that removes the value. The suite count is what separates them.
+        if ($context.Schannel.Functions -and $context.Schannel.Functions.Found -and $context.Schannel.FunctionCount -gt 0) {
             Log-Info "A machine-wide SSL cipher suite policy is configured with $($context.Schannel.FunctionCount) suite(s). That is normal on an Azure image and was not treated as a fault." | Tee-Object -FilePath $logFile -Append
+        }
+        elseif ($context.Schannel.FunctionsEmpty) {
+            Log-Info 'A machine-wide SSL cipher suite policy is present but lists no cipher suites, which leaves nothing for the TLS handshake to agree on. That is a fault and is reported below.' | Tee-Object -FilePath $logFile -Append
         }
         elseif ($context.Schannel.FunctionsUnreadable) {
             Log-Info 'The machine-wide SSL cipher suite policy key exists but its suite list could not be read, so whether it is empty is unknown. It was reported rather than assumed normal.' | Tee-Object -FilePath $logFile -Append

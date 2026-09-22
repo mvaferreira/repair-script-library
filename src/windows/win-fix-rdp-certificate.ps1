@@ -246,6 +246,12 @@ $script:RdpTcpSubPath = 'Control\Terminal Server\WinStations\RDP-Tcp'
 # Anything else in MachineKeys belongs to another component and is not touched.
 $script:RdpContainerPrefix = 'f686aace'
 
+# The container NAME the Terminal Server CSP records against the listener certificate, measured as
+# PROV_RSA_FULL / TSSecKeySet1. It pairs with the file prefix above: the folder stores file names,
+# the certificate stores this, and the mapping between them is a hash this script does not
+# reproduce. Only this one pair is measured on both sides, so only this one is tested.
+$script:RdpContainerName = 'TSSecKeySet1'
+
 # Offline objects whose borrowed descriptor could not be handed back, keyed by path. Populated by
 # Register-UnrestoredPath and turned into non-repairable findings, so a run that leaves a customer
 # object taken cannot also report that it found nothing wrong.
@@ -549,12 +555,12 @@ function Get-KeyStoreState {
     $required = Get-RequiredContainerAce -BuildNumber $BuildNumber
     $containers = @()
     $folderListed = $true
-    # Every file in the folder, not just the listener's own. The filtered list below answers "is the
-    # listener's key container healthy"; it cannot answer "does this certificate have a key at all",
-    # because a certificate an administrator installed keeps its container under its own name. Using
-    # the filtered list for the second question deletes such a certificate on the evidence that it is
-    # not the listener's.
-    $allContainerNames = @()
+    # How many files the folder holds in total, listener or not. Deliberately a COUNT and not a list
+    # of names: these are file names of the form <hash>_<machine GUID>, and a certificate records a
+    # container NAME instead, so the two can never be compared. Keeping the names here invited
+    # exactly that comparison, which is false for every certificate and turned "orphaned" into
+    # "judgeable". The count is only ever reported, never used to decide anything.
+    $allContainerCount = 0
 
     if ($folderExists) {
         $filter = { $_.Name -like "$($script:RdpContainerPrefix)*" }
@@ -584,7 +590,7 @@ function Get-KeyStoreState {
         }
 
         if ($folderListed) {
-            $allContainerNames = @($allFiles | ForEach-Object { $_.Name })
+            $allContainerCount = @($allFiles).Count
             $files = @($allFiles | Where-Object $filter)
         }
 
@@ -638,7 +644,7 @@ function Get-KeyStoreState {
         FolderListed      = $folderListed
         Required          = @($required)
         Containers        = @($containers)
-        AllContainerNames = @($allContainerNames)
+        AllContainerCount = $allContainerCount
     }
 }
 
@@ -754,11 +760,34 @@ function Get-StoreKeyProvInfo {
                 $containerAt = [int][System.BitConverter]::ToUInt32($data, 0)
                 $provType = [System.BitConverter]::ToUInt32($data, 8)
 
+                # The layout is measured, not documented, and it gates a deletion - so every field
+                # read out of it is range-checked before it is believed. A record that does not look
+                # like a CRYPT_KEY_PROV_INFO returns $null, which the caller treats as unknown and
+                # therefore as a reason not to judge the certificate at all. Guessing in either
+                # direction is a fault: too low and a CNG certificate is called legacy, too high and
+                # a legacy one is never examined.
+                #
+                # dwProvType is a small enumeration (PROV_RSA_FULL is 1, the defined values stop in
+                # the twenties); anything larger means this is not the layout assumed here.
+                if ($provType -gt 64) { return $null }
+
+                # The container name is a UTF-16 string inside the same record. A zero offset is the
+                # legitimate "no container name recorded" case; any other value has to land inside
+                # the record, clear the three DWORDs read above, and be even-aligned. A non-zero
+                # offset that does not is proof the layout is not the one assumed here, so the whole
+                # record is discarded rather than half-believed - dwProvType was read on the same
+                # assumption and cannot be trusted either.
                 $container = $null
-                if ($containerAt -gt 0 -and $containerAt -lt $data.Length) {
+                if ($containerAt -ne 0) {
+                    if ($containerAt -lt 12 -or $containerAt -ge $data.Length -or ($containerAt % 2) -ne 0) { return $null }
+
                     $text = [System.Text.Encoding]::Unicode.GetString($data, $containerAt, $data.Length - $containerAt)
                     $end = $text.IndexOf([char]0)
                     $container = $(if ($end -ge 0) { $text.Substring(0, $end) } else { $text })
+
+                    # A decoded name that is empty or holds control characters is a mis-parse, not a
+                    # container this script should test a file name against.
+                    if ([string]::IsNullOrWhiteSpace($container) -or $container -match '[\x00-\x1F]') { return $null }
                 }
 
                 return [PSCustomObject]@{ ProvType = $provType; Container = $container }
@@ -949,7 +978,21 @@ function Get-CertificateStoreState {
             $certificatesKnown = $false
             Add-OfflineRepairLog -Level Info -Message "The Remote Desktop certificate store could not be listed ($($_.Exception.Message)), so what is in it is unknown."
         }
-        finally { if ($borrowed) { [void](Restore-OfflineRegistrySecurity -Captured $captured.ToArray()) } }
+        finally {
+            if ($borrowed) {
+                # The count is compared rather than discarded. A registry key left owned by the
+                # rescue VM with an added FullControl entry is the same residue the file-path
+                # borrows register, and it must not be able to pass while the run reports that
+                # nothing was wrong. The helper skips captured keys that no longer exist, so this
+                # comparison is only sound because nothing in this read path deletes a key; a
+                # future change that does must compare per key instead of by count.
+                $capturedKeys = @($captured.ToArray())
+                $replayed = Restore-OfflineRegistrySecurity -Captured $capturedKeys
+                if ($replayed -lt $capturedKeys.Count) {
+                    Register-UnrestoredPath -Path $script:CertStoreKey
+                }
+            }
+        }
     }
 
     return [PSCustomObject]@{
@@ -1198,17 +1241,35 @@ function Get-AllFinding {
             # A provider property that could not be read is unknown, and unknown does not authorise
             # a deletion either.
             #
-            # The verdict is taken against the container this certificate actually names, looked for
-            # across the whole folder. Judging it by "the folder holds no LISTENER container" answers
-            # a different question: a certificate an administrator installed keeps its key under its
-            # own container name, so that test reads "this is not the listener's key" as "this
-            # certificate has no key" and deletes a working enterprise binding. A certificate that
-            # records no container name at all cannot be judged this way and is left alone.
+            # The verdict is taken only for the listener's own container, and only against the file
+            # name prefix measured for it. The two names are in different namespaces and cannot be
+            # compared directly: KeyContainer is the CryptoAPI container NAME the certificate
+            # records, while the MachineKeys folder holds FILE names of the form <hash>_<machine
+            # GUID>. Testing one against the other is false for every certificate that names a
+            # container at all, which makes "orphaned" collapse into "judgeable" and deletes the
+            # store entry of a certificate whose key is present and healthy.
+            #
+            # The hash is deliberately not reproduced here. MD5 of the container name in ASCII,
+            # UTF-8 and UTF-16, with and without a terminator, matches none of the observed file
+            # names, so any name-to-file mapping written here would be a guess, and a guess is not
+            # something to authorise a deletion with. What IS measured is the pair: the listener
+            # records container TSSecKeySet1, and its container file begins f686aace on 9600, 14393,
+            # 17763, 20348 and 26100. A constant file prefix across five builds and a constant
+            # container name are the same fact seen from both sides, so that one pair is safe.
+            #
+            # A certificate naming any other container is left unjudged rather than guessed at. An
+            # administrator's own certificate keeps its key under its own container name, and this
+            # script cannot locate that file by name; reporting it is correct, deleting it is not.
             $keyWouldBeHere = ($certificate.KeyInMachineKeys -eq $true)
             $containerNamed = -not [string]::IsNullOrWhiteSpace($certificate.KeyContainer)
-            $containerPresent = $containerNamed -and (@($KeyStore.AllContainerNames) -contains $certificate.KeyContainer)
-            $judgeable = $keyWouldBeHere -and $containerNamed -and $KeyStore.FolderExists -and $KeyStore.FolderListed
+            $isListenerContainer = $containerNamed -and ($certificate.KeyContainer -eq $script:RdpContainerName)
+            $containerPresent = $isListenerContainer -and (@($KeyStore.Containers).Count -gt 0)
+            $judgeable = $keyWouldBeHere -and $isListenerContainer -and $KeyStore.FolderExists -and $KeyStore.FolderListed
             $orphaned = $judgeable -and -not $containerPresent
+
+            # Printed for every parsed entry so a lab log shows which branch was taken and on what
+            # evidence, rather than the decision resting on a comment.
+            Add-OfflineRepairLog -Level Info -Message "Store entry $($certificate.Thumbprint): provider type $(if ($null -eq $certificate.KeyInMachineKeys) { 'unreadable' } elseif ($keyWouldBeHere) { 'legacy CSP' } else { 'CNG' }), container $(if ($containerNamed) { $certificate.KeyContainer } else { '(none recorded)' }), machine key store holds $($KeyStore.AllContainerCount) file(s) of which $(@($KeyStore.Containers).Count) are listener containers, judged: $judgeable."
 
             # Stated rather than left silent: without this line, a certificate that was spared only
             # because its key is kept somewhere this script does not read, or because it names no
@@ -1220,8 +1281,11 @@ function Get-AllFinding {
                 elseif (-not $keyWouldBeHere) {
                     "its private key is held by CNG, in Crypto\Keys rather than the RSA\MachineKeys folder this script reads$(if ($certificate.KeyContainer) { " (container $($certificate.KeyContainer))" })"
                 }
-                else {
+                elseif (-not $containerNamed) {
                     'it records no key container name, so there is nothing to look for in the machine key store'
+                }
+                else {
+                    "it keeps its key in container $($certificate.KeyContainer), and the machine key store names its files by a hash of the container name that this script does not reproduce, so the file behind that name cannot be located"
                 }
                 Add-OfflineRepairLog -Level Info -Message "Store entry $($certificate.Thumbprint) was not judged against the machine key store because $where. An empty MachineKeys folder is not evidence about this certificate, so it was left alone."
                 # Recorded, not just logged. The affirmative healthy line states that every
@@ -1373,7 +1437,13 @@ function Add-OfflinePathAce {
             $ownerOnly = if ($isDirectory) { [System.Security.AccessControl.DirectorySecurity]::new() } else { [System.Security.AccessControl.FileSecurity]::new() }
             $ownerOnly.SetOwner([System.Security.Principal.SecurityIdentifier]::new($ownerWas))
             try { Save-OfflinePathSecurity -Path $Path -Security $ownerOnly -IsDirectory:$isDirectory }
-            catch { Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $ownerWas. Restore it with: icacls `"$Path`" /setowner `"*$ownerWas`"" }
+            catch {
+                # Registered, not merely logged. Leaving a customer's key container owned by the
+                # rescue VM is residue of exactly the kind the borrow bookkeeping exists to surface,
+                # and without this the run could still finish "Repaired N of N" and report success.
+                Register-UnrestoredPath -Path $Path -Sddl $captured
+                Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $ownerWas. Restore it with: icacls `"$Path`" /setowner `"*$ownerWas`""
+            }
         }
 
         Add-OfflineRepairLog -Message "$Description Ownership was taken to do it. Original descriptor was $original"
@@ -1752,17 +1822,29 @@ try {
     # Ahead of the detect gate on purpose, so one affirmative line serves both modes. A healthy disk
     # and one this script cannot help must not produce the same silence.
     if ($findings.Count -eq 0) {
+        # The borrow clause is built from what actually happened rather than asserted. A run that
+        # has just raised OfflineSecurityNotRestored must not also state that everything borrowed
+        # was put back, and the detect-only summary below prints the same sentence.
+        $borrowNote = if (@($script:UnrestoredPaths.Keys).Count -gt 0) {
+            "$(@($script:UnrestoredPaths.Keys).Count) object(s) whose descriptor was borrowed could not be handed back and are listed above"
+        }
+        else {
+            'where a descriptor had to be borrowed to read a locked object it was put back'
+        }
+
         # The claim about private keys is narrowed when a certificate was deliberately not judged -
-        # a CNG key, or a provider that could not be read. Saying "any certificate in it has its
-        # private key" in that case is an affirmative statement about a certificate this run
-        # explicitly declined to examine, which is the one thing the detection rules forbid.
+        # a CNG key, a provider that could not be read, or a container this script cannot locate by
+        # name. Saying "any certificate in it has its private key" in that case is an affirmative
+        # statement about a certificate this run explicitly declined to examine, which is the one
+        # thing the detection rules forbid. The count is reported without attributing a cause,
+        # because the three reasons are different and the per-certificate reason is already logged.
         $keyClaim = if (@($script:UnjudgedCertificates).Count -gt 0) {
-            "every certificate this script could judge is in date and has its private key - $(@($script:UnjudgedCertificates).Count) certificate(s) keep their key outside the store this script reads and were left alone, listed above"
+            "every certificate this script could judge is in date and has its private key - $(@($script:UnjudgedCertificates).Count) certificate(s) were not judged against the machine key store, for the reasons given above, and were left alone"
         }
         else {
             'any certificate in it is in date and has its private key'
         }
-        Log-Output "No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, $keyClaim, and the services behind them are not disabled. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
+        Log-Output "No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, $keyClaim, and the services behind them are not disabled. No configuration was changed; $borrowNote." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         $status = $STATUS_SUCCESS
         break main
@@ -1774,7 +1856,7 @@ try {
         }
         # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
         # so a summary printed first is the first thing a long run loses.
-        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No configuration was changed; $(if (@($script:UnrestoredPaths.Keys).Count -gt 0) { "$(@($script:UnrestoredPaths.Keys).Count) object(s) whose descriptor was borrowed could not be handed back and are listed above" } else { 'where a descriptor had to be borrowed to read a locked object it was put back' })." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         $status = $STATUS_SUCCESS
         break main
