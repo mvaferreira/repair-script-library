@@ -1,9 +1,9 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   Restores the private key permissions behind the Remote Desktop listener certificate on an offline
-#   disk, so a VM whose RDP service is running and listening but drops every connection can be reached
-#   again.
+#   Restores the Remote Desktop listener certificate on an offline disk - the permissions on its
+#   private key, and the store it is created in - so a VM whose RDP service is running and listening
+#   but drops every connection can be reached again.
 #
 # .DESCRIPTION
 #   Runs against the broken OS disk attached to a rescue VM by "az vm repair create".
@@ -12,6 +12,10 @@
 #   listener is on 3389, a certificate is present in the Remote Desktop store and it has not expired -
 #   and every client is disconnected the moment the TLS handshake starts. The certificate is fine. The
 #   private key behind it cannot be read by the account that has to read it.
+#
+#   Three faults are covered, and they are three different points on the same path: the key the
+#   handshake reads, the store the certificate lives in, and the certificate itself. Each is only
+#   acted on with evidence that it is the one stopping the connection.
 #
 #   TermService runs as NETWORK SERVICE. The listener's private key lives in a container file under
 #   ProgramData\Microsoft\Crypto\RSA\MachineKeys, and NETWORK SERVICE needs read access to it on every
@@ -65,6 +69,40 @@
 #   how a repaired VM breaks again at the next renewal. When a container has already proven the
 #   certificate path is broken, the folder is put back with it.
 #
+#   The certificate store is the second point on the path. The Remote Desktop store is a REGISTRY
+#   store - HKLM\SOFTWARE\Microsoft\SystemCertificates\Remote Desktop, with one subkey per
+#   certificate under Certificates - and "Cert:\LocalMachine\Remote Desktop" is only a provider view
+#   over it. That is why it can be read and repaired here at all: an online mitigation reaches it
+#   through the provider, and this one reaches the same keys through the mounted SOFTWARE hive.
+#
+#   A Deny entry for SYSTEM on that key stops the self-signed certificate being created in the first
+#   place. It is the one case in this script where an access control entry is REMOVED rather than
+#   added, and that is deliberate: SYSTEM is the account that creates the listener certificate, so a
+#   deny against it on the store it is created in has no legitimate purpose. Only Deny entries for
+#   SYSTEM are removed, only on that key, and the descriptor that was there is written to the log.
+#   Everything else in it, including entries someone added on purpose, is left exactly as found.
+#
+#   The certificate itself is the third. Two states leave the listener with nothing usable and are
+#   repaired by removing the store entry, which is what makes Windows mint a fresh one:
+#
+#     - EXPIRED. Windows renews a certificate that has expired, so on a healthy machine this state
+#       does not last. One that is still expired on a disk being repaired is one where renewal has
+#       been failing, and the stale entry is what the next attempt trips over.
+#     - ORPHANED - a certificate in the store with no key container behind it in MachineKeys. The
+#       private key is half the certificate; without it the entry cannot be used and cannot be
+#       renewed either. This is the state behind TerminalServices-RemoteConnectionManager event 1057
+#       and 1058 "failed to create a new self-signed certificate ... the relevant status code was
+#       Object already exists": Windows will not create one while the old entry is in its way.
+#
+#   Removing the entry is the same measurement the rest of this script rests on - with no certificate
+#   present Windows generates one, and a key container with correct permissions with it, within
+#   seconds of the Remote Desktop services starting. A certificate that is present, in date and
+#   backed by a key container is never touched: there is nothing wrong with it.
+#
+#   An orphaned entry is reported rather than removed when SSLCertificateSHA1Hash pins the listener
+#   to a different certificate, because then the store entry is not what the listener is using and
+#   removing it would be a change to something that was not the fault.
+#
 #   Three things this script will not do, because the monolithic script it replaces did them and each
 #   one is worse than the fault:
 #
@@ -84,15 +122,20 @@
 #   decision, it is temporary by nature, and it is the thing win-fix-rdp-connectivity removes - so it
 #   is named here rather than done.
 #
-#   Access control entries are only ever ADDED. The existing descriptor is never replaced, so
-#   permissions someone added deliberately survive the repair, and the original SDDL of anything
-#   changed is written to the log so it can be put back by hand.
+#   On the file system, access control entries are only ever ADDED. The existing descriptor is never
+#   replaced, so permissions someone added deliberately survive the repair, and the original SDDL of
+#   anything changed is written to the log so it can be put back by hand. The single removal this
+#   script performs is the SYSTEM deny described above.
 #
 # .RESOLVES
 #   A VM that boots, whose Remote Desktop service is running and listening on 3389, and which
 #   disconnects every client immediately; an RDP client reporting an internal error before the logon
 #   screen; RDP lost after a security hardening baseline was applied to the machine's private key
-#   store; and RDP that failed months after such a baseline, when the listener certificate was renewed.
+#   store; RDP that failed months after such a baseline, when the listener certificate was renewed;
+#   a listener certificate that has expired and is not being replaced; and Schannel event 36870 with
+#   0x8009030D or TerminalServices-RemoteConnectionManager events 1057 and 1058 reporting that a new
+#   self-signed certificate could not be created because access was denied or the object already
+#   exists.
 #
 # .PARAMETER detectOnly
 #   "true" to report what is wrong with the listener key permissions and change nothing at all.
@@ -112,12 +155,15 @@
 #   TermService, SessionEnv and UmRdpService are reported when disabled but are never written here,
 #   because win-fix-rdp-connectivity owns them.
 #
-#   The Remote Desktop certificate store itself is not modified, and neither is the machine key store
-#   when it is absent. Neither is a fault: Windows recreates the store, the folder and the key, and
-#   was measured doing all three.
+#   A machine key store that is absent is not a fault, and neither is a Remote Desktop certificate
+#   store that is absent, nor a store with no certificate in it: Windows recreates the store, the
+#   folder, the certificate and the key, and was measured doing all four.
 #
 # .VERSION
 #   v1.0: Initial version.
+#   v1.1: Repair the certificate store as well as the key behind it - remove a SYSTEM deny on the
+#         Remote Desktop store key, and remove an expired or orphaned listener certificate so
+#         Windows generates a fresh one on the next start.
 #
 #########################################################################################################
 
@@ -145,6 +191,16 @@ $isDetectOnly = ($detectOnly -eq 'true')
 $script:MachineKeysSubPath = 'ProgramData\Microsoft\Crypto\RSA\MachineKeys'
 $script:DocUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/prepare-for-upload-vhd-image'
 
+# The Remote Desktop certificate store, in the mounted SOFTWARE hive. A LocalMachine store is a
+# registry store: one subkey per certificate under Certificates, named for its SHA1 thumbprint, each
+# holding the certificate and its properties in a single Blob value.
+$script:CertStoreKey = 'HKLM:\BROKENSOFTWARE\Microsoft\SystemCertificates\Remote Desktop'
+$script:CertStoreCertificatesKey = "$script:CertStoreKey\Certificates"
+
+# The listener pin, in the mounted SYSTEM hive. Read only to decide whether the store entry is the
+# certificate the listener actually uses; this script never writes it - win-fix-rdp-connectivity owns it.
+$script:RdpTcpSubPath = 'Control\Terminal Server\WinStations\RDP-Tcp'
+
 # Every Remote Desktop listener key container measured on 9600, 14393, 17763, 20348 and 26100 began
 # with this prefix. It is the machine-independent hash of the container name the Terminal Server CSP
 # asks for, so it identifies the listener's own keys without needing the certificate store parsed.
@@ -164,6 +220,15 @@ $script:SidEveryone = 'S-1-1-0'
 $script:MaskFullControl = 0x1F01FF
 $script:MaskReadSync = 0x120089   # FILE_GENERIC_READ, shown as "Read, Synchronize"
 $script:MaskFolderEveryone = 0x12019F   # read plus the write that lets a new container be created
+
+# Registry rights, which are a different set from the file rights above. The certificate is written
+# as a value in a subkey SYSTEM has to create, so these two are what a deny has to block to stop it.
+$script:MaskKeyCreate = 0x0006   # KEY_SET_VALUE | KEY_CREATE_SUB_KEY
+$script:MaskKeyFullControl = 0xF003F
+
+# CERT_CERT_PROP_ID. A store blob is a run of (propId, encoding, cbData, data) records; this is the
+# one whose data is the DER encoded certificate itself.
+$script:CertPropIdCertificate = 32
 
 # The build at which the third entry on the container swaps from Administrators to SessionEnv.
 $script:SessionEnvBuild = 17763
@@ -190,7 +255,7 @@ function New-Finding {
         [Parameter(Mandatory = $true)][string]$Cause,
         [Parameter(Mandatory = $true)][string]$Item,
         [Parameter(Mandatory = $true)][string]$Message,
-        [Parameter(Mandatory = $true)][ValidateSet('SYSTEM', 'FILE')][string]$Hive,
+        [Parameter(Mandatory = $true)][ValidateSet('SYSTEM', 'SOFTWARE', 'FILE')][string]$Hive,
         [Parameter(Mandatory = $false)][bool]$Repairable = $true,
         [Parameter(Mandatory = $false)]$Data = $null
     )
@@ -395,11 +460,275 @@ function Get-KeyStoreState {
     }
 }
 
-function Get-CertificateServiceState {
+function ConvertTo-CertificateBlobByte {
     <#
     .SYNOPSIS
-        Reads the Start value of every service the listener certificate depends on.
+        A registry Blob value as byte[], whatever shape the read handed back.
+
+    .DESCRIPTION
+        A REG_BINARY read through a helper that returns it out of a scriptblock arrives as Object[]
+        of boxed bytes, because PowerShell unrolls an array as it leaves. Returns $null for
+        anything that is not a run of bytes, so a value of the wrong type is reported rather than
+        half-converted into a certificate that was never there.
     #>
+    param([Parameter(Mandatory = $false)]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [byte[]]) { return $Value }
+
+    $items = @($Value)
+    if ($items.Count -eq 0) { return $null }
+
+    $bytes = [byte[]]::new($items.Count)
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($items[$i] -isnot [byte]) { return $null }
+        $bytes[$i] = [byte]$items[$i]
+    }
+    return $bytes
+}
+
+function Get-StoreCertificate {
+    <#
+    .SYNOPSIS
+        The certificate inside one Remote Desktop store entry, or $null when it cannot be read.
+
+    .DESCRIPTION
+        A store entry's Blob value is a run of property records - propId, encoding, length, data -
+        of which one, CERT_CERT_PROP_ID, carries the DER encoded certificate. The others are
+        properties such as the key provider info and the friendly name.
+
+        The blob is walked rather than scanned for something that looks like a certificate, because
+        a length taken from the wrong place is how a parser reports a valid certificate as corrupt.
+        Anything that does not parse returns $null and is reported, never guessed at: deleting a
+        certificate this script could not read would be deleting it on no evidence.
+    #>
+    param([Parameter(Mandatory = $true)][byte[]]$Blob)
+
+    $offset = 0
+    while ($offset + 12 -le $Blob.Length) {
+        $propId = [System.BitConverter]::ToUInt32($Blob, $offset)
+        $length = [System.BitConverter]::ToUInt32($Blob, $offset + 8)
+        $dataAt = $offset + 12
+
+        if ($length -gt [int]::MaxValue -or ($dataAt + $length) -gt $Blob.Length) { return $null }
+
+        if ($propId -eq $script:CertPropIdCertificate -and $length -gt 0) {
+            # Cast to int before the copy: a UInt32 length makes the Array.Copy overload ambiguous,
+            # and the bounds test above has already proved the value fits.
+            $size = [int]$length
+            try {
+                $der = [byte[]]::new($size)
+                [System.Array]::Copy($Blob, $dataAt, $der, 0, $size)
+                return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($der)
+            }
+            catch { return $null }
+        }
+
+        $offset = $dataAt + $length
+    }
+
+    return $null
+}
+
+function Get-RegistryKeyProbe {
+    <#
+    .SYNOPSIS
+        Whether an offline hive key exists, and its descriptor, told apart from "access refused".
+
+    .DESCRIPTION
+        Test-Path answers $false for a key that exists but refuses this account, which on this path
+        is the one answer that must never be given: a store key denied to SYSTEM would be reported
+        as "no store, and that is not a fault" - the exact opposite of the truth.
+
+        OpenSubKey separates the two. It returns null only for a key that is not there and throws
+        for one that is there and refused, so an absent store and a locked one are never confused.
+
+        The owner of a key always keeps READ_CONTROL and WRITE_DAC whatever the DACL says, so a key
+        denied to SYSTEM is usually still readable here. When it is not, Exists is still true and
+        Sddl is $null, and the caller reports that rather than guessing.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+    if (-not $subKey) { return [PSCustomObject]@{ Exists = $false; Sddl = $null; Refused = $false } }
+
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            $subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
+            [System.Security.AccessControl.RegistryRights]::ReadPermissions)
+        if (-not $key) { return [PSCustomObject]@{ Exists = $false; Sddl = $null; Refused = $false } }
+
+        $binary = $key.GetAccessControl($script:OfflineSecuritySections).GetSecurityDescriptorBinaryForm()
+        $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($binary, 0)
+        return [PSCustomObject]@{ Exists = $true; Sddl = $raw.GetSddlForm('All'); Refused = $false }
+    }
+    catch {
+        # Thrown, not null: the key is there and this account may not open it for READ_CONTROL.
+        return [PSCustomObject]@{ Exists = $true; Sddl = $null; Refused = $true }
+    }
+    finally { if ($key) { $key.Close() } }
+}
+
+function Get-SddlDeny {
+    <#
+    .SYNOPSIS
+        Whether a SID is denied an access, and whether that deny is written on the key itself.
+
+    .DESCRIPTION
+        The distinction decides what can be repaired. An explicit entry on the key is this script's
+        to remove. An INHERITED one is a copy of an entry on a key above the certificate store -
+        HKLM\SOFTWARE\Microsoft\SystemCertificates, which every machine certificate store on the VM
+        lives under, or higher still. Removing the copy would leave the original in place to be
+        re-propagated, and reaching up to the original would change the permissions of every other
+        store on the machine to fix one. So an inherited deny is named and left to an operator.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Sddl,
+        [Parameter(Mandatory = $true)][string]$Sid,
+        [Parameter(Mandatory = $true)][int]$Mask
+    )
+
+    $any = $false
+    $explicit = $false
+    $inheritedFlag = [int][System.Security.AccessControl.AceFlags]::Inherited
+
+    $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+    if ($null -ne $raw.DiscretionaryAcl) {
+        foreach ($ace in $raw.DiscretionaryAcl) {
+            if ($ace.SecurityIdentifier.Value -ne $Sid) { continue }
+            if ($ace.AceType.ToString() -notlike '*Denied*') { continue }
+            if (-not ($ace.AccessMask -band $Mask)) { continue }
+            $any = $true
+            if (-not ([int]$ace.AceFlags -band $inheritedFlag)) { $explicit = $true }
+        }
+    }
+
+    return [PSCustomObject]@{ Denied = $any; Explicit = $explicit }
+}
+
+function Get-CertificateStoreState {
+    <#
+    .SYNOPSIS
+        Reads the Remote Desktop certificate store: who may write to it, and what is in it.
+
+    .DESCRIPTION
+        Must be called inside Invoke-WithHive -Hive 'SOFTWARE'.
+
+        BOTH keys are judged, because they are not the same key and a deny on either one is enough.
+        "Remote Desktop" is the store; "Remote Desktop\Certificates" is where the certificate is
+        actually written, as a subkey named for its thumbprint. Creating a certificate means
+        creating a subkey under Certificates and setting a value in it, so that is the key the write
+        lands on - while a deny on the store above it stops the path being opened at all. A check
+        that covered only one of the two would pass a machine that is still broken.
+
+        A store that is absent, or present and empty, is not a fault and is reported as such by the
+        caller: Windows creates both, and was measured doing it.
+    #>
+    param()
+
+    $keys = @()
+    foreach ($spec in @(
+            [PSCustomObject]@{ Path = $script:CertStoreKey; Label = 'Remote Desktop' },
+            [PSCustomObject]@{ Path = $script:CertStoreCertificatesKey; Label = 'Remote Desktop\Certificates' })) {
+
+        $probe = Get-RegistryKeyProbe -Path $spec.Path
+        $deny = if ($probe.Sddl) { Get-SddlDeny -Sddl $probe.Sddl -Sid $script:SidSystem -Mask $script:MaskKeyCreate } else { $null }
+
+        $keys += [PSCustomObject]@{
+            Path     = $spec.Path
+            Label    = $spec.Label
+            Exists   = $probe.Exists
+            Sddl     = $probe.Sddl
+            Refused  = $probe.Refused
+            Denied   = [bool]($deny -and $deny.Denied)
+            Explicit = [bool]($deny -and $deny.Explicit)
+        }
+    }
+
+    $certificatesKey = @($keys | Where-Object { $_.Path -eq $script:CertStoreCertificatesKey })[0]
+    $certificates = @()
+    $certificatesKnown = $true
+
+    if ($certificatesKey.Exists) {
+        $entries = @()
+        $captured = [System.Collections.Generic.List[object]]::new()
+        $borrowed = $false
+        try {
+            try { $entries = @(Get-ChildItem -LiteralPath $script:CertStoreCertificatesKey -ErrorAction Stop) }
+            catch {
+                # Borrowed and handed straight back, the same way a hardened MachineKeys folder is.
+                # A store locked hard enough to refuse a listing must never be read as "no
+                # certificate is present" - that reports a broken machine as healthy, and a locked
+                # store is precisely the case this is here for.
+                [void](Grant-OfflineRegistryKeyAccess -Path $script:CertStoreCertificatesKey -CapturedInto $captured)
+                $borrowed = $true
+                $entries = @(Get-ChildItem -LiteralPath $script:CertStoreCertificatesKey -ErrorAction Stop)
+            }
+
+            foreach ($entry in $entries) {
+                $path = Join-Path $script:CertStoreCertificatesKey $entry.PSChildName
+                $found = $false
+                $blob = Get-OfflineProtectedRegistryValue -Path $path -Name 'Blob' -Found ([ref]$found)
+
+                # Get-OfflineProtectedRegistryValue returns its value out of a scriptblock, and
+                # PowerShell unrolls an array on the way out, so a REG_BINARY arrives here as
+                # Object[] of boxed bytes rather than byte[]. Measured, not assumed: a healthy
+                # 2019 listener certificate was reported unreadable by a plain -is [byte[]] test.
+                # Reporting a valid certificate as unparsable is the worst answer this script can
+                # give, so the bytes are rebuilt rather than type-tested.
+                $bytes = ConvertTo-CertificateBlobByte -Value $blob
+                $certificate = $null
+                if ($found -and $bytes -and $bytes.Length -gt 0) { $certificate = Get-StoreCertificate -Blob $bytes }
+
+                $certificates += [PSCustomObject]@{
+                    Thumbprint = $entry.PSChildName
+                    Path       = $path
+                    Parsed     = ($null -ne $certificate)
+                    Subject    = $(if ($certificate) { $certificate.Subject } else { $null })
+                    NotAfter   = $(if ($certificate) { $certificate.NotAfter } else { $null })
+                    Expired    = $(if ($certificate) { $certificate.NotAfter -lt (Get-Date) } else { $false })
+                }
+
+                if ($certificate) { $certificate.Dispose() }
+            }
+        }
+        catch {
+            $certificatesKnown = $false
+            Add-OfflineRepairLog -Level Info -Message "The Remote Desktop certificate store could not be listed ($($_.Exception.Message)), so what is in it is unknown."
+        }
+        finally { if ($borrowed) { [void](Restore-OfflineRegistrySecurity -Captured $captured.ToArray()) } }
+    }
+
+    return [PSCustomObject]@{
+        Keys              = @($keys)
+        StoreExists       = @($keys | Where-Object { $_.Path -eq $script:CertStoreKey })[0].Exists
+        Certificates      = @($certificates)
+        CertificatesKnown = $certificatesKnown
+    }
+}
+
+function Get-ListenerPinnedThumbprint {
+    <#
+    .SYNOPSIS
+        The certificate the listener is pinned to, or $null when it is not pinned to one.
+
+    .DESCRIPTION
+        Must be called inside Invoke-WithHive -Hive 'SYSTEM'. Read only: an orphaned store entry is
+        reported rather than removed when the listener is pinned elsewhere, because then the entry
+        is not what the handshake uses and removing it would be a change to something that was not
+        the fault. A zero length pin is the same as no pin - it names no certificate.
+    #>
+    param([Parameter(Mandatory = $true)][string]$SystemRoot)
+
+    $found = $false
+    $value = Get-OfflineProtectedRegistryValue -Path (Join-Path $SystemRoot $script:RdpTcpSubPath) -Name 'SSLCertificateSHA1Hash' -Found ([ref]$found)
+    if (-not $found -or $value -isnot [byte[]] -or $value.Length -eq 0) { return $null }
+
+    return (($value | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+}
+
+function Get-CertificateServiceState {
     param([Parameter(Mandatory = $true)][string]$SystemRoot)
 
     $services = foreach ($spec in $script:ServiceSpec) {
@@ -435,7 +764,9 @@ function Get-AllFinding {
     #>
     param(
         [Parameter(Mandatory = $true)]$KeyStore,
-        [Parameter(Mandatory = $true)]$Services
+        [Parameter(Mandatory = $true)]$Services,
+        [Parameter(Mandatory = $false)]$CertStore,
+        [Parameter(Mandatory = $false)][string]$PinnedThumbprint
     )
 
     $findings = [System.Collections.Generic.List[object]]::new()
@@ -496,6 +827,77 @@ function Get-AllFinding {
         else {
             [void]$findings.Add((New-Finding -Cause 'CertificateServiceDisabled' -Item $service.Name -Hive 'SYSTEM' -Data $service `
                         -Message "$($service.Name) is disabled (Start=4) - $($service.Spec.Purpose). Without it the private key operations behind the handshake cannot run. It will be set to Start=$($service.Spec.Start), the value measured on every supported build."))
+        }
+    }
+
+    # --- The certificate store --------------------------------------------------------------------
+    # A store that is absent, or present with nothing in it, is not a fault for the same measured
+    # reason a missing MachineKeys folder is not: Windows creates it. What is a fault is a store
+    # SYSTEM cannot write into, and a certificate in it that cannot be used.
+    if ($CertStore) {
+        foreach ($key in @($CertStore.Keys)) {
+            if (-not $key.Exists) { continue }
+
+            if (-not $key.Sddl) {
+                [void]$findings.Add((New-Finding -Cause 'CertificateStoreUnreadable' -Item $key.Label -Hive 'SOFTWARE' -Repairable $false `
+                            -Message "$($key.Label) under HKLM\SOFTWARE\Microsoft\SystemCertificates exists but its security descriptor could not be read, so whether Windows can create a listener certificate there is unknown. Nothing was changed on it."))
+                continue
+            }
+
+            if (-not $key.Denied) { continue }
+
+            if (-not $key.Explicit) {
+                [void]$findings.Add((New-Finding -Cause 'CertificateStoreAccessDeniedInherited' -Item $key.Label -Hive 'SOFTWARE' -Repairable $false `
+                            -Message "NT AUTHORITY\SYSTEM is denied write access on $($key.Label), but the deny is INHERITED from a key above the Remote Desktop store rather than written on it. Removing the copy here would leave the original to be propagated again, and the key it comes from - HKLM\SOFTWARE\Microsoft\SystemCertificates or higher - is shared by every machine certificate store on the VM, so changing it to fix one store is an operator's decision. Find the deny on the parent key and remove it there. Current: $($key.Sddl)"))
+                continue
+            }
+
+            [void]$findings.Add((New-Finding -Cause 'CertificateStoreAccessDenied' -Item $key.Label -Hive 'SOFTWARE' -Data $key `
+                        -Message "NT AUTHORITY\SYSTEM is explicitly denied write access on $($key.Label). SYSTEM is the account that creates the listener certificate, and the certificate is written as a subkey of Remote Desktop\Certificates, so a deny on either key leaves the handshake with nothing to present - the client reports an internal error and Schannel logs 36870. The deny entries for SYSTEM will be removed from this key; every other entry in the descriptor is left as found. Current: $($key.Sddl)"))
+        }
+
+        if (-not $CertStore.CertificatesKnown) {
+            [void]$findings.Add((New-Finding -Cause 'CertificateStoreUnreadable' -Item 'Certificates' -Hive 'SOFTWARE' -Repairable $false `
+                        -Message "The certificates in the Remote Desktop store could not be listed even after taking ownership, so whether the listener has a usable certificate is unknown. Nothing in the store was changed."))
+        }
+
+        foreach ($certificate in @($CertStore.Certificates)) {
+            $isPinned = $PinnedThumbprint -and ($certificate.Thumbprint -eq $PinnedThumbprint)
+
+            if (-not $certificate.Parsed) {
+                [void]$findings.Add((New-Finding -Cause 'ListenerCertificateUnreadable' -Item $certificate.Thumbprint -Hive 'SOFTWARE' -Repairable $false `
+                            -Message "The store entry $($certificate.Thumbprint) does not contain a certificate this script could parse. It was left alone rather than deleted on the strength of a read that failed."))
+                continue
+            }
+
+            # Orphaned: a certificate with no key container behind it. The private key is half the
+            # certificate - without it the entry cannot be used and cannot be renewed, and Windows
+            # will not create a replacement while it is in the way. That refusal is event 1057/1058
+            # "Object already exists". Judged only when the key store was actually listed: a folder
+            # that refused a listing tells us nothing about what is in it, and reading that silence
+            # as "no container" would delete a perfectly good certificate.
+            $orphaned = $KeyStore.FolderExists -and $KeyStore.FolderListed -and (@($KeyStore.Containers).Count -eq 0)
+
+            if ($certificate.Expired -or $orphaned) {
+                $why = if ($certificate.Expired -and $orphaned) {
+                    "expired on $($certificate.NotAfter.ToString('yyyy-MM-dd')) and has no private key container behind it in the machine key store"
+                }
+                elseif ($certificate.Expired) {
+                    "expired on $($certificate.NotAfter.ToString('yyyy-MM-dd')) and has not been replaced, which means renewal has been failing rather than that the certificate simply aged out"
+                }
+                else {
+                    "has no private key container behind it in the machine key store, so it cannot be used for a handshake and cannot be renewed either"
+                }
+
+                if ($isPinned) {
+                    [void]$findings.Add((New-Finding -Cause 'ListenerCertificateUnusable' -Item $certificate.Thumbprint -Hive 'SOFTWARE' -Repairable $false `
+                                -Message "The listener certificate $($certificate.Thumbprint) $why. It was NOT removed, because SSLCertificateSHA1Hash pins the listener to this exact certificate - deleting it would leave the listener pointed at nothing. Run win-fix-rdp-connectivity to remove the pin first, then run this script again."))
+                    continue
+                }
+
+                [void]$findings.Add((New-Finding -Cause 'ListenerCertificateUnusable' -Item $certificate.Thumbprint -Hive 'SOFTWARE' -Data $certificate `
+                            -Message "The listener certificate $($certificate.Thumbprint) $why. The store entry will be removed so that Windows generates a fresh certificate, and the key container to go with it, when the Remote Desktop services next start."))
+            }
         }
     }
 
@@ -674,6 +1076,200 @@ function Repair-RegistryFinding {
     }
 }
 
+function Remove-OfflineRegistryKeyDeny {
+    <#
+    .SYNOPSIS
+        Removes the Deny entries for one SID from an offline hive key, leaving the rest as found.
+
+    .DESCRIPTION
+        This is the one place in this script where an access control entry is taken away rather than
+        added, so it is deliberately narrow: only entries of type Deny, only for the SID it is given,
+        only those written on the key itself, only on the key it is given. Inherited entries are left
+        alone - they belong to a key above this one and are removed by repairing that key, not by
+        stamping a copy of the parent's list here. Every other entry, including anything an
+        administrator added on purpose, is carried across untouched.
+
+        The new descriptor is built from the ORIGINAL capture, not from whatever is on the key after
+        ownership has been taken. That matters: Grant-OfflineRegistryKeyAccess adds a FullControl
+        entry for this account so the write can happen at all, and building from the original is what
+        keeps that borrowed entry out of the result. It also means Restore-OfflineRegistrySecurity
+        must NOT be called against this key afterwards - replaying the capture would put the deny
+        straight back. The owner is handed back by hand instead.
+
+        An allow entry is added only when removing the deny leaves the SID without the access, so a
+        key that already grants it explicitly comes away with nothing added.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Sid,
+        [Parameter(Mandatory = $true)][int]$GrantMask,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $original = Get-OfflineRegistryKeySecurity -Path $Path
+    if (-not $original) {
+        Add-OfflineRepairLog -Level Warning -Message "Could not read the security descriptor of $Path, so it was left alone."
+        return $false
+    }
+
+    $target = [System.Security.Principal.SecurityIdentifier]::new($Sid)
+
+    # Built once, from the original, and reused by both the plain attempt and the retry.
+    $desired = {
+        $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($original, 0)
+        $acl = $raw.DiscretionaryAcl
+        $inheritedFlag = [int][System.Security.AccessControl.AceFlags]::Inherited
+        $kept = @()
+        if ($null -ne $acl) {
+            $kept = @($acl | Where-Object {
+                    -not ($_.SecurityIdentifier -eq $target -and
+                        $_.AceType.ToString() -like '*Denied*' -and
+                        -not ([int]$_.AceFlags -band $inheritedFlag))
+                })
+        }
+
+        $granted = @($kept | Where-Object {
+                $_.SecurityIdentifier -eq $target -and $_.AceType -eq 'AccessAllowed' -and (($_.AccessMask -band $GrantMask) -eq $GrantMask)
+            }).Count -gt 0
+
+        if (-not $granted) {
+            $kept += [System.Security.AccessControl.CommonAce]::new(
+                [System.Security.AccessControl.AceFlags]::None,
+                [System.Security.AccessControl.AceQualifier]::AccessAllowed,
+                $GrantMask, $target, $false, $null)
+        }
+
+        # Canonical order: explicit deny, explicit allow, inherited deny, inherited allow. .NET
+        # refuses to work with a list that is out of order, and a hardening tool is exactly what
+        # produces one.
+        $ordered = @(
+            @($kept | Where-Object { -not ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -like '*Denied*' })
+            @($kept | Where-Object { -not ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -notlike '*Denied*' })
+            @($kept | Where-Object { ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -like '*Denied*' })
+            @($kept | Where-Object { ([int]$_.AceFlags -band $inheritedFlag) -and $_.AceType.ToString() -notlike '*Denied*' })
+        )
+
+        $revision = if ($null -ne $acl) { $acl.Revision } else { 2 }
+        $newAcl = [System.Security.AccessControl.RawAcl]::new($revision, $ordered.Count)
+        for ($i = 0; $i -lt $ordered.Count; $i++) { $newAcl.InsertAce($i, $ordered[$i]) }
+        $raw.DiscretionaryAcl = $newAcl
+
+        $bytes = [byte[]]::new($raw.BinaryLength)
+        $raw.GetBinaryForm($bytes, 0)
+
+        $sd = [System.Security.AccessControl.RegistrySecurity]::new()
+        # The Access section alone, so the owner is not rewritten by a repair that is about the DACL.
+        $sd.SetSecurityDescriptorBinaryForm($bytes, [System.Security.AccessControl.AccessControlSections]::Access)
+        return $sd
+    }
+
+    $write = {
+        [void](Assert-OfflineTarget -Path $Path -Action 'change the permissions of')
+        $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+        if (-not $subKey) { throw "$Path is not a key in a mounted offline hive." }
+
+        $key = $null
+        try {
+            $rights = [System.Security.AccessControl.RegistryRights]::ReadPermissions -bor
+            [System.Security.AccessControl.RegistryRights]::ChangePermissions
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                $subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
+            if (-not $key) { throw "$subKey could not be opened to change its permissions." }
+            $key.SetAccessControl((& $desired))
+        }
+        finally { if ($key) { $key.Close() } }
+    }
+
+    $verify = {
+        $probe = Get-RegistryKeyProbe -Path $Path
+        if (-not $probe.Sddl) { return $false }
+        return -not (Get-SddlDeny -Sddl $probe.Sddl -Sid $Sid -Mask $GrantMask).Explicit
+    }
+
+    try {
+        & $write
+        if (& $verify) {
+            Add-OfflineRepairLog -Message "$Description Original descriptor was $((([System.Security.AccessControl.RawSecurityDescriptor]::new($original, 0)).GetSddlForm('All')))"
+            return $true
+        }
+        Add-OfflineRepairLog -Level Info -Message "$Path still denies the account after the permission change; taking ownership and retrying."
+    }
+    catch {
+        Add-OfflineRepairLog -Level Info -Message "$Path refused the permission change ($($_.Exception.Message)); taking ownership and retrying."
+    }
+
+    # The capture is taken only so the owner can be handed back. The DACL is deliberately NOT
+    # restored from it - that is the deny this whole function exists to remove.
+    $captured = [System.Collections.Generic.List[object]]::new()
+    try { [void](Grant-OfflineRegistryKeyAccess -Path $Path -NoRecurse -CapturedInto $captured) }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be taken ($($_.Exception.Message)), so its permissions were left alone."
+        return $false
+    }
+
+    try {
+        & $write
+        if (-not (& $verify)) { throw 'the deny entry was still present after the write.' }
+    }
+    catch {
+        [void](Restore-OfflineRegistrySecurity -Captured $captured.ToArray())
+        Add-OfflineRepairLog -Level Warning -Message "$Path could not be repaired ($($_.Exception.Message)); its original permissions were put back."
+        return $false
+    }
+
+    # Hand the key back. Only the owner is replayed; the DACL just written is what must survive.
+    $rawOriginal = [System.Security.AccessControl.RawSecurityDescriptor]::new($original, 0)
+    if ($rawOriginal.Owner) {
+        try {
+            $subKey = ConvertTo-OfflineNativeSubKey -Path $Path
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                $subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                [System.Security.AccessControl.RegistryRights]::TakeOwnership)
+            if ($key) {
+                $ownerOnly = [System.Security.AccessControl.RegistrySecurity]::new()
+                $ownerOnly.SetOwner($rawOriginal.Owner)
+                $key.SetAccessControl($ownerOnly)
+                $key.Close()
+            }
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be handed back to $($rawOriginal.Owner). Restore it by hand with: subinacl /keyreg `"$(ConvertTo-OfflineNativeSubKey -Path $Path)`" /setowner=`"$($rawOriginal.Owner)`""
+        }
+    }
+
+    Add-OfflineRepairLog -Message "$Description Ownership was taken to do it. Original descriptor was $($rawOriginal.GetSddlForm('All'))"
+    return $true
+}
+
+function Repair-SoftwareFinding {
+    <#
+    .SYNOPSIS
+        Repairs one finding that lives in the SOFTWARE hive - the certificate store and its contents.
+    #>
+    param([Parameter(Mandatory = $true)]$Finding)
+
+    switch -Regex ($Finding.Cause) {
+
+        '^CertificateStoreAccessDenied$' {
+            return (Remove-OfflineRegistryKeyDeny -Path $Finding.Data.Path -Sid $script:SidSystem -GrantMask $script:MaskKeyFullControl `
+                    -Description "$($Finding.Data.Label): removed the entries denying NT AUTHORITY\SYSTEM, so Windows can create the listener certificate again.")
+        }
+
+        '^ListenerCertificateUnusable$' {
+            $certificate = $Finding.Data
+            $outcome = Invoke-OfflineProtectedKeyRemoval -Path $certificate.Path -Label "listener certificate $($certificate.Thumbprint)"
+            if ($outcome.Removed) {
+                Add-OfflineRepairLog -Message "Removed the unusable listener certificate $($certificate.Thumbprint) (subject $($certificate.Subject), expiry $($certificate.NotAfter)) from the Remote Desktop store, so Windows generates a fresh one on the next start. $($outcome.Reason)"
+                return $true
+            }
+            Add-OfflineRepairLog -Level Warning -Message "The listener certificate $($certificate.Thumbprint) could not be removed: $($outcome.Reason)"
+            return $false
+        }
+
+        default { return $false }
+    }
+}
+
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-Object -FilePath $logFile -Append
 
@@ -695,14 +1291,23 @@ try {
     $keyStore = Get-KeyStoreState -VolumeRoot $volumeRoot -BuildNumber $buildNumber
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
+    # The certificate store is read before the SYSTEM hive rather than inside it, because the two
+    # live in different hives and only one can be mounted under a given name at a time.
+    $certStore = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
+        return (Get-CertificateStoreState)
+    }
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
     $context = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $services = Get-CertificateServiceState -SystemRoot $systemRoot
+        $pinned = Get-ListenerPinnedThumbprint -SystemRoot $systemRoot
 
         return [PSCustomObject]@{
             ControlSet = (Split-Path -Path $systemRoot -Leaf)
             Services   = @($services)
-            Findings   = @(Get-AllFinding -KeyStore $keyStore -Services $services)
+            Pinned     = $pinned
+            Findings   = @(Get-AllFinding -KeyStore $keyStore -Services $services -CertStore $certStore -PinnedThumbprint $pinned)
         }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -730,6 +1335,24 @@ try {
         Log-Info "  $($service.Name): $shown - $($service.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
     }
 
+    $storeShown = if ($certStore.StoreExists) { 'present' } else { 'absent - not a fault, Windows recreates it with the certificate' }
+    Log-Info "Remote Desktop certificate store: HKLM\SOFTWARE\Microsoft\SystemCertificates\Remote Desktop $storeShown." | Tee-Object -FilePath $logFile -Append
+    foreach ($key in @($certStore.Keys)) {
+        if (-not $key.Exists) { Log-Info "  $($key.Label): absent." | Tee-Object -FilePath $logFile -Append; continue }
+        Log-Info "  $($key.Label): $(if ($key.Sddl) { $key.Sddl } else { '<descriptor refused>' })" | Tee-Object -FilePath $logFile -Append
+    }
+    if (@($certStore.Certificates).Count -eq 0 -and $certStore.CertificatesKnown) {
+        # Same measurement as the missing key container above. Stated so nobody reads it as a fault.
+        Log-Info '  No certificate is in the store. That is not a fault: Windows generates one on the next start, and it was measured doing so.' | Tee-Object -FilePath $logFile -Append
+    }
+    foreach ($certificate in @($certStore.Certificates)) {
+        $shown = if (-not $certificate.Parsed) { 'could not be parsed' } else { "$($certificate.Subject), expires $($certificate.NotAfter.ToString('yyyy-MM-dd HH:mm'))$(if ($certificate.Expired) { ' - EXPIRED' })" }
+        Log-Info "  $($certificate.Thumbprint): $shown." | Tee-Object -FilePath $logFile -Append
+    }
+    if ($context.Pinned) {
+        Log-Info "The listener is pinned to certificate $($context.Pinned) by SSLCertificateSHA1Hash. Removing a pin is win-fix-rdp-connectivity's job, not this script's." | Tee-Object -FilePath $logFile -Append
+    }
+
     $findings = @($context.Findings)
     foreach ($finding in $findings) {
         Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
@@ -738,6 +1361,14 @@ try {
     $repairable = @($findings | Where-Object { $_.Repairable })
     $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
+    # Ahead of the detect gate on purpose, so one affirmative line serves both modes. A healthy disk
+    # and one this script cannot help must not produce the same silence.
+    if ($findings.Count -eq 0) {
+        Log-Output 'No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, any certificate in it is in date and has its private key, and the services behind them are not disabled. No changes were made.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_SUCCESS
+    }
+
     if ($isDetectOnly) {
         foreach ($finding in $findings) {
             Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
@@ -745,12 +1376,6 @@ try {
         # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
         # so a summary printed first is the first thing a long run loses.
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($findings.Count -eq 0) {
-        Log-Output 'No listener certificate fault was found. The Remote Desktop service account can read the listener private key and the services behind it are not disabled. No changes were made.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -772,6 +1397,79 @@ try {
         }
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+    # --- Certificate store repairs, in the SOFTWARE hive ------------------------------------------
+    $softwareFindings = @($repairable | Where-Object { $_.Hive -eq 'SOFTWARE' })
+    if ($softwareFindings.Count -gt 0) {
+        $softwareBackup = Backup-OfflineHiveFile -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Log-Info "SOFTWARE hive backed up to $softwareBackup" | Tee-Object -FilePath $logFile -Append
+
+        $softwareOutcome = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            $done = 0
+            $errors = [System.Collections.Generic.List[string]]::new()
+            $revealed = [System.Collections.Generic.List[object]]::new()
+
+            # The store's own permissions first: a certificate cannot be deleted out of a key that
+            # still refuses to be written to.
+            $ordered = @(@($softwareFindings | Where-Object { $_.Cause -eq 'CertificateStoreAccessDenied' }) +
+                @($softwareFindings | Where-Object { $_.Cause -ne 'CertificateStoreAccessDenied' }))
+            $denyRepaired = $false
+            foreach ($finding in $ordered) {
+                try {
+                    if (Repair-SoftwareFinding -Finding $finding) {
+                        $finding.Repaired = $true
+                        $done++
+                        if ($finding.Cause -eq 'CertificateStoreAccessDenied') { $denyRepaired = $true }
+                    }
+                }
+                catch {
+                    [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
+                    Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair failed ($($_.Exception.Message))."
+                }
+            }
+
+            # A store that refused to be listed hid whatever was in it, so removing the deny can
+            # expose a certificate detection never saw. Left to the verification pass it would be
+            # reported as an issue that is "still present" - which would be a repair this script
+            # declined to make, called a failure. It is detected and repaired here instead, in the
+            # same hive session, and reported as what it is: found only once the store opened.
+            if ($denyRepaired) {
+                $seen = @($softwareFindings | ForEach-Object { "$($_.Cause)|$($_.Item)" })
+                $fresh = Get-CertificateStoreState
+                $new = @(Get-AllFinding -KeyStore $keyStore -Services @() -CertStore $fresh -PinnedThumbprint $context.Pinned |
+                        Where-Object { $_.Hive -eq 'SOFTWARE' -and "$($_.Cause)|$($_.Item)" -notin $seen })
+
+                foreach ($finding in $new) {
+                    [void]$revealed.Add($finding)
+                    Add-OfflineRepairLog -Message "Found once the certificate store opened: [$($finding.Cause)] $($finding.Message)"
+                    if (-not $finding.Repairable) { continue }
+                    try {
+                        if (Repair-SoftwareFinding -Finding $finding) {
+                            $finding.Repaired = $true
+                            $done++
+                        }
+                    }
+                    catch {
+                        [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
+                        Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair failed ($($_.Exception.Message))."
+                    }
+                }
+            }
+
+            return [PSCustomObject]@{ Repaired = $done; Errors = @($errors); Revealed = @($revealed) }
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        foreach ($finding in @($softwareOutcome.Revealed)) {
+            Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            $findings += $finding
+            if ($finding.Repairable) { $repairable += $finding } else { $unrepairable += $finding }
+        }
+
+        $repairedCount += $softwareOutcome.Repaired
+        foreach ($failure in @($softwareOutcome.Errors)) { [void]$failed.Add($failure) }
+    }
 
     # --- Registry repairs -------------------------------------------------------------------------
     $registryFindings = @($repairable | Where-Object { $_.Hive -eq 'SYSTEM' })
@@ -808,9 +1506,13 @@ try {
 
     # Verify against freshly read state rather than trusting the writes above.
     $verifyKeyStore = Get-KeyStoreState -VolumeRoot $volumeRoot -BuildNumber $buildNumber
+    $verifyCertStore = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
+        return (Get-CertificateStoreState)
+    }
     $remaining = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
         $systemRoot = Get-OfflineSystemRootPath -Strict
-        return @(Get-AllFinding -KeyStore $verifyKeyStore -Services (Get-CertificateServiceState -SystemRoot $systemRoot))
+        return @(Get-AllFinding -KeyStore $verifyKeyStore -Services (Get-CertificateServiceState -SystemRoot $systemRoot) `
+                -CertStore $verifyCertStore -PinnedThumbprint (Get-ListenerPinnedThumbprint -SystemRoot $systemRoot))
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
