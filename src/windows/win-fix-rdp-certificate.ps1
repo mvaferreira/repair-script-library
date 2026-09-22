@@ -87,12 +87,13 @@
 #   defeat the grant; a deliberately narrow deny against one of those accounts goes with the rest,
 #   and the descriptor that was there is written to the log first.
 #
-#   The two certificate store keys are judged on explicit Deny entries for SYSTEM only. A key that
-#   merely stops granting SYSTEM - a protected DACL listing only Administrators, say - blocks
-#   certificate creation just as effectively but is NOT reported, because on a healthy image these
-#   keys inherit their access rather than granting it explicitly, so requiring an explicit grant
-#   would fire on every machine. If RDP still fails after this script reports the store healthy,
-#   compare that key's descriptor against a known-good VM by hand.
+#   The two certificate store keys are judged on Deny entries for SYSTEM. An explicit deny is
+#   removed; an inherited one is reported and left alone, because it belongs to a parent key this
+#   script does not own. A key that merely stops granting SYSTEM - a protected DACL listing only
+#   Administrators, say - blocks certificate creation just as effectively but is NOT reported,
+#   because on a healthy image these keys inherit their access rather than granting it explicitly,
+#   so requiring an explicit grant would fire on every machine. If RDP still fails after this script
+#   reports the store healthy, compare that key's descriptor against a known-good VM by hand.
 #
 #   The certificate itself is the third. Two states leave the listener with nothing usable and are
 #   repaired by removing the store entry, which is what makes Windows mint a fresh one:
@@ -158,10 +159,13 @@
 #   exists.
 #
 # .PARAMETER detectOnly
-#   "true" to report what is wrong with the listener key permissions and repair nothing. No
-#   configuration is changed. It is not a pure read: an object whose descriptor refuses this rescue
-#   VM has to have that descriptor borrowed before it can be read at all, and each one is restored
-#   immediately afterwards in a finally. Defaults to "false".
+#   "true" to report what is wrong with the listener key container, the machine key store, the
+#   certificate store keys, the certificates in them and the services behind them, and repair
+#   nothing. No configuration is changed. It is not a pure read: an object whose descriptor refuses
+#   this rescue VM has to have that descriptor borrowed before it can be read at all, and each one
+#   is handed back as soon as that read is done. The hand-back is replayed from the binary
+#   descriptor and verified, and one that cannot be put back is reported as a finding rather than
+#   passed over in silence. Defaults to "false".
 #
 # .PARAMETER windowsDrive
 #   The drive letter of the attached offline Windows installation. Detected automatically when not
@@ -241,6 +245,11 @@ $script:RdpTcpSubPath = 'Control\Terminal Server\WinStations\RDP-Tcp'
 # asks for, so it identifies the listener's own keys without needing the certificate store parsed.
 # Anything else in MachineKeys belongs to another component and is not touched.
 $script:RdpContainerPrefix = 'f686aace'
+
+# Offline objects whose borrowed descriptor could not be handed back, keyed by path. Populated by
+# Register-UnrestoredPath and turned into non-repairable findings, so a run that leaves a customer
+# object taken cannot also report that it found nothing wrong.
+$script:UnrestoredPaths = @{}
 
 # NT SERVICE\SessionEnv. Service SIDs are derived from the service name rather than issued per
 # machine, so this value is the same on every Windows installation and is safe to write offline.
@@ -377,6 +386,11 @@ function Test-SddlGrant {
 
     $granted = $false
     $denied = $false
+    # Accumulated across entries, not judged one at a time. Windows is free to express the same
+    # access as one ACE or several - 0x20089 and 0x100000 for the same SID is the same grant as a
+    # single 0x120089 - and requiring one entry to carry the whole mask read a healthy split grant
+    # as missing, which would make the script write on a VM that has nothing wrong with it.
+    $allowUnion = 0
 
     $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
     if ($null -ne $raw.DiscretionaryAcl) {
@@ -396,11 +410,59 @@ function Test-SddlGrant {
             # holds, which cannot be evaluated here, so it is not counted as access already present.
             # The cost of being wrong is one redundant explicit allow; the cost of the opposite is
             # leaving the account without access.
-            if ($type -eq 'AccessAllowed' -and (($ace.AccessMask -band $Mask) -eq $Mask)) { $granted = $true }
+            if ($type -eq 'AccessAllowed') { $allowUnion = $allowUnion -bor [int]$ace.AccessMask }
         }
     }
 
+    if (($allowUnion -band $Mask) -eq $Mask) { $granted = $true }
+
     return [PSCustomObject]@{ Granted = $granted; Denied = $denied }
+}
+
+function Register-UnrestoredPath {
+    <#
+    .SYNOPSIS
+        Recording an offline object whose borrowed descriptor could not be handed back.
+
+    .DESCRIPTION
+        A borrow that cannot be returned leaves the object owned by this rescue VM with an extra
+        FullControl entry on it - on a customer's private key store. That is a worse state than the
+        one the run started in, so it is never allowed to pass silently: each one becomes a
+        non-repairable finding naming the path and the descriptor to put back, which also stops the
+        run reporting that nothing was wrong.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][string]$Sddl
+    )
+
+    if ($script:UnrestoredPaths.Keys -contains $Path) { return }
+    $script:UnrestoredPaths[$Path] = $Sddl
+}
+
+function Restore-BorrowedPath {
+    <#
+    .SYNOPSIS
+        Handing back a descriptor borrowed only to read something, and noticing when that fails.
+
+    .DESCRIPTION
+        The binary descriptor is replayed in preference to the SDDL because it round-trips
+        losslessly: an SDDL string re-resolves machine-relative aliases (LA, DA, DU, DC) against
+        the machine parsing it, so a domain-joined customer disk can fail to restore, or restore to
+        the wrong account, on a workgroup rescue VM. The helper verifies a binary restore by reading
+        it back, and that answer is recorded rather than discarded.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Sddl,
+        [Parameter(Mandatory = $false)][byte[]]$Binary
+    )
+
+    $restored = $false
+    try { $restored = Restore-OfflinePathSecurity -Path $Path -Sddl $Sddl -BinaryDescriptor $Binary }
+    catch { $restored = $false }
+    if (-not $restored) { Register-UnrestoredPath -Path $Path -Sddl $Sddl }
+    return $restored
 }
 
 function Test-FolderEveryoneAccess {
@@ -482,30 +544,43 @@ function Get-KeyStoreState {
     $required = Get-RequiredContainerAce -BuildNumber $BuildNumber
     $containers = @()
     $folderListed = $true
+    # Every file in the folder, not just the listener's own. The filtered list below answers "is the
+    # listener's key container healthy"; it cannot answer "does this certificate have a key at all",
+    # because a certificate an administrator installed keeps its container under its own name. Using
+    # the filtered list for the second question deletes such a certificate on the evidence that it is
+    # not the listener's.
+    $allContainerNames = @()
 
     if ($folderExists) {
         $filter = { $_.Name -like "$($script:RdpContainerPrefix)*" }
+        $allFiles = @()
         $files = @()
         try {
-            $files = @(Get-ChildItem -LiteralPath $folder -Force -File -ErrorAction Stop | Where-Object $filter)
+            $allFiles = @(Get-ChildItem -LiteralPath $folder -Force -File -ErrorAction Stop)
         }
         catch {
             # A store hardened hard enough to refuse this account a listing must never be read as
             # "no key container is present" - that would report a broken machine as healthy, and a
             # hardened store is precisely the case this script exists for. It is borrowed for the
             # length of the listing and handed straight back.
-            $captured = Grant-OfflinePathAccess -Path $folder
+            $capturedBinary = $null
+            $captured = Grant-OfflinePathAccess -Path $folder -CapturedBinary ([ref]$capturedBinary)
             if ($captured) {
                 if (-not $folderSddl) {
                     $folderSddl = $captured
                     $folderSddlKnown = $true
                     $folderOk = (Test-FolderEveryoneAccess -Sddl $captured)
                 }
-                try { $files = @(Get-ChildItem -LiteralPath $folder -Force -File -ErrorAction Stop | Where-Object $filter) }
+                try { $allFiles = @(Get-ChildItem -LiteralPath $folder -Force -File -ErrorAction Stop) }
                 catch { $folderListed = $false }
-                [void](Restore-OfflinePathSecurity -Path $folder -Sddl $captured)
+                [void](Restore-BorrowedPath -Path $folder -Sddl $captured -Binary $capturedBinary)
             }
             else { $folderListed = $false }
+        }
+
+        if ($folderListed) {
+            $allContainerNames = @($allFiles | ForEach-Object { $_.Name })
+            $files = @($allFiles | Where-Object $filter)
         }
 
         foreach ($file in $files) {
@@ -513,10 +588,11 @@ function Get-KeyStoreState {
             if (-not $sddl) {
                 # Same borrow and return. A container whose descriptor denies even READ_CONTROL is
                 # the shape this script repairs, so it must be looked at rather than written off.
-                $captured = Grant-OfflinePathAccess -Path $file.FullName
+                $capturedBinary = $null
+                $captured = Grant-OfflinePathAccess -Path $file.FullName -CapturedBinary ([ref]$capturedBinary)
                 if ($captured) {
                     $sddl = $captured
-                    [void](Restore-OfflinePathSecurity -Path $file.FullName -Sddl $captured)
+                    [void](Restore-BorrowedPath -Path $file.FullName -Sddl $captured -Binary $capturedBinary)
                 }
             }
 
@@ -549,14 +625,15 @@ function Get-KeyStoreState {
     }
 
     return [PSCustomObject]@{
-        FolderPath      = $folder
-        FolderExists    = $folderExists
-        FolderSddl      = $folderSddl
-        FolderOk        = $folderOk
-        FolderSddlKnown = $folderSddlKnown
-        FolderListed    = $folderListed
-        Required        = @($required)
-        Containers      = @($containers)
+        FolderPath        = $folder
+        FolderExists      = $folderExists
+        FolderSddl        = $folderSddl
+        FolderOk          = $folderOk
+        FolderSddlKnown   = $folderSddlKnown
+        FolderListed      = $folderListed
+        Required          = @($required)
+        Containers        = @($containers)
+        AllContainerNames = @($allContainerNames)
     }
 }
 
@@ -913,15 +990,20 @@ function Get-CertificateServiceState {
         $exists = Test-Path -LiteralPath $path
         $start = $null
         $denied = $false
+        $found = $false
+        $malformed = $false
 
         if ($exists) {
-            $found = $false
             $value = Get-OfflineProtectedRegistryValue -Path $path -Name 'Start' -Found ([ref]$found) -Denied ([ref]$denied)
             # TryParse, not [int]: a bare cast throws on a value of an unexpected type, and that
             # throw happens inside the hive scriptblock and takes the whole run to STATUS_ERROR.
             if ($found) {
                 $parsed = 0
                 if ([int]::TryParse("$value", [ref]$parsed)) { $start = $parsed }
+                # Read, but not a number. That is a broken service configuration in its own right,
+                # and it must not share the "(Start not set)" wording with a value that is simply
+                # absent - one of those is a healthy default and the other is not.
+                else { $malformed = $true }
             }
         }
 
@@ -932,10 +1014,12 @@ function Get-CertificateServiceState {
             Exists   = $exists
             Start    = $start
             Denied   = $denied
+            Found    = $found
             # Denied is raised on the first refusal, before the helper takes the key and retries,
             # and is not lowered when that retry succeeds. Only a read that was refused AND never
             # recovered is genuinely unreadable.
-            Unreadable = ($exists -and $denied -and $null -eq $start)
+            Unreadable = ($exists -and $denied -and -not $found)
+            Malformed  = $malformed
             Disabled = ($exists -and $start -eq 4)
         }
     }
@@ -956,6 +1040,17 @@ function Get-AllFinding {
     )
 
     $findings = [System.Collections.Generic.List[object]]::new()
+
+    # Raised first, because it describes damage this run itself is responsible for. A borrowed
+    # descriptor that could not be handed back leaves a customer object owned by the rescue VM with
+    # an extra FullControl entry on it, which is worse than the state the run started in and must
+    # never be reported as a clean result.
+    foreach ($taken in @($script:UnrestoredPaths.Keys)) {
+        $sddl = $script:UnrestoredPaths[$taken]
+        $how = if ($sddl) { " Its original descriptor was $sddl and can be replayed with: icacls `"$taken`" /restore, or set directly with icacls." } else { '' }
+        [void]$findings.Add((New-Finding -Cause 'OfflineSecurityNotRestored' -Item $taken -Hive 'FILE' -Repairable $false `
+                    -Message "The security descriptor of $taken was borrowed to read it and could not be put back, so it is still owned by this rescue VM and carries an entry this repair added.$how"))
+    }
 
     # --- The key containers -----------------------------------------------------------------------
     # A missing MachineKeys folder is deliberately not a fault. Measured on a live VM: renaming the
@@ -1016,6 +1111,14 @@ function Get-AllFinding {
         if ($service.Unreadable) {
             [void]$findings.Add((New-Finding -Cause 'CertificateServiceStartUnreadable' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
                         -Message "The Start value of $($service.Name) could not be read even after taking the key ($($service.Spec.Purpose)), so whether it is disabled is unknown. It was left alone rather than overwritten with a documented default."))
+            continue
+        }
+        # Read, but not a number Windows can use. Reported rather than repaired: the value that was
+        # there is evidence of how the machine got into this state, and replacing it with a
+        # documented default would destroy that without being asked to.
+        if ($service.Malformed) {
+            [void]$findings.Add((New-Finding -Cause 'CertificateServiceStartMalformed' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
+                        -Message "The Start value of $($service.Name) is present but is not a number ($($service.Spec.Purpose)), so Windows cannot read a start type from it. It was left as found; correct it by hand to the measured $($service.Spec.Start)."))
             continue
         }
         if (-not $service.Disabled) { continue }
@@ -1085,18 +1188,31 @@ function Get-AllFinding {
             # typically the custom certificate an administrator bound to the listener deliberately.
             # A provider property that could not be read is unknown, and unknown does not authorise
             # a deletion either.
+            #
+            # The verdict is taken against the container this certificate actually names, looked for
+            # across the whole folder. Judging it by "the folder holds no LISTENER container" answers
+            # a different question: a certificate an administrator installed keeps its key under its
+            # own container name, so that test reads "this is not the listener's key" as "this
+            # certificate has no key" and deletes a working enterprise binding. A certificate that
+            # records no container name at all cannot be judged this way and is left alone.
             $keyWouldBeHere = ($certificate.KeyInMachineKeys -eq $true)
-            $orphaned = $keyWouldBeHere -and $KeyStore.FolderExists -and $KeyStore.FolderListed -and (@($KeyStore.Containers).Count -eq 0)
+            $containerNamed = -not [string]::IsNullOrWhiteSpace($certificate.KeyContainer)
+            $containerPresent = $containerNamed -and (@($KeyStore.AllContainerNames) -contains $certificate.KeyContainer)
+            $judgeable = $keyWouldBeHere -and $containerNamed -and $KeyStore.FolderExists -and $KeyStore.FolderListed
+            $orphaned = $judgeable -and -not $containerPresent
 
             # Stated rather than left silent: without this line, a certificate that was spared only
-            # because its key is kept somewhere this script does not read looks identical in the log
-            # to one that was examined and found healthy.
-            if (-not $keyWouldBeHere -and $KeyStore.FolderExists -and $KeyStore.FolderListed -and (@($KeyStore.Containers).Count -eq 0)) {
+            # because its key is kept somewhere this script does not read, or because it names no
+            # container to look for, looks identical in the log to one examined and found healthy.
+            if (-not $judgeable -and $KeyStore.FolderExists -and $KeyStore.FolderListed) {
                 $where = if ($null -eq $certificate.KeyInMachineKeys) {
                     'the key provider recorded against it could not be read'
                 }
-                else {
+                elseif (-not $keyWouldBeHere) {
                     "its private key is held by CNG, in Crypto\Keys rather than the RSA\MachineKeys folder this script reads$(if ($certificate.KeyContainer) { " (container $($certificate.KeyContainer))" })"
+                }
+                else {
+                    'it records no key container name, so there is nothing to look for in the machine key store'
                 }
                 Add-OfflineRepairLog -Level Info -Message "Store entry $($certificate.Thumbprint) was not judged against the machine key store because $where. An empty MachineKeys folder is not evidence about this certificate, so it was left alone."
             }
@@ -1157,8 +1273,15 @@ function Add-OfflinePathAce {
         return $false
     }
 
+    # The descriptor to build from is passed in rather than re-read. On the retry path below the
+    # object has already been borrowed, which adds a FullControl entry for this account; rebuilding
+    # from a fresh read would write that borrowed entry into the customer's descriptor permanently.
+    # Building from the original capture is what keeps it out, the same reasoning the registry
+    # counterpart records.
     $apply = {
-        $current = Get-PathSddl -Path $Path -IsDirectory:$isDirectory
+        param([string]$SourceSddl)
+
+        $current = $SourceSddl
         if (-not $current) { throw "The security descriptor of $Path could not be read." }
 
         # Worked at the raw level rather than through FileSecurity.AddAccessRule. .NET refuses to
@@ -1207,7 +1330,7 @@ function Add-OfflinePathAce {
     }
 
     try {
-        & $apply
+        & $apply $original
         Add-OfflineRepairLog -Message "$Description Original descriptor was $original"
         return $true
     }
@@ -1216,7 +1339,8 @@ function Add-OfflinePathAce {
     }
 
     $captured = $null
-    try { $captured = Grant-OfflinePathAccess -Path $Path }
+    $capturedBinary = $null
+    try { $captured = Grant-OfflinePathAccess -Path $Path -CapturedBinary ([ref]$capturedBinary) }
     catch { Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be taken ($($_.Exception.Message))." }
     if (-not $captured) {
         Add-OfflineRepairLog -Level Warning -Message "Ownership of $Path could not be taken, so its permissions were left alone."
@@ -1224,7 +1348,9 @@ function Add-OfflinePathAce {
     }
 
     try {
-        & $apply
+        # Built from the descriptor captured before the borrow, so the FullControl entry the borrow
+        # just added for this account is not carried into what gets written.
+        & $apply $captured
 
         # Hand the object back. The DACL just written is kept; only the owner is replayed, and only
         # when taking it actually changed the owner.
@@ -1241,8 +1367,18 @@ function Add-OfflinePathAce {
         return $true
     }
     catch {
-        Restore-OfflinePathSecurity -Path $Path -Sddl $captured | Out-Null
-        Add-OfflineRepairLog -Level Warning -Message "$Path could not be repaired ($($_.Exception.Message)); its original permissions were put back."
+        # The binary descriptor is replayed in preference to the SDDL: an SDDL string re-resolves
+        # machine-relative aliases against the rescue VM, so a domain-joined disk's DA/DU/DC entries
+        # either fail to parse or resolve to the wrong account. A restore that does not read back
+        # identically returns $false, and that answer is acted on rather than discarded - leaving a
+        # customer's key container owned by the rescue VM is not something to report as success.
+        $restored = Restore-BorrowedPath -Path $Path -Sddl $captured -Binary $capturedBinary
+        if (-not $restored) {
+            Add-OfflineRepairLog -Level Warning -Message "$Path could not be repaired ($($_.Exception.Message)), and its original permissions could not be put back either."
+        }
+        else {
+            Add-OfflineRepairLog -Level Warning -Message "$Path could not be repaired ($($_.Exception.Message)); its original permissions were put back."
+        }
         return $false
     }
 }
@@ -1504,7 +1640,15 @@ function Repair-SoftwareFinding {
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-Object -FilePath $logFile -Append
 
+# The status is held rather than returned from inside the try. The status token is an ordinary
+# string on the output stream, so returning it early puts it ahead of whatever the finally flushes -
+# and Run Command keeps only the tail of a 4096-character log, so a long flush can push the token
+# out of the retained window and leave 'az vm repair run' with no status at all. The caller contract
+# in common\helpers\README.md asks for exactly this shape: cleanup and logging first, status last.
+# The labelled block gives the early exits somewhere to go that is still inside the try.
+$status = $STATUS_ERROR
 try {
+    :main do {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
@@ -1562,7 +1706,7 @@ try {
     }
 
     foreach ($service in @($context.Services)) {
-        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Unreadable) { '(unreadable)' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
+        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Unreadable) { '(unreadable)' } elseif ($service.Malformed) { '(Start is not a number)' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
         Log-Info "  $($service.Name): $shown - $($service.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
     }
 
@@ -1597,7 +1741,8 @@ try {
     if ($findings.Count -eq 0) {
         Log-Output 'No listener certificate fault was found. The Remote Desktop service account can read the listener private key, the certificate store grants SYSTEM the access it needs to create a certificate, any certificate in it is in date and has its private key, and the services behind them are not disabled. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+        break main
     }
 
     if ($isDetectOnly) {
@@ -1608,7 +1753,8 @@ try {
         # so a summary printed first is the first thing a long run loses.
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+        break main
     }
 
     $repairedCount = 0
@@ -1780,7 +1926,8 @@ try {
     if ($failed.Count -gt 0 -or $stillRepairable.Count -gt 0) {
         Log-Error "$summary $($failed.Count) repair(s) failed and $($stillRepairable.Count) issue(s) are still present." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
+        $status = $STATUS_ERROR
+        break main
     }
 
     Log-Output $summary | Tee-Object -FilePath $logFile -Append
@@ -1791,12 +1938,13 @@ try {
         Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM. If RDP still fails once it boots, the remaining option is to create a certificate by hand and pin it to the listener with SSLCertificateSHA1Hash, which is a temporary measure and an operator's decision." | Tee-Object -FilePath $logFile -Append
     }
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+    $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
+    $status = $STATUS_ERROR
 }
 finally {
     # The caller contract in common\helpers\README.md. On a throw the buffered helper entries are
@@ -1810,3 +1958,6 @@ finally {
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
 }
+
+# Last, so it survives the tail-truncated log the extension keeps.
+return $status

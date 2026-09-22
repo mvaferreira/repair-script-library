@@ -399,6 +399,11 @@ function Get-TerminalServerState {
     #>
     param([Parameter(Mandatory = $true)][string]$SystemRoot)
 
+    # Test-Path is a presence gate, not an access gate. Measured against a key an administrator
+    # cannot open (HKLM:\SECURITY): Test-Path returns $true while reg query reports access denied
+    # and OpenSubKey throws. So a key whose permissions were changed still reaches the protected
+    # read below and still raises an unreadable finding - the gate only skips a key that genuinely
+    # is not there. Recorded here because it reads like a hole and is not one.
     $tsPath = Join-Path $SystemRoot $script:TerminalServerSubPath
     $rdpPath = Join-Path $SystemRoot $script:RdpTcpSubPath
     $listenerPresent = Test-Path -LiteralPath $rdpPath
@@ -471,11 +476,15 @@ function Get-RdpServiceState {
         $exists = Test-Path -LiteralPath $path
         $start = $null
         $denied = $false
+        $found = $false
+        $raw = $null
         if ($exists) {
             $value = Get-OfflineValueState -Path $path -Name 'Start'
             # $null rather than a cast, so a Start of an unexpected type cannot throw mid-scan.
             if ($value.Found) { $start = ConvertTo-DwordInt32 -Value $value.Value }
             $denied = $value.Denied
+            $found = $value.Found
+            $raw = $value.Value
         }
         [PSCustomObject]@{
             Name     = $spec.Name
@@ -483,7 +492,17 @@ function Get-RdpServiceState {
             Path     = $path
             Exists   = $exists
             Start    = $start
+            Value    = $raw
+            Found    = $found
             Denied   = $denied
+            # Denied is optimistic - it is raised on the first refusal and never lowered when the
+            # retry succeeds - so pairing it with Found is what separates "never read" from "read
+            # after taking the key". Testing $null -eq $Start instead would call a malformed value
+            # unreadable, because a non-numeric Start also converts to $null.
+            Unreadable = ($denied -and -not $found)
+            # Read, but not a number: neither healthy nor disabled, and not something to overwrite
+            # blind. Without this it fell through as $null and the service was reported as fine.
+            Malformed  = ($found -and $null -eq $start)
             Disabled = ($exists -and $start -eq 4)
         }
     }
@@ -536,6 +555,12 @@ function Get-SchannelState {
         Functions      = $functions
         FunctionCount  = $functionCount
         FunctionsEmpty = ($null -ne $functions -and $functions.Found -and $functionCount -eq 0)
+        # An empty cipher suite list stops the handshake outright, so a Functions value that could
+        # not be read is not something to pass over: without this the key's silence was reported as
+        # "sets no suite list, so Windows uses its own ... not treated as a fault", which is an
+        # affirmative healthy statement about a value never read. Unlike the listener values there
+        # is no second read in the same key to raise a finding in its place.
+        FunctionsUnreadable = (Test-ValueUnreadable -State $functions)
     }
 }
 
@@ -596,6 +621,13 @@ function Get-AllFinding {
             }
         }
 
+        # Neither of the two values below is routed through Test-ValueUnreadable, and deliberately:
+        # both live in the RDP-Tcp key alongside the four specs just scanned, so a key this script
+        # cannot read raises ListenerValueUnreadable four times over and the run can never print the
+        # healthy line from an unread value. Adding a fifth and sixth unreadable finding for the same
+        # single cause would be noise. The cipher suite policy is the opposite case - it sits alone
+        # in its own key with nothing correlated beside it - which is why that one is checked.
+
         # Step 8 of the Azure guidance. A pin whose private key no longer resolves fails the
         # handshake before authentication; removing it lets Windows generate a fresh certificate.
         if ($TerminalServer.PinnedCertificate -and $TerminalServer.PinnedCertificate.Found) {
@@ -647,9 +679,14 @@ function Get-AllFinding {
         # An unreadable Start is not a healthy Start. Without this the value silently defaulted to
         # $null, Disabled evaluated false, and a service whose key is locked against Administrators
         # was reported as fine. Same recovered-read rule as the listener values above.
-        if ($service.Denied -and $null -eq $service.Start) {
+        if ($service.Unreadable) {
             [void]$findings.Add((New-Finding -Cause 'RdpServiceStartUnreadable' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
                         -Message "The Start value of $($service.Name) could not be read even after taking the key ($($service.Spec.Purpose)). Its state is unknown, so it was reported rather than assumed healthy or overwritten."))
+            continue
+        }
+        if ($service.Malformed) {
+            [void]$findings.Add((New-Finding -Cause 'RdpServiceStartMalformed' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
+                        -Message "The Start value of $($service.Name) was read but is not a number ($($service.Spec.Purpose)). Windows cannot act on it, so the service is neither demonstrably healthy nor demonstrably disabled. It was reported rather than overwritten, because a value of an unexpected type usually means the key was damaged by something other than a start-type change."))
             continue
         }
         if (-not $service.Disabled) { continue }
@@ -677,7 +714,11 @@ function Get-AllFinding {
                     -Message "TLS 1.2 is explicitly disabled for $(@($disabledSides | ForEach-Object { $_.Side }) -join ' and '). RDP negotiates over TLS, so this closes the handshake. It will be enabled; TLS 1.0 and 1.1 are not touched."))
     }
 
-    if ($Schannel.FunctionsEmpty) {
+    if ($Schannel.FunctionsUnreadable) {
+        [void]$findings.Add((New-Finding -Cause 'CipherPolicyUnreadable' -Item 'Functions' -Hive 'SOFTWARE' -Repairable $false `
+                    -Message "The machine-wide SSL cipher suite policy value at $($script:CipherPolicyPath) could not be read even after taking the key, so whether it lists any cipher suite is unknown. An empty list closes the handshake, so this was reported rather than assumed harmless; inspect the value by hand."))
+    }
+    elseif ($Schannel.FunctionsEmpty) {
         [void]$findings.Add((New-Finding -Cause 'CipherPolicyEmpty' -Item 'Functions' -Hive 'SOFTWARE' `
                     -Message 'The machine-wide SSL cipher suite policy is present but lists no cipher suites, which leaves nothing for the TLS handshake to agree on. The empty value will be removed so Windows uses its own list.'))
     }
@@ -839,7 +880,16 @@ function Repair-Finding {
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-Object -FilePath $logFile -Append
 
+# The caller contract in common\helpers\README.md: seed the status, then return it AFTER the
+# finally, so the marker the caller parses stays at the end of the output. $STATUS_SUCCESS is a
+# plain string written to the output stream, and Run Command keeps only the tail of a 4096-character
+# log, so a status emitted before a long cleanup flush can be pushed out of the retained window.
+# A bare `return` inside the try would exit the script and skip that trailing return, hence the
+# labelled do/while: `break main` leaves the body, runs the finally, and falls through to it.
+$status = $STATUS_ERROR
+
 try {
+    :main do {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
@@ -878,7 +928,7 @@ try {
     $disabledServices = @($context.Services | Where-Object { $_.Disabled })
     Log-Info "Services: $(@($context.Services | Where-Object { $_.Exists }).Count) of $(@($context.Services).Count) required service key(s) present, $($disabledServices.Count) disabled." | Tee-Object -FilePath $logFile -Append
     foreach ($service in @($context.Services)) {
-        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Denied -and $null -eq $service.Start) { '(unreadable)' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
+        $shown = if (-not $service.Exists) { 'no service key' } elseif ($service.Unreadable) { '(unreadable)' } elseif ($service.Malformed) { "(Start is not a number: $(Format-ValueForLog -Value $service.Value))" } elseif (-not $service.Found) { '(Start not set)' } else { "Start=$($service.Start)" }
         Log-Info "  $($service.Name): $shown, $($service.Spec.Source)." | Tee-Object -FilePath $logFile -Append
     }
 
@@ -890,6 +940,9 @@ try {
         # is that fault.
         if ($context.Schannel.Functions -and $context.Schannel.Functions.Found) {
             Log-Info "A machine-wide SSL cipher suite policy is configured with $($context.Schannel.FunctionCount) suite(s). That is normal on an Azure image and was not treated as a fault." | Tee-Object -FilePath $logFile -Append
+        }
+        elseif ($context.Schannel.FunctionsUnreadable) {
+            Log-Info 'The machine-wide SSL cipher suite policy key exists but its suite list could not be read, so whether it is empty is unknown. It was reported rather than assumed normal.' | Tee-Object -FilePath $logFile -Append
         }
         else {
             Log-Info 'The machine-wide SSL cipher suite policy key exists but sets no suite list, so Windows uses its own. That is normal on an Azure image and was not treated as a fault.' | Tee-Object -FilePath $logFile -Append
@@ -910,7 +963,8 @@ try {
     if ($findings.Count -eq 0) {
         Log-Output 'No Remote Desktop fault was found. Remote connections are allowed, the listener and its services are configured for them, and TLS 1.2 is available. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back.' | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+        break main
     }
 
     if ($isDetectOnly) {
@@ -921,7 +975,8 @@ try {
         # so a summary printed first is the first thing a long run loses.
         Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No configuration was changed; where a descriptor had to be borrowed to read a locked object it was put back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+        break main
     }
 
     # Back up every hive that is actually about to be written.
@@ -987,7 +1042,8 @@ try {
     if ($failed.Count -gt 0 -or $stillRepairable.Count -gt 0) {
         Log-Error "$summary $($failed.Count) repair(s) failed and $($stillRepairable.Count) issue(s) are still present." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
+        $status = $STATUS_ERROR
+        break main
     }
 
     Log-Output $summary | Tee-Object -FilePath $logFile -Append
@@ -998,12 +1054,13 @@ try {
         Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
     }
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+    $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
+    $status = $STATUS_ERROR
 }
 finally {
     # The caller contract in common\helpers\README.md. On a throw the buffered helper entries are
@@ -1017,3 +1074,5 @@ finally {
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
 }
+
+return $status
